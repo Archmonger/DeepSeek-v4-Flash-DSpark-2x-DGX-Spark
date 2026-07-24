@@ -40,11 +40,17 @@ VLLM_HOST_IP="${VLLM_HOST_IP:-$MASTER_ADDR}"
 WORKER_VLLM_HOST_IP="${WORKER_VLLM_HOST_IP:-$WORKER_HOST}"
 WORKER_DIR="${WORKER_SCRIPT_DIR:-${WORKER_DIR:-$SCRIPT_DIR}}"
 WORKER_HF_CACHE="${WORKER_HF_CACHE:-${HF_CACHE:-}}"
+# Per-node RoCEv2 GID: worker may differ from head (and can drift after reboot).
+# Set WORKER_NCCL_IB_GID_INDEX in the head .env; start script injects it on remote compose.
+# Do not put WORKER_* first in docker-compose substitution — that is not rank-aware.
+WORKER_NCCL_IB_GID_INDEX="${WORKER_NCCL_IB_GID_INDEX:-${NCCL_IB_GID_INDEX:-}}"
 REMOTE_WORKER_DIR="$(printf '%q' "$WORKER_DIR")"
 REMOTE_COMPOSE_FILE="$REMOTE_WORKER_DIR/docker-compose.dspark.yml"
 REMOTE_ENV_FILE="$REMOTE_WORKER_DIR/.env.dspark"
 REMOTE_VLLM_GB10_PATCH_DIR="$REMOTE_WORKER_DIR/vllm_patch_gb10"
 REMOTE_COMPOSE="cd $REMOTE_WORKER_DIR && env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS COMPOSE_DISABLE_ENV_FILE=1"
+# Env overrides on every remote compose invocation (beats a synced .env.dspark GID pin).
+REMOTE_NCCL_ENV="NCCL_IB_GID_INDEX='$WORKER_NCCL_IB_GID_INDEX'"
 STARTUP_LOG_SINCE=""
 
 need_cmd() {
@@ -72,7 +78,7 @@ compose_base() {
 }
 
 remote_compose() {
-  ssh "$WORKER_HOST" "$REMOTE_COMPOSE $*"
+  ssh "$WORKER_HOST" "$REMOTE_COMPOSE $REMOTE_NCCL_ENV $*"
 }
 
 log_since() {
@@ -128,6 +134,8 @@ print_resolved_profile() {
   echo "  mtp speculative tokens: ${MTP_NUM_TOKENS:-5}"
   echo "  head host/ip: ${VLLM_HOST:-127.0.0.1} / $VLLM_HOST_IP"
   echo "  worker host/ip: $WORKER_HOST / $WORKER_VLLM_HOST_IP"
+  echo "  head NCCL_IB_GID_INDEX: ${NCCL_IB_GID_INDEX:-}"
+  echo "  worker NCCL_IB_GID_INDEX: $WORKER_NCCL_IB_GID_INDEX"
   echo "  worker dir: $WORKER_DIR"
   echo "  worker cache: ${WORKER_HF_CACHE:-${HF_CACHE:-}}"
   echo "  GB10 vLLM patch: $ENABLE_VLLM_GB10_PATCH"
