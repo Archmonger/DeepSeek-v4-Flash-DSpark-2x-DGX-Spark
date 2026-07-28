@@ -48,15 +48,6 @@ This repo still vendors Keys' DSpark concurrency patch and Stage-C overlay
 sources for local image builds and documentation. With the Anemll image, that
 logic ships inside the image rather than as a host bind-mount.
 
-<p>
-<a href="https://x.com/MiaAI_lab" target="_blank">
-  <img src="https://img.shields.io/badge/Follow%20me%20on%20X-000000?style=for-the-badge&logo=x&logoColor=white" alt="Follow Mia on X" />
-</a>
-</p>
-<p>
-<a href='https://ko-fi.com/Z8Z3SPLOD' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi6.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
-</p>
-
 **Default agent-serving profile** (`.env.dspark.example` and README defaults):
 
 - image: `ghcr.io/anemll/dspark-vllm-gx10:0.1.1`
@@ -575,13 +566,13 @@ Edit these values for your cluster:
 - `WORKER_SCRIPT_DIR` if the worker checkout/deployment path differs from the head
 - `MASTER_ADDR`
 - `NCCL_IB_HCA`
-- `NCCL_SOCKET_IFNAME`
-- `NCCL_IB_GID_INDEX`
+- `NCCL_SOCKET_IFNAME` (and matching `TP_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME`, or leave those unset so compose inherits the NCCL IF)
+- `NCCL_IB_GID_INDEX` (not always 0 — match your RoCE GID)
 - `HF_CACHE`
 - `WORKER_HF_CACHE` if the worker cache path differs from the head
 - `VLLM_HOST_IP` and `WORKER_VLLM_HOST_IP` for each node's fabric IP
 
-Example cluster fabric values (edit for your nodes):
+Example cluster fabric values (edit for your nodes — f0 vs f1 and GID index vary):
 
 ```env
 WORKER_HOST=10.0.0.2
@@ -623,6 +614,7 @@ Optional: build the historical Stage-C image instead:
 ```bash
 ./build-dspark-vllm-runtime.sh
 # then set DSPARK_VLLM_IMAGE=vllm-dspark-runtime:dspark-nvfp4-stage-c
+# and IMAGE_PYTHON=/opt/env/bin/python for prepare-dspark-model-cache.sh
 ```
 
 Prepare the model cache on both nodes (or rsync a verified hub snapshot):
@@ -630,6 +622,11 @@ Prepare the model cache on both nodes (or rsync a verified hub snapshot):
 ```bash
 ./prepare-dspark-model-cache.sh
 ```
+
+`prepare-dspark-model-cache.sh` forces HF online for the download step even when
+`.env.dspark` has `HF_HUB_OFFLINE=1` (correct for serve after the cache is warm).
+Use `IMAGE_PYTHON=/usr/bin/python3` on the Anemll image (default); Stage-C needs
+`IMAGE_PYTHON=/opt/env/bin/python`.
 
 Start the service:
 

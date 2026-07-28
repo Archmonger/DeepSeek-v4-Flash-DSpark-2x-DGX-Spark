@@ -19,6 +19,8 @@ fi
 : "${HF_CACHE:=$HOME/.cache/huggingface}"
 : "${HF_DOWNLOAD_WORKERS:=1}"
 : "${DSPARK_VLLM_IMAGE:=vllm-dspark-runtime:dspark-nvfp4-stage-c}"
+# Anemll image ships python at /usr/bin/python3 (Stage-C used /opt/env/bin/python).
+: "${IMAGE_PYTHON:=/usr/bin/python3}"
 
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -45,29 +47,33 @@ need_cmd docker
 mkdir -p "$HF_CACHE"
 verify_local_image
 
+# Serve profiles keep HF_HUB_OFFLINE=1; download must ignore that for this run only.
+echo "prepare: forcing HF online for download (serve can keep HF_HUB_OFFLINE=1)" >&2
+
 run_download() {
   docker run --rm -i \
     -v "${HF_CACHE}:/cache/huggingface" \
     -e HF_HOME=/cache/huggingface \
-    -e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}" \
-    -e TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-0}" \
+    -e HF_HUB_OFFLINE=0 \
+    -e TRANSFORMERS_OFFLINE=0 \
     -e HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}" \
     -e DSPARK_MODEL="$DSPARK_MODEL" \
     -e HF_DOWNLOAD_WORKERS="$HF_DOWNLOAD_WORKERS" \
-    --entrypoint /opt/env/bin/python \
+    --entrypoint "$IMAGE_PYTHON" \
     "$DSPARK_VLLM_IMAGE" \
     -c 'from huggingface_hub import snapshot_download; import os; print(snapshot_download(os.environ["DSPARK_MODEL"], max_workers=int(os.environ.get("HF_DOWNLOAD_WORKERS", "1"))))'
 }
 
 verify_cache() {
+  # local_files_only=True; force offline so verify never re-hits the hub.
   docker run --rm -i \
     -v "${HF_CACHE}:/cache/huggingface" \
     -e HF_HOME=/cache/huggingface \
-    -e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}" \
-    -e TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-0}" \
+    -e HF_HUB_OFFLINE=1 \
+    -e TRANSFORMERS_OFFLINE=1 \
     -e HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}" \
     -e DSPARK_MODEL="$DSPARK_MODEL" \
-    --entrypoint /opt/env/bin/python \
+    --entrypoint "$IMAGE_PYTHON" \
     "$DSPARK_VLLM_IMAGE" \
     - <<'PY'
 import json
