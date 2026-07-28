@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## 2026-07-29
 
 ### Added
 - **Auto RoCEv2 GID resolution** (`start-deepseek-v4-flash-dspark.sh`):
