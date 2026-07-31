@@ -23,7 +23,7 @@ Set `DSPARK_ENCODING_FILE` to the checkpoint's `encoding/encoding_dsv4.py` path 
 
 ## Benchmark Method
 
-Run `scripts/benchmark-0731.py` against a warmed endpoint. The sweep varies prompt length and concurrency, streams each response, records time to first token, and uses the API-reported token counts from naturally completed responses. It does not impose a server-side output limit.
+Run `scripts/benchmark-0731.py` against a warmed endpoint. The default sweep covers 256, 2K, 8K, 32K, and 128K prompt tokens at concurrency 1, 2, 4, and 6. It streams each response, records time to first token, and uses the API-reported token counts from naturally completed responses. It does not impose a server-side output limit.
 
 ```bash
 python3 scripts/benchmark-0731.py \

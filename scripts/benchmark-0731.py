@@ -74,7 +74,7 @@ async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8888/v1")
     parser.add_argument("--model", default="deepseek-v4-flash-0731")
-    parser.add_argument("--prompt-lengths", default="256,2048,8192,32768")
+    parser.add_argument("--prompt-lengths", default="256,2048,8192,32768,131072")
     parser.add_argument("--concurrency", default="1,2,4,6")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
