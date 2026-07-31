@@ -5,7 +5,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="${ENV_FILE:-$SCRIPT_DIR/.env.dspark}"
 CHAT_URL="${CHAT_URL:-http://127.0.0.1:8888/v1/chat/completions}"
 CONCURRENCY="${CONCURRENCY:-6}"
-MAX_TOKENS="${MAX_TOKENS:-32}"
 
 if [ -f "$ENV_FILE" ]; then
   set -a
@@ -24,7 +23,7 @@ for i in $(seq 1 "$CONCURRENCY"); do
   (
     curl -fsS --max-time 180 "$CHAT_URL" \
       -H "Content-Type: application/json" \
-      -d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"Reply with OK and the number '"$i"'."}],"max_tokens":'"$MAX_TOKENS"',"temperature":0.0}' \
+      -d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"Reply with OK and the number '"$i"'."}],"temperature":0.0}' \
       >"$tmpdir/$i.json"
   ) &
 done

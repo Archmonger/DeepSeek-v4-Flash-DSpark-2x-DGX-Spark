@@ -490,7 +490,7 @@ for _ in $(seq 1 "$WAIT_ATTEMPTS"); do
     echo "Running minimal OpenAI-compatible chat request..."
     curl -fsS --max-time 60 "$CHAT_URL" \
       -H "Content-Type: application/json" \
-      -d '{"model":"'"${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"'","messages":[{"role":"user","content":"Reply with OK."}],"max_tokens":8,"temperature":0.0}' >/dev/null
+      -d '{"model":"'"${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"'","messages":[{"role":"user","content":"Reply with OK."}],"temperature":0.0}' >/dev/null
     echo "Minimal chat request succeeded."
     exit 0
   fi
