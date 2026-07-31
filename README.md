@@ -7,6 +7,9 @@
   <a href="https://x.com/MiaAI_lab" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin:0 8px;vertical-align:middle;"><img src="https://img.shields.io/badge/Follow%20me%20on%20X-000000?style=for-the-badge&logo=x&logoColor=white" alt="Follow Mia on X" height="28" style="height:28px;width:auto;vertical-align:middle;border:0;" /></a>
 </p>
 
+> [!IMPORTANT]
+> **This is the updated recipe for DeepSeek v4 Flash GA (0731).**
+
 Self-contained two-node DGX Spark recipe for serving `DeepSeek-V4-Flash-0731`
 with vLLM TP=2, DSpark speculative decoding, and a **1M-token** default max
 model length using the experimental `nvfp4_ds_mla` KV-cache path.
