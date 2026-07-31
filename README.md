@@ -1,6 +1,6 @@
 # DeepSeek V4 Flash DSpark C12 NVFP4 KV on 2x DGX Spark
 
-Self-contained two-node DGX Spark recipe for serving `DeepSeek-V4-Flash-DSpark`
+Self-contained two-node DGX Spark recipe for serving `DeepSeek-V4-Flash-0731`
 with vLLM TP=2, DSpark speculative decoding, and a **1M-token** default max
 model length using the experimental `nvfp4_ds_mla` KV-cache path.
 
@@ -62,13 +62,13 @@ logic ships inside the image rather than as a host bind-mount.
 **Default agent-serving profile** (`.env.dspark.example` and README defaults):
 
 - image: `ghcr.io/anemll/dspark-vllm-gx10:0.1.1`
-- model: `deepseek-ai/DeepSeek-V4-Flash-DSpark` (HF hub id; resolved offline from cache when `HF_HUB_OFFLINE=1`)
+- model: `deepseek-ai/DeepSeek-V4-Flash-0731` (HF hub id; resolved offline from cache when `HF_HUB_OFFLINE=1`)
 - `max_model_len=1048576` (**1M** — keep this as the documented default)
 - `max_num_seqs=6`
 - `max_num_batched_tokens=8192`
 - `kv_cache_dtype=nvfp4_ds_mla`
-- `gpu_memory_utilization=0.85`
-- `MTP_NUM_TOKENS=3`
+- `gpu_memory_utilization=0.80`
+- `MTP_NUM_TOKENS=5`
 - API bind address `0.0.0.0:8888`
 
 Local `.env.dspark` may lower `MAX_MODEL_LEN` (for example `512000`) for a
@@ -115,9 +115,13 @@ path does not switch production to fp8 or a smaller fallback model.
 
 ## Result
 
+### DeepSeek V4 Flash 0731 lane
+
+The 0731 checkpoint keeps the same DSpark block-size-5 structure and 1M context ceiling as the preview checkpoint. Its message encoding is not identical. See [`docs/DEEPSEEK_V4_FLASH_0731.md`](docs/DEEPSEEK_V4_FLASH_0731.md) for the pinned revision, runtime compatibility layer, validation requirements, and measured sweep.
+
 ### Live Anemll image lane (this checkout)
 
-Validated worker-first launch with the prebuilt Anemll image and this repo's
+Historical preview-checkpoint validation with the prebuilt Anemll image and this repo's
 compose/start scripts (TP=2, two nodes).
 
 Runtime:

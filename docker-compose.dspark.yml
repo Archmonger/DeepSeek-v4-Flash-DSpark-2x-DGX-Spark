@@ -33,6 +33,7 @@ services:
       HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
       TRANSFORMERS_OFFLINE: "${TRANSFORMERS_OFFLINE:-0}"
       HF_HUB_DISABLE_XET: "${HF_HUB_DISABLE_XET:-1}"
+      DSPARK_ENCODING_FILE: "${DSPARK_ENCODING_FILE:-}"
       VLLM_CACHE_ROOT: /cache/huggingface/vllm-cache
       VLLM_HOST_IP: "${VLLM_HOST_IP:-}"
 
@@ -94,6 +95,11 @@ services:
         export CUDA_PATH="$${CUDA_PATH:-$${CUDA_HOME}}";
         export CUDAToolkit_ROOT="$${CUDAToolkit_ROOT:-$${CUDA_HOME}}";
         export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$${LD_LIBRARY_PATH:-}";
+        ENCODING_SOURCE="$${DSPARK_ENCODING_FILE:-}";
+        if [ -z "$${ENCODING_SOURCE}" ]; then for candidate in /cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/*/encoding/encoding_dsv4.py; do if [ -f "$${candidate}" ]; then ENCODING_SOURCE="$${candidate}"; break; fi; done; fi;
+        if [ -z "$${ENCODING_SOURCE}" ] && [ -f /models/deepseek-ai/DeepSeek-V4-Flash-0731/encoding/encoding_dsv4.py ]; then ENCODING_SOURCE=/models/deepseek-ai/DeepSeek-V4-Flash-0731/encoding/encoding_dsv4.py; fi;
+        if [ -n "$${ENCODING_SOURCE}" ] && [ -f "$${ENCODING_SOURCE}" ]; then cp "$${ENCODING_SOURCE}" /usr/local/lib/python3.12/dist-packages/vllm/tokenizers/deepseek_v4_encoding.py; fi;
+        python3 -c 'from pathlib import Path; p=Path("/usr/local/lib/python3.12/dist-packages/vllm/tokenizers/deepseek_v4.py"); s=p.read_text(); old="elif reasoning_effort in (\"max\", \"xhigh\"):\n                reasoning_effort = \"max\"\n            else:\n                reasoning_effort = \"high\""; new="elif reasoning_effort in (\"max\", \"xhigh\"):\n                reasoning_effort = \"max\"\n            elif reasoning_effort == \"high\":\n                reasoning_effort = \"high\"\n            else:\n                reasoning_effort = \"low\""; updated=s.replace(old,new); assert new in updated; p.write_text(updated)';
         VLLM_QUANTIZATION_ARGS="";
         if [ "$${ENABLE_VLLM_GB10_PATCH:-0}" = "1" ]; then
           python3 -m pip install -e /opt/vllm-gb10-hybrid-nvfp4 --no-deps;
