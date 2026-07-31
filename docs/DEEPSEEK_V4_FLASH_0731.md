@@ -62,3 +62,18 @@ The 131,072-token concurrency-4 probe did not complete within the 180-second mea
 A separate 900,000-token acceptance request completed with 899,994 API-reported prompt tokens, 900,000 total tokens, 1,028.85-second TTFT, and approximately 874.8 prefill tok/s. The response returned the requested sentinel and confirms the full 1,048,576-token serving profile beyond configuration metadata alone.
 
 Raw measurements are in `results/deepseek-v4-flash-0731-2x-dgx-spark.json`.
+
+## Regular Graph Opt-Out
+
+Anemll `0.1.1` automatically enables breakable CUDA graphs for DeepSeek V4 when `VLLM_USE_BREAKABLE_CUDAGRAPH` is absent. The default recipe now sets it to `0`, which preserves the regular CUDA graph path without disabling CUDA graphs or enabling eager execution.
+
+A matched 520-token natural-completion probe used temperature `0.2`, top-p `0.95`, MTP-5 probabilistic speculation, `MAX_NUM_SEQS=6`, `MAX_NUM_BATCHED_TOKENS=8192`, and the full 1,048,576-token context. Every measured response completed at its requested stop marker without chat-template leakage.
+
+| Mode | Breakable graphs | Regular graphs | Change |
+|---|---:|---:|---:|
+| C1 decode, warm median | 74.55 tok/s | 95.9 tok/s | +28.6% |
+| C2 aggregate decode, median | 134.2 tok/s | 151.8 tok/s | +13.1% |
+| C4 aggregate decode | not measured | 263.7 tok/s | - |
+| C6 aggregate decode | not measured | 340.5 tok/s | - |
+
+The matched 14K-token prefill probes remained within normal run variance: warm C1 moved from 1,770-1,781 to 1,857 tok/s, while C2 moved from 1,920-1,954 to 1,943-1,987 tok/s. This setting is a decode improvement, not a claim that prefill is 28.6% faster.
