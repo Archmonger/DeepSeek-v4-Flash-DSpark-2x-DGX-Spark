@@ -1,4 +1,4 @@
-# DeepSeek V4 Flash DSpark C12 NVFP4 KV on 2x DGX Spark
+# DeepSeek V4 Flash 0731 DSpark on 2x DGX Spark
 
 Self-contained two-node DGX Spark recipe for serving `DeepSeek-V4-Flash-0731`
 with vLLM TP=2, DSpark speculative decoding, and a **1M-token** default max
