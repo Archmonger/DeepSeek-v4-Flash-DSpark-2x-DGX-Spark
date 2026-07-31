@@ -23,7 +23,7 @@ Set `DSPARK_ENCODING_FILE` to the checkpoint's `encoding/encoding_dsv4.py` path 
 
 ## Benchmark Method
 
-Run `scripts/benchmark-0731.py` against a warmed endpoint. The default sweep covers 256, 2K, 8K, 32K, and 128K prompt tokens at concurrency 1, 2, 4, and 6. It streams each response, records time to first token, and uses the API-reported token counts from naturally completed responses. It does not impose a server-side output limit.
+Run `scripts/benchmark-0731.py` against a warmed endpoint. The default sweep covers 256, 2K, 8K, 32K, and 128K prompt tokens at concurrency 1, 2, 4, and 6. Each request has a distinct first cache block so prefix caching cannot make later cases reuse earlier prefill work. It streams each response, records time to first token, prefill throughput, per-request decode throughput, and aggregate decode throughput using API-reported token counts from naturally completed responses. It does not impose a server-side output limit.
 
 ```bash
 python3 scripts/benchmark-0731.py \
@@ -34,4 +34,31 @@ python3 scripts/benchmark-0731.py \
 
 ## Two-Spark Results
 
-Results will be recorded from the pinned revision on two DGX Sparks after warmup.
+Measured on two DGX Sparks connected over ConnectX-7 with tensor parallelism 2. The endpoint used MTP-5 probabilistic speculation, NVFP4 MLA KV cache, CUDA graphs, prefix caching, chunked prefill, and a 1,048,576-token context. Values are medians across requests except aggregate throughput.
+
+| Prompt | Concurrency | TTFT (s) | Prefill tok/s | Decode tok/s | Aggregate tok/s |
+|---:|---:|---:|---:|---:|---:|
+| 256 | 1 | 0.63 | 447 | 75.4 | 69.1 |
+| 256 | 2 | 0.81 | 357 | 58.3 | 104.9 |
+| 256 | 4 | 1.26 | 222 | 46.8 | 164.5 |
+| 256 | 6 | 1.42 | 197 | 36.9 | 191.2 |
+| 2,048 | 1 | 0.81 | 2,563 | 68.8 | 62.0 |
+| 2,048 | 2 | 1.11 | 1,911 | 57.0 | 97.6 |
+| 2,048 | 4 | 1.38 | 1,505 | 44.0 | 154.7 |
+| 2,048 | 6 | 6.06 | 342 | 34.7 | 143.7 |
+| 8,192 | 1 | 4.80 | 1,713 | 73.9 | 43.7 |
+| 8,192 | 2 | 7.51 | 1,176 | 49.8 | 56.2 |
+| 8,192 | 4 | 14.50 | 578 | 37.4 | 72.3 |
+| 8,192 | 6 | 18.38 | 454 | 23.6 | 73.1 |
+| 32,768 | 1 | 22.96 | 1,428 | 64.0 | 16.6 |
+| 32,768 | 2 | 26.82 | 1,287 | 41.5 | 24.8 |
+| 32,768 | 4 | 44.85 | 756 | 17.4 | 26.7 |
+| 32,768 | 6 | 60.75 | 550 | 10.8 | 27.9 |
+| 131,072 | 1 | 78.75 | 1,665 | 65.2 | 5.9 |
+| 131,072 | 2 | 111.17 | 1,306 | 30.9 | 6.6 |
+
+The 131,072-token concurrency-4 probe did not complete within the 180-second measurement window, while the server remained healthy. Its partial values are retained in the raw JSON as capacity-bound evidence and are intentionally excluded from the throughput table.
+
+A separate 900,000-token acceptance request completed with 899,994 API-reported prompt tokens, 900,000 total tokens, 1,028.85-second TTFT, and approximately 874.8 prefill tok/s. The response returned the requested sentinel and confirms the full 1,048,576-token serving profile beyond configuration metadata alone.
+
+Raw measurements are in `results/deepseek-v4-flash-0731-2x-dgx-spark.json`.
