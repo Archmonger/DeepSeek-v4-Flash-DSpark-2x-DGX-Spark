@@ -57,8 +57,8 @@ def stream_one(base_url, model, prompt):
                 cancelled = True
                 break
     finished = time.perf_counter()
-    measured = request_json(tokenize_url(base_url), {"model": model, "prompt": "".join(output)})["count"]
-    output_tokens = (usage or {}).get("completion_tokens", measured)
+    measured = None if usage else request_json(tokenize_url(base_url), {"model": model, "prompt": "".join(output)})["count"]
+    output_tokens = (usage or {}).get("completion_tokens", measured or 0)
     return {"ttft_s": (first or finished) - started, "elapsed_s": finished - started, "prompt_tokens": (usage or {}).get("prompt_tokens", 0), "output_tokens": output_tokens, "output_tok_s": output_tokens / max(0.001, finished - (first or finished)), "cancelled": cancelled}
 
 
