@@ -18,3 +18,4 @@ benchmarks/
 RESULTS.md
 scripts/agent_sanity_bench.py
 scripts/capture_runtime.sh
+start-deepseek-v4-flash-dspark-gb10.sh

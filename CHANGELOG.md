@@ -5,6 +5,8 @@
 - Make `deepseek-ai/DeepSeek-V4-Flash-0731` the default checkpoint for the two-Spark 1M profile.
 - Document the 0731 encoding, parser, and vision boundaries.
 - Add a streaming benchmark sweep that reports observed TTFT, output throughput, and aggregate throughput without imposing a server-side output cap.
+- Expand README Result / Quick Start / Verify notes for PR #14 (0731 boot KV, sweep highlights, regular-graph opt-out).
+- Add official 0731 decode-benchmark capture and numbers under README Benchmarks (`docs/benchmarks.png`).
 
 ### Added
 - **`docs/ENVS.md`**: matrix of compose/`.env` knobs vs Anemll `0.1.1` `vllm.envs` registration and Stage-C overlay (`recipe/overlay/vllm/envs.py`)
@@ -13,7 +15,7 @@
 ### Changed
 - **`docker-compose.dspark.yml`**: default Anemll path no longer injects Stage-C-only `VLLM_*` keys that warn as unknown on `ghcr.io/anemll/dspark-vllm-gx10:0.1.1`
 - **`.env.dspark.example`**: split Anemll-safe defaults vs commented Stage-C-only block; document `CUTE_DSL_ARCH=sm_121a`
-- **README**: note + file table entries pointing at the env matrix
+- **README**: 0731 is the documented current lane; preview Anemll results kept as historical
 
 ### Notes
 - Missing env registration on Anemll does **not** imply missing baked-in DSpark/Keys code paths; it only means those kill-switches are no-ops on 0.1.1
