@@ -37,6 +37,7 @@ echo "  max batched tokens: ${MAX_NUM_BATCHED_TOKENS:-8192}"
 echo "  gpu memory utilization: ${GPU_MEMORY_UTILIZATION:-0.80}"
 echo "  spec tokens (MTP_NUM_TOKENS): ${MTP_NUM_TOKENS:-5} with draft_sample_method=probabilistic (min 5 = dspark_block_size)"
 echo "  cudagraph capture size: $(( ${MAX_NUM_SEQS:-6} * (${MTP_NUM_TOKENS:-5} + 1) )) (max_num_seqs * (mtp + 1))"
+echo "  breakable cudagraph: ${VLLM_USE_BREAKABLE_CUDAGRAPH:-0}"
 echo "  dspark slot clamp: ${DSPARK_SLOT_CLAMP:-1}"
 echo "  sampling override: none (no --override-generation-config; --generation-config vllm only)"
 echo "  WO projection: ${VLLM_USE_B12X_WO_PROJECTION:-1}"
@@ -46,4 +47,4 @@ echo "Rendered vLLM command:"
 env -u MASTER_PORT -u NODE_RANK -u HEADLESS -u WORKER_HOST -u MASTER_ADDR \
   COMPOSE_DISABLE_ENV_FILE=1 \
   docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" config \
-  | grep -E -- '--max-model-len|--max-num-seqs|--max-num-batched-tokens|--max-cudagraph-capture-size|--gpu-memory-utilization|--master-port|--kv-cache-dtype|--speculative-config|--async-scheduling|--enable-chunked-prefill|--generation-config|image:|VLLM_USE_B12X_WO_PROJECTION|VLLM_USE_FLASHINFER_SAMPLER|MTP_NUM_TOKENS'
+  | grep -E -- '--max-model-len|--max-num-seqs|--max-num-batched-tokens|--max-cudagraph-capture-size|--gpu-memory-utilization|--master-port|--kv-cache-dtype|--speculative-config|--async-scheduling|--enable-chunked-prefill|--generation-config|image:|VLLM_USE_B12X_WO_PROJECTION|VLLM_USE_BREAKABLE_CUDAGRAPH|VLLM_USE_FLASHINFER_SAMPLER|MTP_NUM_TOKENS'
