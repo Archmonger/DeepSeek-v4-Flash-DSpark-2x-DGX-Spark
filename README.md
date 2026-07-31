@@ -68,11 +68,13 @@ logic ships inside the image rather than as a host bind-mount.
 - `max_num_batched_tokens=8192`
 - `kv_cache_dtype=nvfp4_ds_mla`
 - `gpu_memory_utilization=0.80`
-- `MTP_NUM_TOKENS=5`
+- `MTP_NUM_TOKENS=5` (checkpoint `dspark_block_size` is 5; k must be ≥ 5)
+- `VLLM_USE_BREAKABLE_CUDAGRAPH=0` (keep regular CUDA graphs; Anemll auto-enables the slower breakable path when unset)
 - API bind address `0.0.0.0:8888`
 
-Local `.env.dspark` may lower `MAX_MODEL_LEN` (for example `512000`) for a
-specific cluster without changing the recipe default.
+Local `.env.dspark` may lower `MAX_MODEL_LEN` (for example `512000`) or raise
+`MTP_NUM_TOKENS` / `GPU_MEMORY_UTILIZATION` for a specific cluster without
+changing the recipe default.
 
 > [!IMPORTANT]
 > This profile is meant for real deep-context agent serving: up to **1M tokens
@@ -91,15 +93,15 @@ specific cluster without changing the recipe default.
 > GPU_MEMORY_UTILIZATION=0.87
 > ```
 
-This repo documents the validated 1M NVFP4 agent profile, historical Stage-C
-checkpoints, and the current Anemll prebuilt runtime:
+This repo documents the validated 0731 1M NVFP4 agent profile, historical
+preview / Stage-C checkpoints, and the current Anemll prebuilt runtime:
 
-- default `max_model_len=1048576` (1M), `max_num_seqs=6`, `kv_cache_dtype=nvfp4_ds_mla`
-- default image `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` (~2.8M-token KV pool on this cluster)
+- default checkpoint `deepseek-ai/DeepSeek-V4-Flash-0731` @ `9e165c30e2704aec5d9d593cce3eebd58bbef1cb`
+- default `max_model_len=1048576` (1M), `max_num_seqs=6`, `kv_cache_dtype=nvfp4_ds_mla`, `MTP_NUM_TOKENS=5`
+- default image `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` (~2.5M-token KV pool on this cluster at util≈0.835; ~2.8M on the prior preview lane at util 0.85)
+- 0731 is text-only; pair with a multimodal sidecar when image input is required
+- 900K acceptance + concurrency/prefill sweep published under `results/`
 - historical Stage-C C12 pool: `3,225,280 tokens`
-- single-stream decode stayed above `50 tok/s` on validated C12 gates
-- deterministic direct prompts completed with no Chinese drift or repeated junk
-- 2/4/6 concurrent code-gate prompts completed cleanly (Stage-C C12)
 - DSpark concurrency patch validated at `max_model_len=200000`, `max_num_seqs=16`
   (static C16 `315.1` / staggered C16 `205.0` tok/s aggregate)
 
@@ -115,14 +117,121 @@ path does not switch production to fp8 or a smaller fallback model.
 
 ## Result
 
-### DeepSeek V4 Flash 0731 lane
+### DeepSeek V4 Flash 0731 lane (current default)
 
-The 0731 checkpoint keeps the same DSpark block-size-5 structure and 1M context ceiling as the preview checkpoint. Its message encoding is not identical. See [`docs/DEEPSEEK_V4_FLASH_0731.md`](docs/DEEPSEEK_V4_FLASH_0731.md) for the pinned revision, runtime compatibility layer, validation requirements, and measured sweep.
+Current default from [#14](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/pull/14).
+The 0731 checkpoint keeps the same DSpark block-size-5 structure and 1M
+context ceiling as the preview checkpoint; message encoding is not identical.
+See [`docs/DEEPSEEK_V4_FLASH_0731.md`](docs/DEEPSEEK_V4_FLASH_0731.md) for the
+pinned revision, encoder install / reasoning-effort compatibility layer,
+validation requirements, and full sweep.
 
-### Live Anemll image lane (this checkout)
+Runtime:
 
-Historical preview-checkpoint validation with the prebuilt Anemll image and this repo's
-compose/start scripts (TP=2, two nodes).
+- image: `ghcr.io/anemll/dspark-vllm-gx10:0.1.1`
+- model id: `deepseek-ai/DeepSeek-V4-Flash-0731` (revision `9e165c30e2704aec5d9d593cce3eebd58bbef1cb`)
+- served model name: `deepseek-v4-flash-0731`
+- `kv_cache_dtype=nvfp4_ds_mla`
+- recipe defaults: `max_model_len=1048576`, `max_num_seqs=6`,
+  `max_num_batched_tokens=8192`, `gpu_memory_utilization=0.80`, `MTP_NUM_TOKENS=5`
+- `VLLM_USE_BREAKABLE_CUDAGRAPH=0`
+- compose installs checkpoint `encoding/encoding_dsv4.py` into vLLM on both ranks
+  (override with `DSPARK_ENCODING_FILE` when needed)
+- `--moe-backend flashinfer_b12x`
+- `VLLM_USE_FLASHINFER_SAMPLER=1`
+- `HF_HUB_OFFLINE=1` recommended after both nodes have a complete hub cache
+- fabric: explicit `VLLM_HOST_IP` / `WORKER_VLLM_HOST_IP`, plus matching
+  `NCCL_SOCKET_IFNAME` / `TP_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME`
+
+Live boot evidence on this cluster (0731, Anemll `0.1.1`, local knobs
+`MAX_NUM_SEQS=4`, `MTP_NUM_TOKENS=6`, `GPU_MEMORY_UTILIZATION=0.835`):
+
+```text
+Available KV cache memory: 18.08 GiB
+GPU KV cache size: 2,493,464 tokens
+Maximum concurrency for 1,048,576 tokens per request: 2.38x
+Application startup complete.
+```
+
+## Benchmarks
+
+### Official decode benchmark (`deepseek-v4-flash-0731`)
+
+Live decode bench against this cluster's OpenAI-compatible endpoint
+(`port 8888`, served model `deepseek-v4-flash-0731`): **2048** completion
+tokens, concurrency **1–6**, wall time **5m 48s**, status **COMPLETED**.
+
+![Decode benchmark for deepseek-v4-flash-0731](docs/benchmarks.png)
+
+Official numbers from that report (rows shown in the capture):
+
+| Load | TTFT | Streams | Aggregate tok/s | Stream tok/s |
+| ---: | ---: | :---: | ---: | ---: |
+| x1 | 168 ms | 1/1 | 82.4 | 82.4 |
+| x2 | 295 ms | 2/2 | 98.0 | 53.0 |
+| x3 | 338 ms | 3/3 | 134.6 | 45.8 |
+| x4 | 5.36 s | 4/4 | 120.4 | 33.6 |
+
+- **Aggregate** — total tok/s across all concurrent streams
+- **Stream** — per-stream average tok/s
+
+Peak aggregate in this capture is **134.6 tok/s** at x3. At x4, TTFT jumps to
+**5.36 s** while aggregate falls to **120.4 tok/s** and per-stream average to
+**33.6 tok/s**. The run was configured through concurrency 6; the published
+screenshot includes the completed x1–x4 rows above.
+
+### Prefill / concurrency sweep (PR #14)
+
+PR #14 live validation (recipe defaults, MTP-5 / seqs=6 / util=0.80):
+
+- advertised context: 1,048,576 tokens
+- 900K request: 899,994 prompt tokens, 1,028.85 s TTFT, ~874.8 prefill tok/s,
+  requested sentinel returned
+- clean system/user role boundary; reasoning emitted separately from final content
+- `deepseek_v4` tool parser returned valid OpenAI function arguments
+- multi-turn role handling passed
+
+Throughput highlights (medians; full table + raw JSON in
+[`docs/DEEPSEEK_V4_FLASH_0731.md`](docs/DEEPSEEK_V4_FLASH_0731.md) and
+`results/deepseek-v4-flash-0731-2x-dgx-spark.json`):
+
+| Prompt | Concurrency | Prefill tok/s | Decode tok/s | Aggregate tok/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 | 1 | 447 | 75.4 | 69.1 |
+| 256 | 6 | 197 | 36.9 | 191.2 |
+| 2,048 | 1 | 2,563 | 68.8 | 62.0 |
+| 2,048 | 6 | 342 | 34.7 | 143.7 |
+| 8,192 | 1 | 1,713 | 73.9 | 43.7 |
+| 8,192 | 6 | 454 | 23.6 | 73.1 |
+| 32,768 | 1 | 1,428 | 64.0 | 16.6 |
+| 32,768 | 6 | 550 | 10.8 | 27.9 |
+| 131,072 | 1 | 1,665 | 65.2 | 5.9 |
+| 131,072 | 2 | 1,306 | 30.9 | 6.6 |
+
+Regular CUDA graphs (`VLLM_USE_BREAKABLE_CUDAGRAPH=0`) vs Anemll auto breakable
+graphs, matched natural-completion probe at full 1M context:
+
+| Mode | Breakable graphs | Regular graphs | Change |
+| --- | ---: | ---: | ---: |
+| C1 decode, warm median | 74.55 tok/s | 95.9 tok/s | +28.6% |
+| C2 aggregate decode, median | 134.2 tok/s | 151.8 tok/s | +13.1% |
+| C4 aggregate decode | not measured | 263.7 tok/s | - |
+| C6 aggregate decode | not measured | 340.5 tok/s | - |
+
+Reproduce the sweep:
+
+```bash
+python3 scripts/benchmark-0731.py \
+  --base-url http://127.0.0.1:8888/v1 \
+  --model deepseek-v4-flash-0731 \
+  --output results/deepseek-v4-flash-0731.json
+```
+
+### Historical preview Anemll lane (`DeepSeek-V4-Flash-DSpark`)
+
+Earlier preview-checkpoint validation with the same Anemll image and this
+repo's compose/start scripts (TP=2, two nodes). Kept for comparison; not the
+current default.
 
 Runtime:
 
@@ -130,15 +239,12 @@ Runtime:
 - model id: `deepseek-ai/DeepSeek-V4-Flash-DSpark` (HF cache under `HF_CACHE`)
 - served model name: configurable via `SERVED_MODEL_NAME` (example: `deepseek-v4-flash`)
 - `kv_cache_dtype=nvfp4_ds_mla`
-- default recipe: `max_model_len=1048576`, `max_num_seqs=6`,
+- profile used then: `max_model_len=1048576`, `max_num_seqs=6`,
   `max_num_batched_tokens=8192`, `gpu_memory_utilization=0.85`, `MTP_NUM_TOKENS=3`
 - `--moe-backend flashinfer_b12x`
 - `VLLM_USE_FLASHINFER_SAMPLER=1`, `VLLM_USE_B12X_WO_PROJECTION=1`
-- `HF_HUB_OFFLINE=1` recommended after both nodes have a complete hub cache
-- fabric: explicit `VLLM_HOST_IP` / `WORKER_VLLM_HOST_IP`, plus matching
-  `NCCL_SOCKET_IFNAME` / `TP_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME`
 
-Boot evidence on this cluster (Anemll image, 1M max-model-len profile):
+Boot evidence on this cluster (preview checkpoint, 1M max-model-len profile):
 
 ```text
 Available KV cache memory: 19.03 GiB
@@ -150,11 +256,12 @@ Application startup complete.
 Direct API smoke: `/v1/models` HTTP 200 and OpenAI-compatible chat completions
 returned non-empty assistant content on both head and worker ranks.
 
-### Real-life decode speed (after first token)
+### Historical real-life decode speed (preview Anemll lane)
 
-Streaming decode-only bench on the live Anemll lane with **agent / file-writing**
-prompts (`max_tokens=512`, temperature 0, unique nonce per request, 3 trials,
-median by aggregate). Prefill and the first token are **excluded**.
+Streaming decode-only bench on the preview Anemll lane with **agent /
+file-writing** prompts (`max_tokens=512`, temperature 0, unique nonce per
+request, 3 trials, median by aggregate). Prefill and the first token are
+**excluded**.
 
 | Metric | Formula |
 | --- | --- |
@@ -401,9 +508,9 @@ Three independent knobs, often confused:
 
 | knob | what it is | this build |
 | --- | --- | --- |
-| **KV cache pool** | total shared KV memory in tokens, sized from `gpu_memory_utilization` after weights load | ~2.8M tokens on Anemll image (this checkout); ~3.2M on historical Stage-C C12 |
+| **KV cache pool** | total shared KV memory in tokens, sized from `gpu_memory_utilization` after weights load | ~2.49M tokens on 0731 / Anemll (this cluster @ util 0.835); ~2.8M on preview Anemll @ util 0.85; ~3.2M on historical Stage-C C12 |
 | `max_model_len` | per-request **ceiling** — how long any one request may grow | **1,048,576 (1M)** default |
-| `max_num_seqs` | **concurrency cap** — max active sequences the scheduler runs at once | 6 |
+| `max_num_seqs` | **concurrency cap** — max active sequences the scheduler runs at once | 6 (recipe default; this cluster currently runs 4) |
 
 The pool is **shared and allocated on demand**: PagedAttention hands KV blocks
 to each request as it generates tokens and frees them when it finishes.
@@ -424,8 +531,8 @@ Worked examples at 1M ceiling / 6 slots:
 6 requests x 1M   tokens =  6.0M   impossible — excess requests queue/preempt
 ```
 
-The boot log's `Maximum concurrency for 1,048,576 tokens per request: ~2.7x`
-(Anemll image on this cluster) only means a few *simultaneous full-1M*
+The boot log's `Maximum concurrency for 1,048,576 tokens per request: ~2.4x`
+(0731 on this cluster) only means a few *simultaneous full-1M*
 requests fit. Agent turns are almost never near 1M, so six normal-length
 sessions share the pool while the 1M ceiling stays available for the rare long
 one. That is exactly why `1M + max_num_seqs=6` is useful: you are not
@@ -452,9 +559,10 @@ On this deployment there are three checks to make before blaming the weights:
    `recipe/vllm/v1/spec_decode/dspark_proposer.py` and overlay sources are
    consistent with the image you built.
 2. **Model cache on both nodes:** a full offline HF hub cache for
-   `deepseek-ai/DeepSeek-V4-Flash-DSpark` must exist on head **and** worker
+   `deepseek-ai/DeepSeek-V4-Flash-0731` must exist on head **and** worker
    (`HF_HUB_OFFLINE=1` once complete). Incomplete caches or online re-downloads
-   have filled worker disks and broken TP=2 start.
+   have filled worker disks and broken TP=2 start. Confirm the snapshot also
+   contains `encoding/encoding_dsv4.py` so compose can install the 0731 encoder.
 3. **Decode/fallback safety:** for long OpenAI-compatible agent prompts, avoid
    unstable sampling and hidden fallback transitions. The server keeps
    `--generation-config vllm` and does not install a server-side
@@ -462,8 +570,9 @@ On this deployment there are three checks to make before blaming the weights:
    win.
 
 The compose launcher includes `--generation-config vllm`, sets `thinking=false`,
-uses DSpark speculative decoding with `MTP_NUM_TOKENS=3` and
-`draft_sample_method=probabilistic`, and enables the FlashInfer sampler. For
+uses DSpark speculative decoding with `MTP_NUM_TOKENS=5` and
+`draft_sample_method=probabilistic`, keeps regular CUDA graphs via
+`VLLM_USE_BREAKABLE_CUDAGRAPH=0`, and enables the FlashInfer sampler. For
 exact deterministic curl checks, send `temperature: 0` in the request body.
 
 Also clear agent fallback lists during validation. A model that looks fixed in
@@ -478,10 +587,11 @@ Validation gates to run after a live fix:
 direct vLLM prompts: clean
 direct concurrent vLLM prompts: clean
 agent harness prompts: clean, DeepSeek, no fallback
-MTP3 probabilistic draft sampling active
+MTP5 probabilistic draft sampling active
+reasoning / tool-call encoding semantics intact on 0731
 ```
 
-This keeps NVFP4 KV and MTP3. Do not switch to fp8 or drop to a smaller fallback
+This keeps NVFP4 KV and MTP5. Do not switch to fp8 or drop to a smaller fallback
 model just to hide the symptom unless you intentionally accept the context and
 quality tradeoff.
 
@@ -549,8 +659,10 @@ usage terms.
 
 | path | purpose |
 | --- | --- |
-| `docker-compose.dspark.yml` | two-node vLLM/DSpark service (Anemll image layout by default) |
-| `.env.dspark.example` | sanitized cluster template; default image Anemll `0.1.1`, **1M** context |
+| `docker-compose.dspark.yml` | two-node vLLM/DSpark service (Anemll image layout by default; installs 0731 encoder) |
+| `.env.dspark.example` | sanitized cluster template; default image Anemll `0.1.1`, **0731** / **1M** context |
+| [`docs/DEEPSEEK_V4_FLASH_0731.md`](docs/DEEPSEEK_V4_FLASH_0731.md) | 0731 checkpoint, encoder notes, sweep method, and measured results |
+| [`docs/benchmarks.png`](docs/benchmarks.png) | official 0731 decode-benchmark capture (2048 tok, concurrency sweep) |
 | [`docs/ENVS.md`](docs/ENVS.md) | Anemll vs Stage-C env registry matrix (unknown-`VLLM_*` warnings) |
 | `docker-compose.stage-c.override.yml` | optional Stage-C-only env injection |
 | `start-deepseek-v4-flash-dspark.sh` | worker-first launch and smoke test; image must exist on both nodes |
@@ -560,6 +672,8 @@ usage terms.
 | `smoke-deepseek-v4-flash-dspark.sh` | direct concurrent OpenAI-compatible smoke test |
 | `validate-dspark-config.sh` | renders and checks the local DSpark compose/env config |
 | `prepare-dspark-model-cache.sh` | downloads/verifies the model cache |
+| `scripts/benchmark-0731.py` | streaming concurrency/prefill sweep for the 0731 endpoint |
+| `results/deepseek-v4-flash-0731-2x-dgx-spark.json` | published two-Spark 0731 sweep measurements |
 | `build-dspark-vllm-runtime.sh` | optional Stage-C local image build (not required for Anemll) |
 | `recipe/overlay/` | Stage-C DSpark vLLM overlay sources for local image builds |
 | `recipe/vllm/v1/spec_decode/dspark_proposer.py` | Stage-C/proposer reference; start script may sync to worker |
@@ -608,17 +722,19 @@ Keep these **default** agent-serving knobs unless you are deliberately
 experimenting (do not treat a temporary local `MAX_MODEL_LEN` override as the
 recipe default):
 
+- `DSPARK_MODEL=deepseek-ai/DeepSeek-V4-Flash-0731`
+- `SERVED_MODEL_NAME=deepseek-v4-flash-0731`
 - `VLLM_HOST=0.0.0.0` if Hermes/OpenClaw or another machine must reach the API
 - `VLLM_PORT=8888`
 - `MAX_MODEL_LEN=1048576` (**1M**)
 - `MAX_NUM_SEQS=6`
 - `MAX_NUM_BATCHED_TOKENS=8192`
-- `GPU_MEMORY_UTILIZATION=0.85`
-- `MTP_NUM_TOKENS=3`
+- `GPU_MEMORY_UTILIZATION=0.80`
+- `MTP_NUM_TOKENS=5`
+- `VLLM_USE_BREAKABLE_CUDAGRAPH=0`
 - `HF_HUB_OFFLINE=1` after both nodes have a full model cache
 - `VLLM_USE_FLASHINFER_SAMPLER=1`
-- `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`
-- `VLLM_USE_B12X_WO_PROJECTION=1`
+- `VLLM_USE_B12X_MOE=1`
 - `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`
 
 Pull the default runtime image on **head and worker**:
@@ -750,9 +866,9 @@ concurrency patch and set:
 ### 1M Single-Stream Legacy Profile
 
 For conservative single-stream testing, set `MAX_NUM_SEQS=1` and
-`VLLM_USE_B12X_WO_PROJECTION=0`. Keep `MTP_NUM_TOKENS=3` unless you are
-deliberately running an experiment; the current local runtime uses
-probabilistic DSpark draft sampling at MTP3.
+`VLLM_USE_B12X_WO_PROJECTION=0`. Keep `MTP_NUM_TOKENS=5` unless you are
+deliberately running an experiment; the current recipe uses probabilistic
+DSpark draft sampling at MTP5 (checkpoint `dspark_block_size` is 5).
 
 ## Verify
 
@@ -775,15 +891,18 @@ docker compose --env-file .env.dspark -f docker-compose.dspark.yml logs vllm-dsp
   | grep -E "GPU KV cache size|Maximum concurrency"
 ```
 
-On the Anemll image at 1M max-model-len / 0.85 GPU util, expect roughly:
+On the Anemll image with the 0731 1M profile, expect roughly (trust the live
+boot log; util and MTP change the pool):
 
 ```text
-GPU KV cache size: approximately 2.8M tokens
-Maximum concurrency for 1,048,576 tokens per request: approximately 2.7x
+Available KV cache memory: approximately 18 GiB
+GPU KV cache size: approximately 2.5M tokens
+Maximum concurrency for 1,048,576 tokens per request: approximately 2.4x
 ```
 
+Historical preview Anemll boots at util 0.85 reported ~2.8M tokens / ~2.7x.
 Historical Stage-C C12 boots reported ~2–3.2M tokens and ~1.9–3.2x depending on
-image and util; always trust the live boot log for your node.
+image and util.
 
 Before pointing an agent harness at the endpoint, run the included smoke test:
 
@@ -806,20 +925,22 @@ blaming the DSpark weights.
 - To combine DSpark concurrency with longer context, pick a lower context
   target first, then raise concurrency slowly while watching boot logs, KV
   allocation, acceptance, and request errors.
-- 1M was validated as booted/advertised `max_model_len` with KV headroom and
-  short-prompt speed probes. This repo does not claim a full 1M-token retrieval
-  or correctness benchmark.
+- 1M was validated as booted/advertised `max_model_len` with KV headroom.
+  PR #14 additionally completed a 900K acceptance request and a
+  concurrency/prefill sweep through 128K prompts. This repo still does not
+  claim a full 1M-token retrieval or correctness benchmark.
 - The measured probes were p256/p512 with g64/g256. Rebenchmark if you change
   sampling, batching, context length, WO projection, compressed MLA, or the
   confidence scheduler.
-- The **default** agent-serving profile is `MAX_MODEL_LEN=1048576` (1M),
-  `MAX_NUM_SEQS=6`, `MAX_NUM_BATCHED_TOKENS=8192`,
-  `GPU_MEMORY_UTILIZATION=0.85`, `MTP_NUM_TOKENS=3`,
+- The **default** agent-serving profile is `DSPARK_MODEL=deepseek-ai/DeepSeek-V4-Flash-0731`,
+  `SERVED_MODEL_NAME=deepseek-v4-flash-0731`,
+  `MAX_MODEL_LEN=1048576` (1M), `MAX_NUM_SEQS=6`, `MAX_NUM_BATCHED_TOKENS=8192`,
+  `GPU_MEMORY_UTILIZATION=0.80`, `MTP_NUM_TOKENS=5`,
+  `VLLM_USE_BREAKABLE_CUDAGRAPH=0`,
   `DSPARK_VLLM_IMAGE=ghcr.io/anemll/dspark-vllm-gx10:0.1.1`,
-  `VLLM_USE_FLASHINFER_SAMPLER=1`, `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`,
-  `VLLM_USE_B12X_WO_PROJECTION=1`, no generation override, and
-  `VLLM_DSV4_B12X_COMPRESSED_MLA=0`. Local `.env.dspark` may temporarily lower
-  context (for example 512k) without changing that recipe default.
+  `VLLM_USE_FLASHINFER_SAMPLER=1`, `VLLM_USE_B12X_MOE=1`, no generation override.
+  Local `.env.dspark` may temporarily lower context (for example 512k) or raise
+  MTP / util without changing that recipe default.
 - Worker-first startup avoids a race during multi-node `mp` initialization and
   validates rendered compose on both nodes before starting containers.
 - Requires matching images on both nodes, correct NCCL/RoCE settings, and a
