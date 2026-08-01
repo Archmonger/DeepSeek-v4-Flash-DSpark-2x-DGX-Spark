@@ -1,6 +1,6 @@
 services:
   vllm-dspark:
-    image: ${DSPARK_VLLM_IMAGE:-ghcr.io/anemll/dspark-vllm-gx10:0.1.1}
+    image: ${DSPARK_VLLM_IMAGE:-ghcr.io/miaai-lab/deepseek-v4-flash-0731-dspark:latest}
     pull_policy: if_not_present
     entrypoint: []
     network_mode: host
@@ -19,13 +19,13 @@ services:
     volumes:
       - ${HF_CACHE:-${HOME}/.cache/huggingface}:/cache/huggingface
       # Optional Stage-C overlay: host proposer only when path exists on the
-      # Anemll layout (vLLM ships DSpark under v1/worker/gpu/spec_decode).
+      # prebuilt image layout (vLLM ships DSpark under v1/worker/gpu/spec_decode).
       # GB10 hybrid plugin tree for ENABLE_VLLM_GB10_PATCH=1 only.
       - ${VLLM_GB10_PATCH_DIR:-./vllm_patch_gb10}:/opt/vllm-gb10-hybrid-nvfp4
       - ${DSPARK_TMP_HOST:-${HOME}/.cache/dspark-tmp}:/tmp
 
     # Env surface is split by runtime image:
-    #   - This file: knobs registered (or non-VLLM_) on Anemll 0.1.1
+    #   - This file: knobs registered (or non-VLLM_) on the prebuilt 0.26 image
     #   - docker-compose.stage-c.override.yml: Stage-C overlay kill-switches
     # See docs/ENVS.md before adding VLLM_* keys back to the default path.
     environment:

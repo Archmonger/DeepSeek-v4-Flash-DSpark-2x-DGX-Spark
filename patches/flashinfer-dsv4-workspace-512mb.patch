@@ -1,0 +1,16 @@
+--- a/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
++++ b/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
+@@ -29,7 +29,12 @@
+ if TYPE_CHECKING:
+     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+ 
+-_FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
++# Sized for the split-K decode workspace worst case: 64 tokens x 32 heads x
++# (ceil(128/64) + ceil(8192/64)) splits x 512 d_v (bf16) + fp32 LSE ~ 262 MiB.
++# The padded c128a topk indices width (max_num_batched_tokens=8192) drives the
++# split count; 128 MiB underflowed and _sparse_mla_decode_workspace returned
++# (None, None) -> AttributeError: 'NoneType' object has no attribute 'shape'.
++_FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE = 512 * 1024 * 1024
+ _FLASHINFER_DSV4_DECODE_MAX_TOKENS = 64
+ _FLASHINFER_DSV4_MAX_HEADS = 128
+ _flashinfer_dsv4_workspace_by_device: dict[torch.device, torch.Tensor] = {}
