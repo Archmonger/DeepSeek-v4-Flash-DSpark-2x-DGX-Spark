@@ -10,10 +10,6 @@
 > [!IMPORTANT]
 > **This is the updated recipe for DeepSeek v4 Flash GA (0731).**
 
-> [!IMPORTANT]
-> **Updated to a new image with vLLM-0.26.**
-> **Please set DSPARK_VLLM_IMAGE in .env.dspark to ghcr.io/miaai-lab/deepseek-v4-flash-0731-dspark:latest**
-
 Self-contained two-node DGX Spark recipe for serving `DeepSeek-V4-Flash-0731`
 with vLLM TP=2, DSpark speculative decoding, and a **1M-token** default max
 model length using the experimental `nvfp4_ds_mla` KV-cache path.
