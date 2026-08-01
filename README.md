@@ -20,24 +20,19 @@ model length using the experimental `nvfp4_ds_mla` KV-cache path.
 
 ## Current runtime (this checkout)
 
-The default Docker image is the prebuilt MiaAI-Lab DSpark vLLM 0.26 (SM121)
-image with native DSpark / NVFP4 DS-MLA / b12x MoE support:
+The default Docker image is the prebuilt Anemll GX10/DGX Spark port of vLLM
+0.25 with native DSpark / NVFP4 DS-MLA / b12x MoE support:
 
 ```text
-ghcr.io/miaai-lab/deepseek-v4-flash-0731-dspark:latest
+ghcr.io/anemll/dspark-vllm-gx10:0.1.1
 ```
 
-It includes the flashinfer DSv4 SM120 decode workspace fix (128→512 MiB;
-[`docs/PATCHES.md`](docs/PATCHES.md), Patch 3). Source:
-[MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark).
+Source: [Anemll/dspark-vllm-gx10](https://github.com/Anemll/dspark-vllm-gx10).
 Pull on **both** nodes before first start:
 
 ```bash
-docker pull ghcr.io/miaai-lab/deepseek-v4-flash-0731-dspark:latest
+docker pull ghcr.io/anemll/dspark-vllm-gx10:0.1.1
 ```
-
-Alternative: the Anemll GX10 port of vLLM 0.25
-(`ghcr.io/anemll/dspark-vllm-gx10:0.1.1`, [source](https://github.com/Anemll/dspark-vllm-gx10)).
 
 `docker-compose.dspark.yml` is aligned with that image layout:
 
@@ -57,13 +52,13 @@ When using Stage-C, also merge `docker-compose.stage-c.override.yml` and enable
 the Stage-C env block in `.env.dspark` (see [`docs/ENVS.md`](docs/ENVS.md)).
 
 This repo still vendors Keys' DSpark concurrency patch and Stage-C overlay
-sources for local image builds and documentation. With the prebuilt image, that
+sources for local image builds and documentation. With the Anemll image, that
 logic ships inside the image rather than as a host bind-mount.
 
 > [!NOTE]
-> **Environment variables differ by image.** The default prebuilt image does
+> **Environment variables differ by image.** The default Anemll `0.1.1` image does
 > **not** register every `VLLM_DSPARK_*` / `VLLM_USE_B12X_WO_PROJECTION` kill-switch
-> from the Stage-C overlay. Setting those on the prebuilt image only yields
+> from the Stage-C overlay. Setting those on Anemll only yields
 > `Unknown vLLM environment variable` warnings (no-ops). See
 > [`docs/ENVS.md`](docs/ENVS.md). Stage-C users should merge
 > `docker-compose.stage-c.override.yml`.
@@ -71,7 +66,7 @@ logic ships inside the image rather than as a host bind-mount.
 
 **Default agent-serving profile** (`.env.dspark.example` and README defaults):
 
-- image: `ghcr.io/miaai-lab/deepseek-v4-flash-0731-dspark:latest`
+- image: `ghcr.io/anemll/dspark-vllm-gx10:0.1.1`
 - model: `deepseek-ai/DeepSeek-V4-Flash-0731` (HF hub id; resolved offline from cache when `HF_HUB_OFFLINE=1`)
 - `max_model_len=1048576` (**1M** — keep this as the documented default)
 - `max_num_seqs=6`
@@ -79,7 +74,7 @@ logic ships inside the image rather than as a host bind-mount.
 - `kv_cache_dtype=nvfp4_ds_mla`
 - `gpu_memory_utilization=0.80`
 - `MTP_NUM_TOKENS=5` (checkpoint `dspark_block_size` is 5; k must be ≥ 5)
-- `VLLM_USE_BREAKABLE_CUDAGRAPH=0` (keep regular CUDA graphs; the prebuilt images auto-enable the slower breakable path when unset)
+- `VLLM_USE_BREAKABLE_CUDAGRAPH=0` (keep regular CUDA graphs; Anemll auto-enables the slower breakable path when unset)
 - API bind address `0.0.0.0:8888`
 
 Local `.env.dspark` may lower `MAX_MODEL_LEN` (for example `512000`) or raise
@@ -104,11 +99,11 @@ changing the recipe default.
 > ```
 
 This repo documents the validated 0731 1M NVFP4 agent profile, historical
-preview / Stage-C checkpoints, and the current prebuilt runtime:
+preview / Stage-C checkpoints, and the current Anemll prebuilt runtime:
 
 - default checkpoint `deepseek-ai/DeepSeek-V4-Flash-0731` @ `9e165c30e2704aec5d9d593cce3eebd58bbef1cb`
 - default `max_model_len=1048576` (1M), `max_num_seqs=6`, `kv_cache_dtype=nvfp4_ds_mla`, `MTP_NUM_TOKENS=5`
-- default image `ghcr.io/miaai-lab/deepseek-v4-flash-0731-dspark:latest` (~2.5M-token KV pool on this cluster at util≈0.835; ~2.8M on the prior preview lane at util 0.85)
+- default image `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` (~2.5M-token KV pool on this cluster at util≈0.835; ~2.8M on the prior preview lane at util 0.85)
 - 0731 is text-only; pair with a multimodal sidecar when image input is required
 - 900K acceptance + concurrency/prefill sweep published under `results/`
 - historical Stage-C C12 pool: `3,225,280 tokens`
@@ -138,7 +133,7 @@ validation requirements, and full sweep.
 
 Runtime:
 
-- image: `ghcr.io/miaai-lab/deepseek-v4-flash-0731-dspark:latest`
+- image: `ghcr.io/anemll/dspark-vllm-gx10:0.1.1`
 - model id: `deepseek-ai/DeepSeek-V4-Flash-0731` (revision `9e165c30e2704aec5d9d593cce3eebd58bbef1cb`)
 - served model name: `deepseek-v4-flash-0731`
 - `kv_cache_dtype=nvfp4_ds_mla`
@@ -153,7 +148,7 @@ Runtime:
 - fabric: explicit `VLLM_HOST_IP` / `WORKER_VLLM_HOST_IP`, plus matching
   `NCCL_SOCKET_IFNAME` / `TP_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME`
 
-Live boot evidence on this cluster (0731, prebuilt `deepseek-v4-flash-0731-dspark` image, local knobs
+Live boot evidence on this cluster (0731, Anemll `0.1.1`, local knobs
 `MAX_NUM_SEQS=4`, `MTP_NUM_TOKENS=6`, `GPU_MEMORY_UTILIZATION=0.835`):
 
 ```text
@@ -562,7 +557,7 @@ or Telegram-visible junk, do not assume the weights are bad.
 
 On this deployment there are three checks to make before blaming the weights:
 
-1. **Runtime image + DSpark path:** with the prebuilt image, confirm both nodes
+1. **Runtime image + DSpark path:** with the Anemll image, confirm both nodes
    run the same tag (`docker image inspect $DSPARK_VLLM_IMAGE`) and that compose
    uses `/usr/local/bin/vllm` (not a Stage-C `/opt/env` path). For historical
    Stage-C builds, also ensure the Keys proposer path under
@@ -654,7 +649,7 @@ foundation.
 
 MiaAI-Lab maintains this fork's validated 1M NVFP4-KV recipe, Stage A/B/C
 runtime packaging, sanitized two-node launch flow, Keys patch integration, and
-compose/start tooling. This checkout defaults to the MiaAI-Lab prebuilt `deepseek-v4-flash-0731-dspark` image while
+compose/start tooling. This checkout defaults to the Anemll prebuilt image while
 keeping Stage-C build scripts for optional local rebuilds.
 
 ## License Notes
@@ -669,11 +664,11 @@ usage terms.
 
 | path | purpose |
 | --- | --- |
-| `docker-compose.dspark.yml` | two-node vLLM/DSpark service (prebuilt image layout by default; installs 0731 encoder) |
-| `.env.dspark.example` | sanitized cluster template; default image `ghcr.io/miaai-lab/deepseek-v4-flash-0731-dspark:latest`, **0731** / **1M** context |
+| `docker-compose.dspark.yml` | two-node vLLM/DSpark service (Anemll image layout by default; installs 0731 encoder) |
+| `.env.dspark.example` | sanitized cluster template; default image Anemll `0.1.1`, **0731** / **1M** context |
 | [`docs/DEEPSEEK_V4_FLASH_0731.md`](docs/DEEPSEEK_V4_FLASH_0731.md) | 0731 checkpoint, encoder notes, sweep method, and measured results |
 | [`docs/benchmarks.png`](docs/benchmarks.png) | official 0731 decode-benchmark capture (2048 tok, concurrency sweep) |
-| [`docs/ENVS.md`](docs/ENVS.md) | prebuilt 0.26 vs Stage-C env registry matrix (unknown-`VLLM_*` warnings) |
+| [`docs/ENVS.md`](docs/ENVS.md) | Anemll vs Stage-C env registry matrix (unknown-`VLLM_*` warnings) |
 | `docker-compose.stage-c.override.yml` | optional Stage-C-only env injection |
 | `start-deepseek-v4-flash-dspark.sh` | worker-first launch and smoke test; image must exist on both nodes |
 | `stop-deepseek-v4-flash-dspark.sh` | stops head and worker services |
@@ -684,14 +679,13 @@ usage terms.
 | `prepare-dspark-model-cache.sh` | downloads/verifies the model cache |
 | `scripts/benchmark-0731.py` | streaming concurrency/prefill sweep for the 0731 endpoint |
 | `results/deepseek-v4-flash-0731-2x-dgx-spark.json` | published two-Spark 0731 sweep measurements |
-| `build-dspark-vllm-runtime.sh` | optional Stage-C local image build (not required for the prebuilt image) |
+| `build-dspark-vllm-runtime.sh` | optional Stage-C local image build (not required for Anemll) |
 | `recipe/overlay/` | Stage-C DSpark vLLM overlay sources for local image builds |
 | `recipe/vllm/v1/spec_decode/dspark_proposer.py` | Stage-C/proposer reference; start script may sync to worker |
 | `recipe/nvfp4/Dockerfile.stage-*` | Stage A/B/C NVFP4 image layers for local builds |
 | `patches/keys-concurrency.patch` | full path-adjusted Keys concurrency patch reference |
-| `patches/flashinfer-dsv4-workspace-512mb.patch` | flashinfer DSv4 SM120 decode workspace 512 MiB fix (Patch 3, baked into the default image) |
 | `vllm_patch_gb10/` | optional experimental GB10 hybrid NVFP4 vLLM plugin |
-| `docs/PATCHES.md` | plain-English Patch 1 / 2 / 2b concurrency explanation + Patch 3 workspace fix |
+| `docs/PATCHES.md` | plain-English Patch 1 / Patch 2 / Patch 2b concurrency explanation |
 | `scripts/verify-overlay-sources.sh` | checks overlay sources before Stage-C image build |
 
 ## Quick Start
@@ -726,7 +720,7 @@ NCCL_IB_HCA=rocep1s0f1
 NCCL_SOCKET_IFNAME=enp1s0f1np1
 TP_SOCKET_IFNAME=enp1s0f1np1
 GLOO_SOCKET_IFNAME=enp1s0f1np1
-DSPARK_VLLM_IMAGE=ghcr.io/miaai-lab/deepseek-v4-flash-0731-dspark:latest
+DSPARK_VLLM_IMAGE=ghcr.io/anemll/dspark-vllm-gx10:0.1.1
 ```
 
 Keep these **default** agent-serving knobs unless you are deliberately
@@ -751,7 +745,7 @@ recipe default):
 Pull the default runtime image on **head and worker**:
 
 ```bash
-docker pull ghcr.io/miaai-lab/deepseek-v4-flash-0731-dspark:latest
+docker pull ghcr.io/anemll/dspark-vllm-gx10:0.1.1
 ```
 
 Optional: build the historical Stage-C image instead:
@@ -770,7 +764,7 @@ Prepare the model cache on both nodes (or rsync a verified hub snapshot):
 
 `prepare-dspark-model-cache.sh` forces HF online for the download step even when
 `.env.dspark` has `HF_HUB_OFFLINE=1` (correct for serve after the cache is warm).
-Use `IMAGE_PYTHON=/usr/bin/python3` on the prebuilt image (default); Stage-C needs
+Use `IMAGE_PYTHON=/usr/bin/python3` on the Anemll image (default); Stage-C needs
 `IMAGE_PYTHON=/opt/env/bin/python`.
 
 Start the service:
@@ -825,7 +819,7 @@ access at the network/firewall layer.
 
 Core vLLM flags (from `docker-compose.dspark.yml`):
 
-- image: `ghcr.io/miaai-lab/deepseek-v4-flash-0731-dspark:latest` (override with `DSPARK_VLLM_IMAGE`)
+- image: `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` (override with `DSPARK_VLLM_IMAGE`)
 - `/usr/local/bin/vllm serve …`
 - `--tensor-parallel-size 2`
 - `--distributed-executor-backend mp`
@@ -845,7 +839,7 @@ Core vLLM flags (from `docker-compose.dspark.yml`):
 
 Key runtime env:
 
-- `DSPARK_VLLM_IMAGE=ghcr.io/miaai-lab/deepseek-v4-flash-0731-dspark:latest`
+- `DSPARK_VLLM_IMAGE=ghcr.io/anemll/dspark-vllm-gx10:0.1.1`
 - `HF_HUB_OFFLINE=1` when hub caches are complete on both nodes
 - `ENABLE_VLLM_GB10_PATCH=0` by default; set to `1` to load the optional
   `vllm_patch_gb10/` plugin and add `--quantization modelopt_gb10_hybrid`
@@ -902,7 +896,7 @@ docker compose --env-file .env.dspark -f docker-compose.dspark.yml logs vllm-dsp
   | grep -E "GPU KV cache size|Maximum concurrency"
 ```
 
-On the default prebuilt image with the 0731 1M profile, expect roughly (trust the live
+On the Anemll image with the 0731 1M profile, expect roughly (trust the live
 boot log; util and MTP change the pool):
 
 ```text
@@ -948,7 +942,7 @@ blaming the DSpark weights.
   `MAX_MODEL_LEN=1048576` (1M), `MAX_NUM_SEQS=6`, `MAX_NUM_BATCHED_TOKENS=8192`,
   `GPU_MEMORY_UTILIZATION=0.80`, `MTP_NUM_TOKENS=5`,
   `VLLM_USE_BREAKABLE_CUDAGRAPH=0`,
-  `DSPARK_VLLM_IMAGE=ghcr.io/miaai-lab/deepseek-v4-flash-0731-dspark:latest`,
+  `DSPARK_VLLM_IMAGE=ghcr.io/anemll/dspark-vllm-gx10:0.1.1`,
   `VLLM_USE_FLASHINFER_SAMPLER=1`, `VLLM_USE_B12X_MOE=1`, no generation override.
   Local `.env.dspark` may temporarily lower context (for example 512k) or raise
   MTP / util without changing that recipe default.
