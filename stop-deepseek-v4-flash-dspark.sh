@@ -22,14 +22,42 @@ WORKER_DIR="${WORKER_SCRIPT_DIR:-${WORKER_DIR:-$SCRIPT_DIR}}"
 WORKER_HF_CACHE="${WORKER_HF_CACHE:-${HF_CACHE:-}}"
 WORKER_VLLM_HOST_IP="${WORKER_VLLM_HOST_IP:-}"
 
+local_project_has_resources() {
+  local project="$1"
+  {
+    docker ps -aq --filter "label=com.docker.compose.project=$project"
+    docker network ls -q --filter "label=com.docker.compose.project=$project"
+    docker volume ls -q --filter "label=com.docker.compose.project=$project"
+  } | grep -q .
+}
+
 stop_project() {
   local project="$1"
 
-  echo "Stopping DSpark head project ${project}..."
-  COMPOSE_DISABLE_ENV_FILE=1 docker compose -p "$project" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" down || true
+  if local_project_has_resources "$project"; then
+    echo "Stopping DSpark head project ${project}..."
+    COMPOSE_DISABLE_ENV_FILE=1 docker compose -p "$project" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" down || true
+  else
+    echo "No DSpark head resources for project ${project}; skipping."
+  fi
 
-  echo "Stopping DSpark worker project ${project} on ${WORKER_HOST}..."
-  ssh "$WORKER_HOST" "cd '$WORKER_DIR' && env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS COMPOSE_DISABLE_ENV_FILE=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' docker compose -p '$project' --env-file .env.dspark -f docker-compose.dspark.yml down" || true
+  ssh "$WORKER_HOST" "
+    cd '$WORKER_DIR' || exit 1
+    if {
+      docker ps -aq --filter 'label=com.docker.compose.project=$project'
+      docker network ls -q --filter 'label=com.docker.compose.project=$project'
+      docker volume ls -q --filter 'label=com.docker.compose.project=$project'
+    } | grep -q .; then
+      echo 'Stopping DSpark worker project $project on $WORKER_HOST...'
+      env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS \
+        COMPOSE_DISABLE_ENV_FILE=1 HF_CACHE='$WORKER_HF_CACHE' \
+        VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' \
+        docker compose -p '$project' --env-file .env.dspark \
+          -f docker-compose.dspark.yml down
+    else
+      echo 'No DSpark worker resources for project $project on $WORKER_HOST; skipping.'
+    fi
+  " || true
 }
 
 stop_project "$PROJECT_NAME"

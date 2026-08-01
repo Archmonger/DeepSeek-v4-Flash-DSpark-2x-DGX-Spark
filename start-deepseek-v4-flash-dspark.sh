@@ -98,7 +98,15 @@ fi
 VLLM_PORT="$((10#$VLLM_PORT))"
 # Keep PORT as a backwards-compatible alias, but use VLLM_PORT internally.
 PORT="$VLLM_PORT"
-export VLLM_HOST VLLM_PORT PORT
+DEFAULT_THINKING="${DEFAULT_THINKING:-low}"
+case "$DEFAULT_THINKING" in
+  off|low|high|max) ;;
+  *)
+    echo "DEFAULT_THINKING must be one of: off, low, high, max (got: $DEFAULT_THINKING)" >&2
+    exit 2
+    ;;
+esac
+export VLLM_HOST VLLM_PORT PORT DEFAULT_THINKING
 
 # A wildcard is valid for binding but not a useful health-check destination.
 API_HOST="${API_HOST:-$VLLM_HOST}"
@@ -376,6 +384,7 @@ print_resolved_profile() {
   echo "  max batched tokens: ${MAX_NUM_BATCHED_TOKENS:-8192}"
   echo "  gpu memory utilization: ${GPU_MEMORY_UTILIZATION:-0.80}"
   echo "  mtp speculative tokens: ${MTP_NUM_TOKENS:-5} (dspark_block_size min is 5)"
+  echo "  default thinking: $DEFAULT_THINKING (off/low/high/max)"
   echo "  cudagraph capture size: $(( ${MAX_NUM_SEQS:-6} * (${MTP_NUM_TOKENS:-5} + 1) ))"
   echo "  API bind: $VLLM_HOST:$VLLM_PORT"
   echo "  API probe: $API_URL"
