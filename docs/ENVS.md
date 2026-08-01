@@ -1,15 +1,18 @@
-# Environment variable matrix (Anemll 0.1.1 vs Stage-C overlay)
+# Environment variable matrix (prebuilt MiaAI-Lab 0.26 image vs Stage-C overlay)
 
 This recipe defaults to the prebuilt image:
 
 ```text
-ghcr.io/anemll/dspark-vllm-gx10:0.1.1
+ghcr.io/miaai-lab/deepseek-v4-flash-0731-dspark:latest
 ```
+
+(vLLM `0.26.0+dspark.sm121.2`; includes the flashinfer DSv4 SM120 decode
+workspace fix — see [`docs/PATCHES.md`](PATCHES.md), Patch 3.)
 
 A large set of `VLLM_DSPARK_*` / extra B12X knobs still appear in historical
 Stage-C docs and in `recipe/overlay/vllm/envs.py`. **Those symbols are
-registered in the Stage-C overlay build**, not necessarily in the Anemll
-prebuilt image.
+registered in the Stage-C overlay build**, not necessarily in the prebuilt
+image.
 
 vLLM validates process environment keys that start with `VLLM_`. Unknown keys
 log:
@@ -21,18 +24,22 @@ Unknown vLLM environment variable detected: VLLM_…
 and are **ignored** (warning only; serve still starts).
 
 > **Important:** missing env registration does **not** mean DSpark or the Keys
-> concurrency patches are absent from Anemll. Logic may be baked into the image
-> without exposing every Stage-C kill-switch. Conversely, setting a Stage-C-only
-> env on Anemll does **not** enable that kill-switch.
+> concurrency patches are absent from the prebuilt image. Logic may be baked
+> into the image without exposing every Stage-C kill-switch. Conversely,
+> setting a Stage-C-only env on the prebuilt image does **not** enable that
+> kill-switch.
 
-Audit date: **2026-07-29**, image tag **`ghcr.io/anemll/dspark-vllm-gx10:0.1.1`**,
-by inspecting `vllm.envs.environment_variables` inside the container and
-comparing to `recipe/overlay/vllm/envs.py` in this repo.
+Audit date: **2026-08-01**, image tag
+**`ghcr.io/miaai-lab/deepseek-v4-flash-0731-dspark:latest`** (audited via the
+identical local `vllm-026-gb10-dsv4-dspark:latest`), by inspecting
+`vllm.envs.environment_variables` inside the container (283 registered keys)
+and comparing to `recipe/overlay/vllm/envs.py` in this repo. Supersedes the
+2026-07-29 audit of the Anemll `0.1.1` alternative image.
 
 Re-check after image bumps:
 
 ```bash
-docker run --rm --entrypoint python3 ghcr.io/anemll/dspark-vllm-gx10:0.1.1 - <<'PY'
+docker run --rm -i --entrypoint python3 ghcr.io/miaai-lab/deepseek-v4-flash-0731-dspark:latest - <<'PY'
 import pathlib, vllm
 ns = {}
 exec(compile((pathlib.Path(vllm.__file__).parent / "envs.py").read_text(), "envs.py", "exec"), ns)
@@ -47,7 +54,9 @@ PY
 
 ## Compose / `.env` knobs by lane
 
-### A. Safe on Anemll 0.1.1 (registered `VLLM_*` or non-`VLLM_` runtime)
+### A. Safe on the prebuilt 0.26 image (registered `VLLM_*` or non-`VLLM_` runtime)
+
+Registered in `vllm.envs.environment_variables` on the 2026-08-01 audit:
 
 | Variable | Role |
 |----------|------|
@@ -56,7 +65,6 @@ PY
 | `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS` | Profiler / capture estimate |
 | `VLLM_USE_FLASHINFER_SAMPLER` | FlashInfer sampler |
 | `VLLM_USE_BREAKABLE_CUDAGRAPH` | Set `0` to opt out of DS4's automatic breakable-graph mode and retain regular CUDA graphs |
-| `VLLM_USE_B12X_MOE` | Enable B12X MoE path |
 | `VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM` | Experimental W4A16 selector |
 | `VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M` | Experimental W4A16 selector |
 | `VLLM_B12X_W4A16_FORCE_TILE_CONFIG` | Experimental W4A16 selector |
@@ -68,11 +76,16 @@ PY
 | `HF_*` / `TRANSFORMERS_OFFLINE` | Hub cache behavior |
 | `MTP_NUM_TOKENS` | Consumed by compose command line (not a vLLM env registry key) |
 
-### B. Stage-C / overlay-registered only (warn + no-op on Anemll 0.1.1)
+Note: `VLLM_USE_B12X_MOE` is **not** registered on the 0.26 image. Compose
+still sets it (harmless unknown-env warning) for the Anemll alternative; the
+MoE path on 0.26 is selected by the `--moe-backend flashinfer_b12x` command
+line, not this env.
+
+### B. Stage-C / overlay-registered only (warn + no-op on the prebuilt image)
 
 These appear in `recipe/overlay/vllm/envs.py` and in older validated Stage-C
-lanes. On Anemll **0.1.1** they are **not** in `environment_variables` and only
-produce unknown-env warnings if injected.
+lanes. On the prebuilt 0.26 image they are **not** in
+`environment_variables` and only produce unknown-env warnings if injected.
 
 | Variable | Stage-C intent (summary) |
 |----------|---------------------------|
@@ -89,7 +102,7 @@ produce unknown-env warnings if injected.
 | `VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE` | Defer target cudagraph capture |
 | `VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE_EXACT` | Exact defer variant |
 
-Default Anemll compose **does not** inject these. For Stage-C images, merge:
+Default compose **does not** inject these. For Stage-C images, merge:
 
 ```bash
 docker compose --env-file .env.dspark \
@@ -104,8 +117,9 @@ docker compose --env-file .env.dspark \
 
 | Variable | Notes |
 |----------|--------|
-| `VLLM_TRITON_MLA_SPARSE` | Not in Anemll 0.1.1 registry; not found as overlay registration in the same form — avoid on Anemll |
-| `VLLM_SKIP_INIT_MEMORY_CHECK` | Not in Anemll 0.1.1 registry — avoid on Anemll |
+| `VLLM_TRITON_MLA_SPARSE` | Not in the 0.26 registry; not found as overlay registration in the same form — avoid |
+| `VLLM_SKIP_INIT_MEMORY_CHECK` | Not in the 0.26 registry — avoid |
+| `VLLM_USE_B12X_MOE` | Not in the 0.26 registry (was registered on Anemll 0.1.1); compose sets it for the Anemll alternative — no-op warning on 0.26 |
 | `DSPARK_SLOT_CLAMP` | Non-`VLLM_` prefix (no unknown-`VLLM_` warning). Only meaningful if the image reads it; treat as Stage-C/overlay unless confirmed |
 | `B12X_W4A16_TC_DECODE` | Non-`VLLM_` package/debug knob |
 | `VLLM_HOST` / `VLLM_PORT` | Used by **compose command substitution** / start scripts, not as in-process vLLM config envs in the same way as registry keys |
@@ -115,15 +129,20 @@ docker compose --env-file .env.dspark \
 
 ## Recommended defaults by image
 
-### Anemll `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` (repo default)
+### MiaAI-Lab `ghcr.io/miaai-lab/deepseek-v4-flash-0731-dspark:latest` (repo default)
 
 Keep the slim set in `.env.dspark.example` + `docker-compose.dspark.yml`:
 
 - Serve profile: `MTP_NUM_TOKENS=5`, capture `max_num_seqs * (k+1)`, `GPU_MEMORY_UTILIZATION≈0.80`
 - `VLLM_USE_BREAKABLE_CUDAGRAPH=0` (explicit opt-out; omission auto-enables the slower breakable path on DS4)
-- `VLLM_USE_B12X_MOE=1`
 - `CUTE_DSL_ARCH=sm_121a` (GB10 CuTeDSL target; prevents slower JIT fallbacks)
 - Do **not** rely on Stage-C-only `VLLM_DSPARK_*` for behavior on this tag
+
+### Anemll `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` (alternative)
+
+- Same compose file works; set `DSPARK_VLLM_IMAGE=ghcr.io/anemll/dspark-vllm-gx10:0.1.1`
+- `VLLM_USE_B12X_MOE=1` is registered and meaningful on this tag
+- Env audit of this tag: 2026-07-29 (see git history for the previous matrix)
 
 ### Stage-C `vllm-dspark-runtime:dspark-nvfp4-stage-c`
 
@@ -136,8 +155,9 @@ Keep the slim set in `.env.dspark.example` + `docker-compose.dspark.yml`:
 
 ## What this does *not* claim
 
-- It does **not** invalidate published Anemll decode benches. Throughput can be
+- It does **not** invalidate published decode benches. Throughput can be
   real while unused envs only add log noise.
-- It does **not** assert Anemll lacks concurrency fixes—only that several
-  **env kill-switches** from the overlay are not exposed on 0.1.1.
-- Image tags after 0.1.1 may register more keys; re-run the audit snippet above.
+- It does **not** assert the prebuilt image lacks concurrency fixes—only that
+  several **env kill-switches** from the overlay are not exposed on it.
+- Image tags after this audit may register more keys; re-run the audit
+  snippet above.
