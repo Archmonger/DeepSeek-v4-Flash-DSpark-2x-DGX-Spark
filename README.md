@@ -70,6 +70,7 @@ logic ships inside the image rather than as a host bind-mount.
 - `kv_cache_dtype=nvfp4_ds_mla`
 - `gpu_memory_utilization=0.80`
 - `MTP_NUM_TOKENS=5` (checkpoint `dspark_block_size` is 5; k must be ≥ 5)
+- `DEFAULT_THINKING=low` (`off`, `low`, `high`, or `max`; request-level overrides still win)
 - `VLLM_USE_BREAKABLE_CUDAGRAPH=0` (keep regular CUDA graphs; Anemll auto-enables the slower breakable path when unset)
 - API bind address `0.0.0.0:8888`
 
@@ -570,8 +571,11 @@ On this deployment there are three checks to make before blaming the weights:
    `--override-generation-config`; explicit client request parameters still
    win.
 
-The compose launcher includes `--generation-config vllm`, sets `thinking=false`,
-uses DSpark speculative decoding with `MTP_NUM_TOKENS=5` and
+The compose launcher includes `--generation-config vllm` and defaults to
+`DEFAULT_THINKING=low`. It validates `off`, `low`, `high`, or `max` and
+translates the selected mode into vLLM chat-template kwargs; explicit
+request-level overrides still win. It uses DSpark speculative decoding with
+`MTP_NUM_TOKENS=5` and
 `draft_sample_method=probabilistic`, keeps regular CUDA graphs via
 `VLLM_USE_BREAKABLE_CUDAGRAPH=0`, and enables the FlashInfer sampler. For
 exact deterministic curl checks, send `temperature: 0` in the request body.
@@ -808,6 +812,50 @@ http://HEAD_NODE_IP:VLLM_PORT/v1
 `VLLM_HOST=127.0.0.1`. For Hermes/OpenClaw or
 another machine to use the endpoint, keep `VLLM_HOST=0.0.0.0` and control
 access at the network/firewall layer.
+
+## Pi reasoning controls (off / low / high / max)
+
+The 0731 checkpoint has no Hugging Face Jinja `chat_template`.
+`--tokenizer-mode deepseek_v4` instead calls the checkpoint's installed
+`encoding/encoding_dsv4.py`, which supports `off`, `low`, `high`, and `max`.
+The recipe defaults to `DEFAULT_THINKING=low`, the base reasoning mode. This
+mode opens `<think>` but adds no effort prefix. Clients should still send an
+explicit request-level override when they require deterministic behavior.
+
+A ready-to-copy pi configuration is provided in
+[`pi-models.dspark.example.json`](pi-models.dspark.example.json):
+
+```bash
+mkdir -p ~/.pi/agent
+cp pi-models.dspark.example.json ~/.pi/agent/models.json
+# If pi runs away from the head node, replace 127.0.0.1 with HEAD_NODE_IP.
+```
+
+Select the supported modes with pi's normal thinking control:
+
+```bash
+pi --model local-dspark/deepseek-v4-flash-0731 --thinking off
+pi --model local-dspark/deepseek-v4-flash-0731 --thinking low
+pi --model local-dspark/deepseek-v4-flash-0731 --thinking high
+pi --model local-dspark/deepseek-v4-flash-0731 --thinking max
+```
+
+`DEFAULT_THINKING` and pi use the same mapping. The pi configuration hides the
+unsupported `minimal`, `medium`, and `xhigh` levels:
+
+| Pi level | vLLM request |
+|---|---|
+| `off` | `chat_template_kwargs: {"thinking": false}` |
+| `low` | `chat_template_kwargs: {"thinking": true, "reasoning_effort": "low"}` |
+| `high` | `chat_template_kwargs: {"thinking": true, "reasoning_effort": "high"}` |
+| `max` | `chat_template_kwargs: {"thinking": true, "reasoning_effort": "max"}` |
+
+Do not use pi's generic top-level OpenAI `reasoning_effort` mapping for this
+endpoint. The specialized DeepSeek V4 tokenizer reads these values from
+`chat_template_kwargs`. vLLM returns the generated reasoning in its `reasoning`
+stream field; pi recognizes that field, stores it as a thinking block, and
+replays it as `reasoning`. vLLM normalizes that to `reasoning_content` before
+the custom encoder runs, so tool-call reasoning is not lost.
 
 ## Runtime Profile
 

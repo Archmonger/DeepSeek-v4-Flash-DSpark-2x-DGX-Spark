@@ -21,6 +21,19 @@ The model card does not ship a Jinja chat template. It includes an `encoding` pa
 
 Set `DSPARK_ENCODING_FILE` to the checkpoint's `encoding/encoding_dsv4.py` path inside the container when the runtime image predates the checkpoint. The launcher installs that encoder into vLLM before import, on both ranks. It also corrects pre-0731 tokenizer wrappers that mapped `low` reasoning effort to `high`. These changes are required for the 0731 `reasoning_content`, reasoning-effort, and tool-argument semantics.
 
+The equivalent Unsloth GGUF Jinja template implements the same central DS4
+behavior—DSML tools, `<think>` boundaries, `high`/`max` instruction prefixes,
+and retention of tool-turn `reasoning_content`—but it is not loaded by this
+vLLM profile. Here, request controls are consumed by vLLM's custom tokenizer
+wrapper and passed to the Python encoder. The underlying implementations fall
+back to non-thinking when no kwarg exists, but this recipe defaults
+`DEFAULT_THINKING=low` to match DeepSeek V4's intended base reasoning mode.
+The setting accepts `off`, `low`, `high`, or `max`; `low` opens
+`<think>` but adds no effort instruction. For pi, use
+`pi-models.dspark.example.json`; it maps pi's off/low/high/max selector
+to request-level `chat_template_kwargs.thinking` and
+`chat_template_kwargs.reasoning_effort`.
+
 ## Benchmark Method
 
 Run `scripts/benchmark-0731.py` against a warmed endpoint. The default sweep covers 256, 2K, 8K, 32K, and 128K prompt tokens at concurrency 1, 2, 4, and 6. Each request has a distinct first cache block so prefix caching cannot make later cases reuse earlier prefill work. It streams each response, records time to first token, prefill throughput, per-request decode throughput, and aggregate decode throughput using API-reported token counts from naturally completed responses. It does not impose a server-side output limit.
