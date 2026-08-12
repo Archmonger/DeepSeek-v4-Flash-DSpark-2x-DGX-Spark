@@ -455,9 +455,9 @@ print_resolved_profile() {
     echo "  Issue #22 hotfix: not found"
   fi
   if [ "${DSPARK_SKIP_HOTFIX:-0}" = "1" ]; then
-    echo "  DSV4 perf hotfixes (#50312/#50004/#49486/#48407/#48957/#50298): SKIPPED (DSPARK_SKIP_HOTFIX=1)"
+    echo "  DSV4 perf hotfixes (#50312/#50004/#49486/#48407/#48957/#50298/#44993-grammar): SKIPPED (DSPARK_SKIP_HOTFIX=1)"
   else
-    echo "  DSV4 perf hotfixes (#50312/#50004/#49486/#48407/#48957/#50298): will apply on start"
+    echo "  DSV4 perf hotfixes (#50312/#50004/#49486/#48407/#48957/#50298/#44993-grammar): will apply on start"
   fi
   if [ "$ENABLE_VLLM_GB10_PATCH" = "1" ]; then
     echo "  GB10 vLLM patch dir: $VLLM_GB10_PATCH_DIR"
@@ -547,7 +547,7 @@ fi
 # width, #49486 short-context topk skip, #48407 dense-prefill indexer skip
 # (dormant), #48957 empty-C128 compressor skip, #50298 FlashMLA workspace
 # reuse) — same sync + apply + restart lifecycle as Issue #22.
-for _hf_sync in hotfix-dsv4-mtp-buffer-50312.sh hotfix-dsv4-adaptive-topk-50004.sh hotfix-dsv4-skip-topk-49486.sh hotfix-dsv4-dense-prefill-indexer-48407.sh hotfix-dsv4-skip-empty-c128-48957.sh hotfix-dsv4-flashmla-workspace-50298.sh; do
+for _hf_sync in hotfix-dsv4-mtp-buffer-50312.sh hotfix-dsv4-adaptive-topk-50004.sh hotfix-dsv4-skip-topk-49486.sh hotfix-dsv4-dense-prefill-indexer-48407.sh hotfix-dsv4-skip-empty-c128-48957.sh hotfix-dsv4-flashmla-workspace-50298.sh hotfix-dsv4-grammar-advance.sh; do
   if [ -f "$SCRIPT_DIR/patches/$_hf_sync" ]; then
     echo "Syncing $_hf_sync to ${WORKER_HOST}:${WORKER_DIR}"
     scp "$SCRIPT_DIR/patches/$_hf_sync" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/$_hf_sync"
@@ -600,6 +600,7 @@ if [ "${DSPARK_SKIP_HOTFIX:-0}" != "1" ]; then
     "hotfix-dsv4-dense-prefill-indexer-48407.sh"
     "hotfix-dsv4-skip-empty-c128-48957.sh"
     "hotfix-dsv4-flashmla-workspace-50298.sh"
+    "hotfix-dsv4-grammar-advance.sh"
   )
 fi
 DSV4_HOTFIX_PRESENT=0
