@@ -1,3 +1,29 @@
+## 2026-08-12
+
+### New
+
+#### DSV4 v0.27 performance hotfix backports (6 scripts, all idempotent)
+
+Backported onto the `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` image (vLLM 0.25.2.dev0+g752a3a504.d20260714) from upstream vLLM 0.27.0 DeepSeek-V4 PRs.  Each supports `--status`, `--before`/`--after` (host-side KV + prompt-histogram validation).  Full reference: `docs/vllm-027-new-patches.md`.
+
+- **`patches/hotfix-dsv4-skip-topk-49486.sh`** — upstream #49486, verbatim.  In `models/deepseek_v4/attention.py` (3 hunks): imports `tl, triton`; adds `_fill_short_context_topk_indices` Triton kernel; early-returns from `DeepseekV4Indexer.forward` when `max_seq_len // compress_ratio <= topk_tokens`, still building K cache but writing all-candidate indices directly (skips wq_b→RoPE→quant→QK-logits→top-k).  Fires only ≤2048 tokens (~3.4% E2E TTFT upstream).
+- **`patches/hotfix-dsv4-dense-prefill-indexer-48407.sh`** — upstream #48407 port, **12 hunks, deliberately dormant (Stage A)**.  Adds indexer skip machinery across `model_executor/layers/sparse_attn_indexer.py`, `models/deepseek_v4/sparse_mla.py`, `models/deepseek_v4/attention.py`, `models/deepseek_v32/nvidia/attention.py` (param threading, skip gate, `num_decode_tokens` metadata).  The gate is bound to `dense_mha_metadata_layer_name=""` because this fork has no dense-MHA route for sparse-MLA prefills — enabling it would silently drop valid KV selection.  **Zero perf effect.  Do NOT activate until the dense-MHA route lands.**
+- **`patches/hotfix-dsv4-mtp-buffer-50312.sh`** — upstream #50312 + **2 None-guards upstream lacks**.  In `models/deepseek_v4/nvidia/model.py` (2 hunks): allocates `_mtp_hidden_buffer` only when a speculator needs it (`use_eagle()`/`uses_draft_model()`), else `None`; skips the per-step `copy_` when `None`.  In `v1/worker/gpu/model_runner.py` (1 hunk, expect=2): None-guards both `get_mtp_target_hidden_states()` feed sites.  Saves ~448 MiB/rank (256 MiB/rank here) — memory ROI, no TTFT gain.
+- **`patches/hotfix-dsv4-adaptive-topk-50004.sh`** — upstream #50004, verbatim.  In `models/deepseek_v4/sparse_mla.py` (2 hunks): computes `active_topk_width` from live `cm.max_seq_len`; returns packed `[num_tokens, width]` views and passes live width as the C128A kernel stride instead of full ~1M width (~1.0% E2E TTFT upstream).
+- **`patches/hotfix-dsv4-skip-empty-c128-48957.sh`** — upstream #48957, **new this session**.  In `models/deepseek_v4/compressor.py` (6 hunks): imports `CUDAGraphMode`; adds `_get_c128_boundary` helper; adds `CompressorMetadata.c128_boundary`; `build()` populates it (C128 layers only, `block_size == 8`); captures `forward_context`; skips the compress→KV kernel launch when no request crosses a 128-token boundary this step (state-cache write still runs).  **Disabled under `CUDAGraphMode.FULL`** — live server runs `FULL_AND_PIECEWISE`, so the FULL-graph prefill path silently skips it.
+- **`patches/hotfix-dsv4-flashmla-workspace-50298.sh`** — upstream #50298, **new this session**.  Across `models/deepseek_v4/nvidia/flashmla.py` + `models/deepseek_v4/common/ops/cache_utils.py` (6 hunks): optional `out=` on `combine_topk_swa_indices`; dummy path `forward_mqa` reserves the combined-topk int32 buffers; `_forward_prefill` requests all three buffers in one `get_simultaneous` and slices per chunk; passes `out=(...)` (no per-chunk `torch.full`/`torch.empty`).  1.88x on the combined-topk+SWA kernel upstream.
+
+- **`start-deepseek-v4-flash-dspark.sh`**: all six scripts added to `DSV4_HOTFIX_FILES`, the sync-to-worker loop (`scp`), the worker apply loop, and the profile/echo strings.  Next fresh start applies all six + Issue #22 idempotently, then restarts both containers once.  See opt-outs below.
+- **`docs/vllm-027-new-patches.md`**: status table, #48407 Stage A/B rationale, un-backported PR list (#49236 workspace pool — needs C++ op rebuild, image-level; #46789 sequence parallelism; #48993, #48047).
+
+#### Env opt-outs
+
+- **`DSPARK_SKIP_HOTFIX=1`** skips the six v0.27 perf backports only; Issue #22 still applies.
+- **`DSPARK_SKIP_ISSUE22_HOTFIX=1`** also skips Issue #22 (fully clean baseline).
+- Pass as inline prefix or `export` — a bare `VAR=1` on its own line is not exported to the start script (DO NOT do `DSPARK_SKIP_HOTFIX=1` then run the script; it silently applies everything).
+
+## Unreleased
+
 ### Changed
 - **Text-only ship (vision deferred)**: product default is `ENABLE_VL_SIDECAR=0` with `GPU_MEMORY_UTILIZATION_TEXT=0.835` (0731 on `:8888` only). README documents the text-only agent profile. Optional **Experimental: Vision** section covers `ENABLE_VL_SIDECAR=1` / VL sidecar / MCP for experimenters (not the supported default). `PREPARE_VL_SIDECAR_MODEL` defaults to **0** in prepare + example (set `1` only for vision experiments). `stop-deepseek-v4-flash-dspark.sh` still sweeps leftover VL containers but reports text-only when the flag is off. VL compose / `plugins/dspark_vision_mcp` remain in-tree.
 
@@ -44,28 +70,6 @@
 
 ### Changed
 - **`docs/PATCHES.md`**: added Issue #22 section with root cause analysis and fix details
-
-### New
-
-#### DSV4 v0.27 performance hotfix backports (6 scripts, all idempotent)
-
-Backported onto the `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` image (vLLM 0.25.2.dev0+g752a3a504.d20260714) from upstream vLLM 0.27.0 DeepSeek-V4 PRs.  Each supports `--status`, `--before`/`--after` (host-side KV + prompt-histogram validation).  Full reference: `docs/vllm-027-new-patches.md`.
-
-- **`patches/hotfix-dsv4-skip-topk-49486.sh`** — upstream #49486, verbatim.  In `models/deepseek_v4/attention.py` (3 hunks): imports `tl, triton`; adds `_fill_short_context_topk_indices` Triton kernel; early-returns from `DeepseekV4Indexer.forward` when `max_seq_len // compress_ratio <= topk_tokens`, still building K cache but writing all-candidate indices directly (skips wq_b→RoPE→quant→QK-logits→top-k).  Fires only ≤2048 tokens (~3.4% E2E TTFT upstream).
-- **`patches/hotfix-dsv4-dense-prefill-indexer-48407.sh`** — upstream #48407 port, **12 hunks, deliberately dormant (Stage A)**.  Adds indexer skip machinery across `model_executor/layers/sparse_attn_indexer.py`, `models/deepseek_v4/sparse_mla.py`, `models/deepseek_v4/attention.py`, `models/deepseek_v32/nvidia/attention.py` (param threading, skip gate, `num_decode_tokens` metadata).  The gate is bound to `dense_mha_metadata_layer_name=""` because this fork has no dense-MHA route for sparse-MLA prefills — enabling it would silently drop valid KV selection.  **Zero perf effect.  Do NOT activate until the dense-MHA route lands.**
-- **`patches/hotfix-dsv4-mtp-buffer-50312.sh`** — upstream #50312 + **2 None-guards upstream lacks**.  In `models/deepseek_v4/nvidia/model.py` (2 hunks): allocates `_mtp_hidden_buffer` only when a speculator needs it (`use_eagle()`/`uses_draft_model()`), else `None`; skips the per-step `copy_` when `None`.  In `v1/worker/gpu/model_runner.py` (1 hunk, expect=2): None-guards both `get_mtp_target_hidden_states()` feed sites.  Saves ~448 MiB/rank (256 MiB/rank here) — memory ROI, no TTFT gain.
-- **`patches/hotfix-dsv4-adaptive-topk-50004.sh`** — upstream #50004, verbatim.  In `models/deepseek_v4/sparse_mla.py` (2 hunks): computes `active_topk_width` from live `cm.max_seq_len`; returns packed `[num_tokens, width]` views and passes live width as the C128A kernel stride instead of full ~1M width (~1.0% E2E TTFT upstream).
-- **`patches/hotfix-dsv4-skip-empty-c128-48957.sh`** — upstream #48957, **new this session**.  In `models/deepseek_v4/compressor.py` (6 hunks): imports `CUDAGraphMode`; adds `_get_c128_boundary` helper; adds `CompressorMetadata.c128_boundary`; `build()` populates it (C128 layers only, `block_size == 8`); captures `forward_context`; skips the compress→KV kernel launch when no request crosses a 128-token boundary this step (state-cache write still runs).  **Disabled under `CUDAGraphMode.FULL`** — live server runs `FULL_AND_PIECEWISE`, so the FULL-graph prefill path silently skips it.
-- **`patches/hotfix-dsv4-flashmla-workspace-50298.sh`** — upstream #50298, **new this session**.  Across `models/deepseek_v4/nvidia/flashmla.py` + `models/deepseek_v4/common/ops/cache_utils.py` (6 hunks): optional `out=` on `combine_topk_swa_indices`; dummy path `forward_mqa` reserves the combined-topk int32 buffers; `_forward_prefill` requests all three buffers in one `get_simultaneous` and slices per chunk; passes `out=(...)` (no per-chunk `torch.full`/`torch.empty`).  1.88x on the combined-topk+SWA kernel upstream.
-
-- **`start-deepseek-v4-flash-dspark.sh`**: all six scripts added to `DSV4_HOTFIX_FILES`, the sync-to-worker loop (`scp`), the worker apply loop, and the profile/echo strings.  Next fresh start applies all six + Issue #22 idempotently, then restarts both containers once.  See opt-outs below.
-- **`docs/vllm-027-new-patches.md`**: status table, #48407 Stage A/B rationale, un-backported PR list (#49236 workspace pool — needs C++ op rebuild, image-level; #46789 sequence parallelism; #48993, #48047).
-
-#### Env opt-outs
-
-- **`DSPARK_SKIP_HOTFIX=1`** skips the six v0.27 perf backports only; Issue #22 still applies.
-- **`DSPARK_SKIP_ISSUE22_HOTFIX=1`** also skips Issue #22 (fully clean baseline).
-- Pass as inline prefix or `export` — a bare `VAR=1` on its own line is not exported to the start script (DO NOT do `DSPARK_SKIP_HOTFIX=1` then run the script; it silently applies everything).
 
 ### Previously unreleased (carried forward)
 - Raise `DEFAULT_THINKING` from `low` to `max` in `.env.dspark.example`, enabling full reasoning effort by default. Request-level overrides still take precedence.
