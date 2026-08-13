@@ -73,6 +73,7 @@ logic ships inside the image rather than as a host bind-mount.
 - **Available KV (text-only, this cluster @ util 0.835):** ~**18.08 GiB** → **GPU KV cache size ~2,493,464 tokens** (~2.38× concurrency at 1M; trust the live boot log)
 - `MTP_NUM_TOKENS=5` (checkpoint `dspark_block_size` is 5; k must be ≥ 5)
 - `DEFAULT_THINKING=max` (`off`, `low`, `high`, or `max`; request-level overrides still win)
+- `thinking_token_budget` is supported on this DSpark/V2 serve ([Issue #31](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/31)). **Clients still have to send `thinking_token_budget`.** If they don’t, a reply that hits `max_tokens` mid-reasoning still returns `content: null` (`finish_reason: length`); the thoughts are only in `message.reasoning`.
 - `VLLM_USE_BREAKABLE_CUDAGRAPH=0` (keep regular CUDA graphs; Anemll auto-enables the slower breakable path when unset)
 - API bind address `0.0.0.0:8888`
 
@@ -754,7 +755,7 @@ recipe default):
 - `MAX_NUM_BATCHED_TOKENS=8192`
 - `GPU_MEMORY_UTILIZATION_TEXT=0.835`
 - `MTP_NUM_TOKENS=5`
-- `DEFAULT_THINKING=max`
+- `DEFAULT_THINKING=max` — send `thinking_token_budget` on each request or issue #31 empty-`content` still happens
 - `VLLM_USE_BREAKABLE_CUDAGRAPH=0`
 - `HF_HUB_OFFLINE=1` after both nodes have a full model cache
 - `VLLM_USE_FLASHINFER_SAMPLER=1`
@@ -871,6 +872,9 @@ The recipe defaults to `DEFAULT_THINKING=max` (full effort). Set `low` (or
 `off` / `high`) in `.env.dspark` if you want a quieter base mode. Clients should
 still send an explicit request-level override when they require deterministic
 behavior.
+
+> [!IMPORTANT]
+> **Clients still have to send `thinking_token_budget`.** If they don’t, [issue #31](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/31)’s empty-`content` case is still there: thinking stays `max`, fills `max_tokens`, and the API returns `content: null` with `finish_reason: "length"`. OpenAI-style harnesses that only render `content` then show a blank turn. Pass a budget (for example `128` or `256`) on the chat-completions request so the server can close `</think>` and leave tokens for the answer. Omitting the field leaves the old behaviour unchanged.
 
 A ready-to-copy pi configuration is provided in
 [`pi-models.dspark.example.json`](pi-models.dspark.example.json):

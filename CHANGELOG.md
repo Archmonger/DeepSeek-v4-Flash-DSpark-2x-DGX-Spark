@@ -2,6 +2,12 @@
 
 ### Fixed
 
+- **`thinking_token_budget` rejected on DSpark / V2 ([Issue #31](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/31))**: with `DEFAULT_THINKING=max`, a reply that hits `max_tokens` while still inside `<think>` returns `content: null` and `finish_reason: length`. Stock Anemll `0.1.1` rejects `thinking_token_budget` with HTTP 400 (`not yet supported by the V2 model runner`); `VLLM_USE_V2_MODEL_RUNNER=0` cannot be used because DSpark exists only on V2.
+
+  **Fix:** `patches/hotfix-dsv4-issue31-v2-thinking-budget.py` — drop the V2 400, install a V2 sampler hook that counts tokens after the last `<think>` and forces `</think>` when the request budget is exhausted, thread `ReasoningConfig` into the V2 `Sampler`. Mounted RO and applied in the compose entrypoint (synced to the worker by `start-deepseek-v4-flash-dspark.sh`).
+
+  Live (TP=2, thinking `max`): control `17+25` unchanged; hard #31 prompt + `max_tokens=512` + `thinking_token_budget=64` → HTTP 200, short reasoning, **non-null `content`**; same prompt with no budget still `content: null` (default path unchanged). Clients must send `thinking_token_budget` or the empty-content case remains.
+
 - **Prefix-cache collapse at 32K+ x8 ([Issue #26](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/26))** (`1f9765e`): DSV4-Flash + DSpark on Anemll `0.1.1` runs four KV groups (1× `MLAAttentionSpec` + 3× `SlidingWindowMLASpec`). `HybridKVCacheCoordinator.find_longest_cache_hit` takes the min hit length across groups, so a sliding-window group that frees old blocks by design zeroes the common hit. Warm x8 32K/62K then fully re-prefills (`prefix_cache_hits_total +0`, warm wall == cold). Independent of #27.
 
   Coordinator-only is necessary but not sufficient: at 44K+ x8, dense SWA tails also evict MLA prefix blocks from the shared pool.
