@@ -1,4 +1,28 @@
+## 2026-08-13
+
+### Fixed
+
+- **Prefix-cache collapse at 32K+ x8 ([Issue #26](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/26))** (`1f9765e`): DSV4-Flash + DSpark on Anemll `0.1.1` runs four KV groups (1× `MLAAttentionSpec` + 3× `SlidingWindowMLASpec`). `HybridKVCacheCoordinator.find_longest_cache_hit` takes the min hit length across groups, so a sliding-window group that frees old blocks by design zeroes the common hit. Warm x8 32K/62K then fully re-prefills (`prefix_cache_hits_total +0`, warm wall == cold). Independent of #27.
+
+  Coordinator-only is necessary but not sufficient: at 44K+ x8, dense SWA tails also evict MLA prefix blocks from the shared pool.
+
+  **Fix (both required):**
+  1. `patches/hotfix-dsv4-issue26-hybrid-swa-min.py` — SWA/`SlidingWindowSpec` lookups keep their hit blocks but must not shrink `curr_hit_length`. Mounted RO and applied in the compose entrypoint next to the #27 hotfix.
+  2. `VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096` — sparsify SWA prefix-cache checkpoints (one tail per 4096-token segment + replay boundary).
+
+  Live (TP=2, `max_num_seqs=8`, #27 live): x8 ~22.8K / ~44.7K / ~88.4K warm **8/8** (ratios 0.9986 / 0.9973 / 0.9996; 32K warm wall ~9 s vs ~421 s); x1 262K control 5/5. Repro: `scripts/reproduce-issue26-live.py`, `scripts/reproduce-issue26-control.py`.
+
 ## 2026-08-12
+
+### Fixed
+
+- **Decode-lane starvation under concurrent long prefill ([Issue #27](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/27))** (`2f180e7`): stock vLLM 0.25.2.dev0 defines `SchedulerConfig.max_num_partial_prefills` (default 1) but the v1 `Scheduler.schedule` admission loop never reads it. With chunked prefill + async scheduling + `max_num_seqs>=8` and `long_prefill_token_threshold=0`, multiple already-admitted prefills at the front of `self.running` each consume `max_num_batched_tokens`; decode-active requests later get `num_new_tokens==0` and are skipped (`continue`, not preempted) — cold-only, zero-preemption starvation that grows with prompt length.
+
+  **Fix (both required):**
+  1. `patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py` — break waiting-admission once `len(self._inflight_prefills)` reaches `max_num_partial_prefills`.
+  2. `LONG_PREFILL_TOKEN_THRESHOLD=1024` — cap each prefill chunk so decode lanes keep leftover budget.
+
+  Live: x8 8K/16K/32K worst decode ~15 tok/s (was 2.07 / 0.47 / 0.36), +0 preemptions, MTP 96–99%. Repro: `scripts/reproduce-issue27-live.py`.
 
 ### New
 
