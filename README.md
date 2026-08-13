@@ -30,6 +30,18 @@ Pull on **both** nodes before first start:
 docker pull ghcr.io/anemll/dspark-vllm-gx10:0.1.1
 ```
 
+### Push validation (GitHub Actions)
+
+Every push and pull request to `main` runs [`.github/workflows/validate.yml`](.github/workflows/validate.yml) → `scripts/ci-validate.sh` on a stock Ubuntu runner. That is **CPU-only**: it will not start vLLM, measure tok/s, or catch a live garble. It *will* fail the push if a patch file is broken, if the withdrawn `#31`/`#34` thinking-budget hook is wired back into compose/start, or if `#26` is no longer v2.
+
+Run the same gates locally before you start a serve:
+
+```bash
+bash scripts/ci-validate.sh
+```
+
+Live regressions (decode tok/s, tool-eval, 256k prefill) still need the 2× Spark pair after a restart.
+
 `docker-compose.dspark.yml` is aligned with that image layout:
 
 - entrypoint cleared; command uses `/usr/local/bin/vllm serve`
