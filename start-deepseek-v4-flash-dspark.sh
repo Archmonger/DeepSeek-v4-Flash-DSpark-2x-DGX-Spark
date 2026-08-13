@@ -137,17 +137,7 @@ case "$DEFAULT_THINKING" in
     exit 2
     ;;
 esac
-DEFAULT_THINKING_TOKEN_BUDGET="${DEFAULT_THINKING_TOKEN_BUDGET-32768}"
-DEFAULT_MAX_TOKENS="${DEFAULT_MAX_TOKENS-131072}"
-for _dspark_int_var in DEFAULT_THINKING_TOKEN_BUDGET DEFAULT_MAX_TOKENS; do
-  _dspark_int_val="${!_dspark_int_var}"
-  if [ -n "$_dspark_int_val" ] && ! [[ "$_dspark_int_val" =~ ^[0-9]+$ ]]; then
-    echo "$_dspark_int_var must be a non-negative integer or empty (got: $_dspark_int_val)" >&2
-    exit 2
-  fi
-done
-unset _dspark_int_var _dspark_int_val
-export VLLM_HOST VLLM_PORT PORT DEFAULT_THINKING DEFAULT_THINKING_TOKEN_BUDGET DEFAULT_MAX_TOKENS
+export VLLM_HOST VLLM_PORT PORT DEFAULT_THINKING
 
 # A wildcard is valid for binding but not a useful health-check destination.
 API_HOST="${API_HOST:-$VLLM_HOST}"
@@ -436,8 +426,6 @@ print_resolved_profile() {
   echo "  gpu memory utilization: ${GPU_MEMORY_UTILIZATION:-0.80} (text default ${GPU_MEMORY_UTILIZATION_TEXT:-0.835} / vision default ${GPU_MEMORY_UTILIZATION_VISION:-0.80})"
   echo "  mtp speculative tokens: ${MTP_NUM_TOKENS:-5} (dspark_block_size min is 5)"
   echo "  default thinking: $DEFAULT_THINKING (off/low/high/max)"
-  echo "  default thinking_token_budget: ${DEFAULT_THINKING_TOKEN_BUDGET:-<unbounded>} (omit-field fallback)"
-  echo "  default max_tokens: ${DEFAULT_MAX_TOKENS:-<vLLM remaining context>} (omit-field fallback)"
   echo "  cudagraph capture size: $(( ${MAX_NUM_SEQS:-6} * (${MTP_NUM_TOKENS:-5} + 1) ))"
   echo "  API bind: $VLLM_HOST:$VLLM_PORT"
   echo "  API probe: $API_URL"
@@ -582,12 +570,6 @@ if [ -f "$DSPARK_ISSUE26_HOTFIX" ]; then
   echo "Syncing Issue #26 hybrid-SWA-min hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
   ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
   scp "$DSPARK_ISSUE26_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-issue26-hybrid-swa-min.py"
-fi
-DSPARK_ISSUE31_HOTFIX="${DSPARK_ISSUE31_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-issue31-v2-thinking-budget.py}"
-if [ -f "$DSPARK_ISSUE31_HOTFIX" ]; then
-  echo "Syncing Issue #31 V2 thinking-budget hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
-  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
-  scp "$DSPARK_ISSUE31_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-issue31-v2-thinking-budget.py"
 fi
 if [ "$ENABLE_VLLM_GB10_PATCH" = "1" ]; then
   echo "Syncing GB10 vLLM patch to ${WORKER_HOST}:${WORKER_DIR}/vllm_patch_gb10"

@@ -1,24 +1,24 @@
 ## 2026-08-13
 
+### Changed
+
+- **Withdraw #31/#34 V2 `thinking_token_budget` hotfix**: the sampler hook and omit-field defaults (`DEFAULT_THINKING_TOKEN_BUDGET=32768`, `DEFAULT_MAX_TOKENS=131072`) are removed. Field reports ([#35](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/35), [#37](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/37), [#39](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/39)) tied the path to decode-speed cliffs, tool-name drift, and DSML leaks. Stock Anemll V2 again rejects `thinking_token_budget` (HTTP 400). Size client `max_tokens` (or set `DEFAULT_THINKING` below `max`) so a long think cannot empty `content`. #26 v2 and #27 stay.
+
 ### Fixed
 
 - **Warm shared-prefix DSML / CJK salad after #26 ([Issue #36](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/36))**: the v1 hybrid-SWA hotfix refused to let sliding-window groups shrink `curr_hit_length`. A 21k Hermes system prefix then reported a 100% MLA cache hit while SWA had no retained tail at that length (different user turns move the replay boundary; `VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096` only keeps sparse checkpoints). Prefill was skipped and SWA KV was padded with nulls → leftover `</｜DSML｜parameter>` / Chinese / loops. v2 restores the min-across-groups length so the common hit stops at the last SWA tail. Warm hits stay large because of retention, not because we ignore a missing SWA window. Unit: `scripts/test-issue26-swa-min-v2.py`. Restart required.
 
-- **#31/#34 thinking-budget hook scanned the full prefix every decode step**: after #34 every omitted-field request has a budget, so the V2 sampler hook no longer early-returned. Each step copied request-index tensors to CPU, converted the entire token sequence to a Python list, and linearly rescanned it twice for `<think>` / `</think>`. That is O(context) Python on the sample hot path and matches long-context decode falling to a few tok/s. The hook now primes once from a short tail (DSV4 puts `<think>` at the end of the formatted prompt) and then only scans newly appended tokens. Unit: `scripts/test-issue31-thinking-budget.py`.
+- **#31/#34 thinking-budget hook scanned the full prefix every decode step** *(withdrawn later the same day)*: after #34 every omitted-field request had a budget, so the V2 sampler hook no longer early-returned. Incremental scan was a stopgap; the whole hook is now removed (see Changed above).
 
-- **Blank turns on stock OpenAI clients ([Issue #34](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/34))**: #31 only applied `thinking_token_budget` when the request sent the field. pi / OMP / VS Code custom EP cannot, so `DEFAULT_THINKING=max` still returned `content: null`. Recipe now applies omit-field defaults: `DEFAULT_THINKING_TOKEN_BUDGET=32768` and `DEFAULT_MAX_TOKENS=131072` (request wins; empty/`0` restores the old path). Generous on purpose — this model thinks a lot; 32k think + 128k total leaves ~100k for the answer. A client that still sends `max_tokens: 256` can blank; the server does not raise an explicit cap.
+- **Blank turns on stock OpenAI clients ([Issue #34](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/34))** *(withdrawn later the same day)*: omit-field defaults `DEFAULT_THINKING_TOKEN_BUDGET=32768` / `DEFAULT_MAX_TOKENS=131072` were added, then removed with the hook.
 
 ### Docs
 
-- README: client recommendations for `thinking_token_budget` and `max_tokens` (they share one generation pool; equal caps empty `content`; recipe omit-field defaults 32768 / 131072).
+- README: `thinking_token_budget` is not supported on this V2 serve; size `max_tokens` instead (see Changed above).
 
 ### Fixed
 
-- **`thinking_token_budget` rejected on DSpark / V2 ([Issue #31](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/31))**: with `DEFAULT_THINKING=max`, a reply that hits `max_tokens` while still inside `<think>` returns `content: null` and `finish_reason: length`. Stock Anemll `0.1.1` rejects `thinking_token_budget` with HTTP 400 (`not yet supported by the V2 model runner`); `VLLM_USE_V2_MODEL_RUNNER=0` cannot be used because DSpark exists only on V2.
-
-  **Fix:** `patches/hotfix-dsv4-issue31-v2-thinking-budget.py` — drop the V2 400, install a V2 sampler hook that counts tokens after the last `<think>` and forces `</think>` when the request budget is exhausted, thread `ReasoningConfig` into the V2 `Sampler`. Mounted RO and applied in the compose entrypoint (synced to the worker by `start-deepseek-v4-flash-dspark.sh`).
-
-  Live (TP=2, thinking `max`): control `17+25` unchanged; hard #31 prompt + `max_tokens=512` + `thinking_token_budget=64` → HTTP 200, short reasoning, **non-null `content`**; same prompt with no budget still `content: null` (default path unchanged). Clients must send `thinking_token_budget` or the empty-content case remains.
+- **`thinking_token_budget` rejected on DSpark / V2 ([Issue #31](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/31))** *(hotfix later withdrawn; see Changed above)*: stock Anemll `0.1.1` rejects the field on the V2 runner (HTTP 400). DSpark cannot use `VLLM_USE_V2_MODEL_RUNNER=0`. Clients must size `max_tokens` so a `DEFAULT_THINKING=max` think cannot empty `content`.
 
 - **Prefix-cache collapse at 32K+ x8 ([Issue #26](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/26))** (`1f9765e`): DSV4-Flash + DSpark on Anemll `0.1.1` runs four KV groups (1× `MLAAttentionSpec` + 3× `SlidingWindowMLASpec`). `HybridKVCacheCoordinator.find_longest_cache_hit` takes the min hit length across groups, so a sliding-window group that frees old blocks by design zeroes the common hit. Warm x8 32K/62K then fully re-prefills (`prefix_cache_hits_total +0`, warm wall == cold). Independent of #27.
 
