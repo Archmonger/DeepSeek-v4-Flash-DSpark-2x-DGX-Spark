@@ -571,6 +571,12 @@ if [ -f "$DSPARK_ISSUE27_HOTFIX" ]; then
   ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
   scp "$DSPARK_ISSUE27_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py"
 fi
+DSPARK_ISSUE43_HOTFIX="${DSPARK_ISSUE43_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-issue43-decode-fairness-and-diag.py}"
+if [ -f "$DSPARK_ISSUE43_HOTFIX" ]; then
+  echo "Syncing Issue #43 decode-fairness hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_ISSUE43_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-issue43-decode-fairness-and-diag.py"
+fi
 DSPARK_ISSUE26_HOTFIX="${DSPARK_ISSUE26_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-issue26-hybrid-swa-min.py}"
 if [ -f "$DSPARK_ISSUE26_HOTFIX" ]; then
   echo "Syncing Issue #26 hybrid-SWA-min hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
