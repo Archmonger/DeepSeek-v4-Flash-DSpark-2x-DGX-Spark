@@ -2,7 +2,9 @@
 
 ### Changed
 
-- **Withdraw #31/#34 V2 `thinking_token_budget` hotfix**: the sampler hook and omit-field defaults (`DEFAULT_THINKING_TOKEN_BUDGET=32768`, `DEFAULT_MAX_TOKENS=131072`) are removed. Field reports ([#35](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/35), [#37](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/37), [#39](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/39)) tied the path to decode-speed cliffs, tool-name drift, and DSML leaks. Stock Anemll V2 again rejects `thinking_token_budget` (HTTP 400). Size client `max_tokens` (or set `DEFAULT_THINKING` below `max`) so a long think cannot empty `content`. #26 v2 and #27 stay.
+- **Reverted the #31/#34 `thinking_token_budget` patch (bug + hotfix)**: the V2 sampler hook, `ThinkingBudgetState` O(n) per-step scan, and omit-field defaults (`DEFAULT_THINKING_TOKEN_BUDGET=32768`, `DEFAULT_MAX_TOKENS=131072`) are **fully removed** from compose, start, and `patches/`. That path was the [#39](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/39) **~4.7× decode tok/s cliff** at long context (Python scan × MTP rows on every request after #34). It is not incremental-scanned and left in; it is gone. Stock Anemll V2 again rejects `thinking_token_budget` (HTTP 400). Size client `max_tokens` (or set `DEFAULT_THINKING` below `max`) so a long think cannot empty `content`.
+
+- **Current tip should not produce those two regressions**: together with **#26 v2** (SWA may shrink the common prefix hit again; see #36 below), this recipe no longer ships a mechanism that should **drop decode tok/s** the way #31/#34 did, or **garble** the way #26 v1 did (warm 21k DSML/CJK salad, invented tool names, stale cross-turn KV). #27 stays. `VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096` stays. Remaining `high`/`max`+tools model/template noise is not a leftover budget or v1-cache patch.
 
 ### Fixed
 
