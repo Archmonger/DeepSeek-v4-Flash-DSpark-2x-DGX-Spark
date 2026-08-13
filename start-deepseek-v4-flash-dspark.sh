@@ -459,6 +459,13 @@ print_resolved_profile() {
   else
     echo "  DSV4 perf hotfixes (#50312/#50004/#49486/#48407/#48957/#50298/#44993-grammar): will apply on start"
   fi
+  if [ "${DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX:-0}" = "1" ]; then
+    echo "  Suppress stops in <think>: SKIPPED (DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX=1)"
+  elif [ "${DSPARK_SUPPRESS_STOPS_IN_REASONING:-${VLLM_SUPPRESS_STOPS_IN_REASONING:-1}}" = "0" ]; then
+    echo "  Suppress stops in <think>: hotfix applies but guard off (DSPARK_SUPPRESS_STOPS_IN_REASONING=0)"
+  else
+    echo "  Suppress stops in <think>: will apply (client stop dormant until </think>)"
+  fi
   if [ "$ENABLE_VLLM_GB10_PATCH" = "1" ]; then
     echo "  GB10 vLLM patch dir: $VLLM_GB10_PATCH_DIR"
     echo "  GB10 hybrid NVFP4 M threshold: ${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}"
