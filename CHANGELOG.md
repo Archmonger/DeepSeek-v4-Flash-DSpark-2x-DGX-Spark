@@ -1,8 +1,12 @@
 ## 2026-08-13
 
+### Fixed
+
+- **Blank turns on stock OpenAI clients ([Issue #34](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/34))**: #31 only applied `thinking_token_budget` when the request sent the field. pi / OMP / VS Code custom EP cannot, so `DEFAULT_THINKING=max` still returned `content: null`. Recipe now applies omit-field defaults: `DEFAULT_THINKING_TOKEN_BUDGET=32768` and `DEFAULT_MAX_TOKENS=131072` (request wins; empty/`0` restores the old path). Generous on purpose — this model thinks a lot; 32k think + 128k total leaves ~100k for the answer. A client that still sends `max_tokens: 256` can blank; the server does not raise an explicit cap.
+
 ### Docs
 
-- README: client recommendations for `thinking_token_budget` and `max_tokens` (they share one generation pool; equal caps empty `content`; do not omit `max_tokens` when setting a budget).
+- README: client recommendations for `thinking_token_budget` and `max_tokens` (they share one generation pool; equal caps empty `content`; recipe omit-field defaults 32768 / 131072).
 
 ### Fixed
 

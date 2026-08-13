@@ -12,8 +12,9 @@ This patch:
      next sampled token(s) to the reasoning-end sequence (</think>).
   3. Threads ReasoningConfig into the V2 Sampler so start/end ids are known.
 
-No-op when the request does not set thinking_token_budget. DSpark rejection
-sampling still runs; forcing is applied to processed logits before top-k.
+When the request omits thinking_token_budget, DEFAULT_THINKING_TOKEN_BUDGET
+(default 32768) is used. Empty/0 restores unbounded think. When the client
+omits max_tokens, DEFAULT_MAX_TOKENS (default 131072) is used (issue #34).
 
 Idempotent. Patches files under
 /usr/local/lib/python3.12/dist-packages/vllm/
@@ -29,10 +30,22 @@ THINKING_BUDGET_PY = r'''# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 
 from vllm.sampling_params import SamplingParams
+
+
+def _env_optional_int(name: str, default: int | None) -> int | None:
+    # Missing key → recipe default. Empty or 0 → unbounded / omit.
+    if name not in os.environ:
+        return default
+    raw = os.environ.get(name, "").strip()
+    if raw == "" or raw == "0":
+        return None
+    return int(raw)
 
 
 def _last_subseq(seq: list[int], pat: list[int]) -> int:
@@ -61,6 +74,8 @@ class ThinkingBudgetState:
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         b = getattr(sampling_params, "thinking_token_budget", None)
+        if b is None:
+            b = _env_optional_int("DEFAULT_THINKING_TOKEN_BUDGET", 32768)
         self.budget[req_idx] = -1 if b is None else int(b)
 
     def apply(
@@ -231,6 +246,27 @@ from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState  # {MA
             # {MARK}: budget is implemented in the V2 Sampler.
             pass""",
         "vllm.py stale V2 warning",
+    )
+
+    _patch_file(
+        VLLM / "entrypoints/serve/utils/api_utils.py",
+        """    fallback_max_tokens = (
+        max_tokens
+        if max_tokens is not None
+        else default_sampling_params.get("max_tokens")
+    )""",
+        """    fallback_max_tokens = (
+        max_tokens
+        if max_tokens is not None
+        else default_sampling_params.get("max_tokens")
+    )
+    if fallback_max_tokens is None:
+        # [issue34-hotfix] recipe default when the client omits max_tokens.
+        import os
+        raw = os.environ.get("DEFAULT_MAX_TOKENS", "131072").strip()
+        if raw and raw != "0":
+            fallback_max_tokens = int(raw)""",
+        "get_max_tokens recipe default",
     )
 
     runner = VLLM / "v1/worker/gpu/model_runner.py"

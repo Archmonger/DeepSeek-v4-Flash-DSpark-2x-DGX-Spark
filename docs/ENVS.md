@@ -111,6 +111,8 @@ docker compose --env-file .env.dspark \
 | `B12X_W4A16_TC_DECODE` | Non-`VLLM_` package/debug knob |
 | `VLLM_HOST` / `VLLM_PORT` | Used by **compose command substitution** / start scripts, not as in-process vLLM config envs in the same way as registry keys |
 | `DSPARK_MODEL`, `DSPARK_REVISION`, `DSPARK_VLLM_IMAGE`, `ENABLE_VLLM_GB10_PATCH`, … | Launcher / compose only |
+| `DEFAULT_THINKING_TOKEN_BUDGET` | Non-`VLLM_`. Omit-field fallback for `thinking_token_budget` (default **32768**, issue #34). Empty/`0` = unbounded think |
+| `DEFAULT_MAX_TOKENS` | Non-`VLLM_`. Omit-field fallback for `max_tokens` (default **131072**, issue #34). Empty/`0` = vLLM remaining-context cap |
 
 ---
 

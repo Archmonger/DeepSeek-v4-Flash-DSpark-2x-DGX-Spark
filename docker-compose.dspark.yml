@@ -104,6 +104,10 @@ services:
       # Checkpoint dspark_block_size is 5; k<5 truncates draft blocks (silent on 0.25.2 image).
       MTP_NUM_TOKENS: "${MTP_NUM_TOKENS:-5}"
       DEFAULT_THINKING: "${DEFAULT_THINKING:-low}"
+      # Issue #34: used only when the request omits the field. Empty or 0
+      # disables the recipe default (unbounded think / remaining-context out).
+      DEFAULT_THINKING_TOKEN_BUDGET: "${DEFAULT_THINKING_TOKEN_BUDGET-32768}"
+      DEFAULT_MAX_TOKENS: "${DEFAULT_MAX_TOKENS-131072}"
 
     command:
       - bash
