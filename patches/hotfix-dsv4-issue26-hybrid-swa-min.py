@@ -1,35 +1,35 @@
 #!/usr/bin/env python3
-"""Hotfix: do not let SWA groups shrink the hybrid prefix-cache common hit.
+"""Issue #26 / #36 hybrid prefix-cache hotfix (v2).
 
-On DSV4-Flash + DSpark the v1 HybridKVCacheCoordinator has four KV groups
-(1x MLAAttentionSpec + 3x SlidingWindowMLASpec). ``find_longest_cache_hit``
-takes the min hit length across groups. Sliding-window managers free blocks
-outside the attention window by design, so at 32K+ their hit collapses to 0
-and zeroes the common hit even when the full-attention MLA group still has
-the prefix. Warm x8 32K/62K then re-prefill with 0 cache hits (issue #26).
+DSV4-Flash + DSpark has four KV groups (1x MLA + 3x SlidingWindowMLA).
+``find_longest_cache_hit`` takes the min hit length across groups.
 
-Fix: after a SlidingWindowSpec (covers SlidingWindowMLASpec) lookup, keep
-that group's hit blocks but do not assign its window-limited length to
-``curr_hit_length``. Full-attention / MLA still bound the common hit.
+v1 (issue #26) skipped that min for SlidingWindowSpec so a long MLA hit
+survived when SWA only had a window tail. That restored warm x8 hit *rate*,
+but when SWA did not actually have a tail at that length the engine still
+skipped prefill and attached **null** SWA KV. Hermes-style shared ~21k
+prefixes then decoded DSML / CJK salad (issue #36).
 
-Idempotent: re-applying is a no-op once the marker is present.
+v2: SWA is allowed to shrink the common hit again. Warm long-prefix hits
+come from ``VLLM_PREFIX_CACHE_RETENTION_INTERVAL`` (sparse SWA tails, default
+4096), which keeps the last retained window instead of zeroing the hit.
+A 21k prefix may cache ~20k instead of 21k; that is correct.
 
-Patches /usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_coordinator.py
-in-place inside the container (called from the compose entrypoint before
-``exec vllm serve``).
+Idempotent. Reverts an in-image v1 inject. Called from the compose
+entrypoint before ``exec vllm serve``.
 """
+from __future__ import annotations
+
 from pathlib import Path
 
 P = Path(
     "/usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_coordinator.py"
 )
-src = P.read_text()
-MARK = "# [issue26-hotfix] SWA groups must not shrink the hybrid common hit"
-if MARK in src:
-    print(f"[issue26-hotfix] already applied to {P}")
-    raise SystemExit(0)
 
-ANCHOR = (
+MARK_V2 = "# [issue26-hotfix-v2] SWA may shrink the common hit (#36)"
+MARK_V1 = "# [issue26-hotfix] SWA groups must not shrink the hybrid common hit"
+
+STOCK = (
     "                _new_hit_length = len(hit_blocks[0]) * spec.block_size\n"
     "                if drop_eagle_block:\n"
     "                    eagle_verified.add(idx)\n"
@@ -38,9 +38,8 @@ ANCHOR = (
     "                    eagle_verified.clear()\n"
     "                curr_hit_length = _new_hit_length\n"
 )
-assert ANCHOR in src, "hybrid min-hit assign anchor not found; refusing to patch"
 
-INJECT = (
+V1_INJECT = (
     "                _new_hit_length = len(hit_blocks[0]) * spec.block_size\n"
     "                # [issue26-hotfix] SWA groups must not shrink the hybrid common hit.\n"
     "                # Sliding-window managers retain only the last window tokens;\n"
@@ -59,6 +58,45 @@ INJECT = (
     "                    eagle_verified.clear()\n"
     "                curr_hit_length = _new_hit_length\n"
 )
-src = src.replace(ANCHOR, INJECT, 1)
-P.write_text(src)
-print(f"[issue26-hotfix] patched {P}")
+
+V2_BLOCK = (
+    "                _new_hit_length = len(hit_blocks[0]) * spec.block_size\n"
+    "                # [issue26-hotfix-v2] SWA may shrink the common hit (#36).\n"
+    "                # v1 skipped this assign for SlidingWindowSpec so a long MLA\n"
+    "                # hit could skip prefill with null SWA KV (DSML / CJK salad).\n"
+    "                # Issue #26 warm hits come from VLLM_PREFIX_CACHE_RETENTION_INTERVAL\n"
+    "                # keeping sparse SWA tails, not from ignoring SWA length.\n"
+    "                if drop_eagle_block:\n"
+    "                    eagle_verified.add(idx)\n"
+    "                elif _new_hit_length < curr_hit_length:\n"
+    "                    # length shrunk; invalidate previous eagle verifications\n"
+    "                    eagle_verified.clear()\n"
+    "                curr_hit_length = _new_hit_length\n"
+)
+
+
+def apply_text(src: str) -> tuple[str, str]:
+    """Return (new_source, status) where status is v2|reverted-v1|annotated."""
+    if MARK_V2 in src:
+        return src, "v2"
+    if V1_INJECT in src or MARK_V1 in src:
+        if V1_INJECT not in src:
+            raise SystemExit("issue26 v1 marker present but inject block not found")
+        return src.replace(V1_INJECT, V2_BLOCK, 1), "reverted-v1"
+    if STOCK not in src:
+        raise SystemExit("hybrid min-hit assign anchor not found; refusing to patch")
+    return src.replace(STOCK, V2_BLOCK, 1), "annotated"
+
+
+def main() -> None:
+    src = P.read_text()
+    new, status = apply_text(src)
+    if status == "v2":
+        print(f"[issue26-hotfix-v2] already applied to {P}")
+        return
+    P.write_text(new)
+    print(f"[issue26-hotfix-v2] {status}: {P}")
+
+
+if __name__ == "__main__":
+    main()

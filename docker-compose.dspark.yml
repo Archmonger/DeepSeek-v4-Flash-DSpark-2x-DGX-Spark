@@ -26,7 +26,7 @@ services:
       - ${DSPARK_ENCODING_ISSUE21_HOTFIX:-./patches/hotfix-encoding-dsv4-issue21.py}:/opt/hotfix-encoding-dsv4-issue21.py:ro
       # Issue #27 partial-prefill concurrency hotfix (enforce max_num_partial_prefills).
       - ${DSPARK_ISSUE27_HOTFIX:-./patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py}:/opt/hotfix-dsv4-issue27-partial-prefill-concurrency.py:ro
-      # Issue #26 hybrid coordinator: SWA groups must not shrink the common hit.
+      # Issue #26/#36 hybrid coordinator: SWA may shrink the common hit (v2).
       - ${DSPARK_ISSUE26_HOTFIX:-./patches/hotfix-dsv4-issue26-hybrid-swa-min.py}:/opt/hotfix-dsv4-issue26-hybrid-swa-min.py:ro
       # Issue #31: thinking_token_budget on the V2 / DSpark runner.
       - ${DSPARK_ISSUE31_HOTFIX:-./patches/hotfix-dsv4-issue31-v2-thinking-budget.py}:/opt/hotfix-dsv4-issue31-v2-thinking-budget.py:ro

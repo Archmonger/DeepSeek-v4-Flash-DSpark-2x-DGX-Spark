@@ -2,6 +2,8 @@
 
 ### Fixed
 
+- **Warm shared-prefix DSML / CJK salad after #26 ([Issue #36](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/36))**: the v1 hybrid-SWA hotfix refused to let sliding-window groups shrink `curr_hit_length`. A 21k Hermes system prefix then reported a 100% MLA cache hit while SWA had no retained tail at that length (different user turns move the replay boundary; `VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096` only keeps sparse checkpoints). Prefill was skipped and SWA KV was padded with nulls → leftover `</｜DSML｜parameter>` / Chinese / loops. v2 restores the min-across-groups length so the common hit stops at the last SWA tail. Warm hits stay large because of retention, not because we ignore a missing SWA window. Unit: `scripts/test-issue26-swa-min-v2.py`. Restart required.
+
 - **#31/#34 thinking-budget hook scanned the full prefix every decode step**: after #34 every omitted-field request has a budget, so the V2 sampler hook no longer early-returned. Each step copied request-index tensors to CPU, converted the entire token sequence to a Python list, and linearly rescanned it twice for `<think>` / `</think>`. That is O(context) Python on the sample hot path and matches long-context decode falling to a few tok/s. The hook now primes once from a short tail (DSV4 puts `<think>` at the end of the formatted prompt) and then only scans newly appended tokens. Unit: `scripts/test-issue31-thinking-budget.py`.
 
 - **Blank turns on stock OpenAI clients ([Issue #34](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/34))**: #31 only applied `thinking_token_budget` when the request sent the field. pi / OMP / VS Code custom EP cannot, so `DEFAULT_THINKING=max` still returned `content: null`. Recipe now applies omit-field defaults: `DEFAULT_THINKING_TOKEN_BUDGET=32768` and `DEFAULT_MAX_TOKENS=131072` (request wins; empty/`0` restores the old path). Generous on purpose — this model thinks a lot; 32k think + 128k total leaves ~100k for the answer. A client that still sends `max_tokens: 256` can blank; the server does not raise an explicit cap.
@@ -23,7 +25,7 @@
   Coordinator-only is necessary but not sufficient: at 44K+ x8, dense SWA tails also evict MLA prefix blocks from the shared pool.
 
   **Fix (both required):**
-  1. `patches/hotfix-dsv4-issue26-hybrid-swa-min.py` — SWA/`SlidingWindowSpec` lookups keep their hit blocks but must not shrink `curr_hit_length`. Mounted RO and applied in the compose entrypoint next to the #27 hotfix.
+  1. `patches/hotfix-dsv4-issue26-hybrid-swa-min.py` — originally skipped SWA shrink of `curr_hit_length` (v1). **Superseded by v2** (issue #36): SWA may shrink again; retention (below) is what keeps warm hits.
   2. `VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096` — sparsify SWA prefix-cache checkpoints (one tail per 4096-token segment + replay boundary).
 
   Live (TP=2, `max_num_seqs=8`, #27 live): x8 ~22.8K / ~44.7K / ~88.4K warm **8/8** (ratios 0.9986 / 0.9973 / 0.9996; 32K warm wall ~9 s vs ~421 s); x1 262K control 5/5. Repro: `scripts/reproduce-issue26-live.py`, `scripts/reproduce-issue26-control.py`.
