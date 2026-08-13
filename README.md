@@ -73,7 +73,7 @@ logic ships inside the image rather than as a host bind-mount.
 - **Available KV (text-only, this cluster @ util 0.835):** ~**18.08 GiB** → **GPU KV cache size ~2,493,464 tokens** (~2.38× concurrency at 1M; trust the live boot log)
 - `MTP_NUM_TOKENS=5` (checkpoint `dspark_block_size` is 5; k must be ≥ 5)
 - `DEFAULT_THINKING=max` (`off`, `low`, `high`, or `max`; request-level overrides still win)
-- `thinking_token_budget` is supported on this DSpark/V2 serve ([Issue #31](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/31)). **Clients still have to send `thinking_token_budget`.** If they don’t, a reply that hits `max_tokens` mid-reasoning still returns `content: null` (`finish_reason: length`); the thoughts are only in `message.reasoning`.
+- `thinking_token_budget` is supported on this DSpark/V2 serve ([Issue #31](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/31)). **Clients must send both `thinking_token_budget` and `max_tokens`.** The budget only closes `</think>`; it does not add tokens. `max_tokens` is think + answer. If they are equal (or `max_tokens` is omitted and the harness default is small), a `max` think turn returns `content: null` (`finish_reason: length`). See [Client `max_tokens` and `thinking_token_budget`](#client-max_tokens-and-thinking_token_budget).
 - `VLLM_USE_BREAKABLE_CUDAGRAPH=0` (keep regular CUDA graphs; Anemll auto-enables the slower breakable path when unset)
 - API bind address `0.0.0.0:8888`
 
@@ -755,7 +755,7 @@ recipe default):
 - `MAX_NUM_BATCHED_TOKENS=8192`
 - `GPU_MEMORY_UTILIZATION_TEXT=0.835`
 - `MTP_NUM_TOKENS=5`
-- `DEFAULT_THINKING=max` — send `thinking_token_budget` on each request or issue #31 empty-`content` still happens
+- `DEFAULT_THINKING=max` — each client request should send `thinking_token_budget` **and** a larger `max_tokens` (see below) or issue #31 empty-`content` still happens
 - `VLLM_USE_BREAKABLE_CUDAGRAPH=0`
 - `HF_HUB_OFFLINE=1` after both nodes have a full model cache
 - `VLLM_USE_FLASHINFER_SAMPLER=1`
@@ -874,7 +874,41 @@ still send an explicit request-level override when they require deterministic
 behavior.
 
 > [!IMPORTANT]
-> **Clients still have to send `thinking_token_budget`.** If they don’t, [issue #31](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/31)’s empty-`content` case is still there: thinking stays `max`, fills `max_tokens`, and the API returns `content: null` with `finish_reason: "length"`. OpenAI-style harnesses that only render `content` then show a blank turn. Pass a budget (for example `128` or `256`) on the chat-completions request so the server can close `</think>` and leave tokens for the answer. Omitting the field leaves the old behaviour unchanged.
+> **Clients still have to send `thinking_token_budget`.** If they don’t, [issue #31](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/31)’s empty-`content` case is still there: thinking stays `max`, fills `max_tokens`, and the API returns `content: null` with `finish_reason: "length"`. OpenAI-style harnesses that only render `content` then show a blank turn. Omitting the field leaves the old behaviour unchanged.
+
+### Client `max_tokens` and `thinking_token_budget`
+
+These two fields share **one** generation budget. `thinking_token_budget`
+forces `</think>` after that many reasoning tokens; `max_tokens` is the cap on
+**all** new tokens (reasoning + visible answer + tool markup). The server does
+not default a thinking budget, and it does not raise `max_tokens` when you set
+one.
+
+Send **both** on every chat-completions request (`DEFAULT_THINKING=max`):
+
+| Field | Recommended | Notes |
+|---|---|---|
+| `thinking_token_budget` | **2048** agent / coding, **256** short Q&A | Enough to close think; 24k is usually wasted and will eat `max_tokens` |
+| `max_tokens` | **at least budget + 2048**; **8192** typical, **32768** long agent | Must be **strictly larger** than the thinking budget |
+
+Do **not**:
+
+- Omit `max_tokens` and only set a thinking budget. Many VS Code / custom-EP
+  stacks then send a small engine default, or leave generation unbounded until
+  something else kills the turn.
+- Set them equal (for example 24k / 24k). The sampler closes `</think>` on the
+  last allowed token and `content` is empty (`finish_reason: length`). Live
+  check on this recipe: budget `256` + `max_tokens` `256` → `content: null`;
+  budget `64` + `max_tokens` `256` → a normal answer.
+- Treat a harness “max output” slider as extra room on top of thinking. If the
+  proxy forwards `thinking_token_budget=24000` and `max_tokens=24000`, there is
+  no answer budget.
+
+If a turn “stops” with a budget set, inspect `finish_reason` and
+`completion_tokens`. `length` + null `content` means think used the whole
+`max_tokens` — raise `max_tokens` or cut the budget. Gibberish / DSML loops
+without a budget are a different issue (sampling / tool markup at high
+temperature), not this cap.
 
 A ready-to-copy pi configuration is provided in
 [`pi-models.dspark.example.json`](pi-models.dspark.example.json):

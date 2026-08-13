@@ -1,5 +1,9 @@
 ## 2026-08-13
 
+### Docs
+
+- README: client recommendations for `thinking_token_budget` and `max_tokens` (they share one generation pool; equal caps empty `content`; do not omit `max_tokens` when setting a budget).
+
 ### Fixed
 
 - **`thinking_token_budget` rejected on DSpark / V2 ([Issue #31](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/31))**: with `DEFAULT_THINKING=max`, a reply that hits `max_tokens` while still inside `<think>` returns `content: null` and `finish_reason: length`. Stock Anemll `0.1.1` rejects `thinking_token_budget` with HTTP 400 (`not yet supported by the V2 model runner`); `VLLM_USE_V2_MODEL_RUNNER=0` cannot be used because DSpark exists only on V2.
