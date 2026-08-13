@@ -892,6 +892,12 @@ behavior.
 > `DEFAULT_THINKING=max`, a small cap (256, 512, 800) can be consumed
 > entirely inside `<think>` and return `content: null` /
 > `finish_reason: length`. Give the answer room, or set thinking `low`/`off`.
+>
+> Client `stop` / `stop[:4]` (lm-eval, many coding agents) is a **second**
+> way to get `content: null`: vLLM matches those strings inside `<think>`.
+> The recipe applies `patches/hotfix-dsv4-suppress-stops-in-reasoning.py`
+> so stops stay dormant until `</think>`. Opt out with
+> `DSPARK_SUPPRESS_STOPS_IN_REASONING=0`.
 
 ### Client `max_tokens`
 

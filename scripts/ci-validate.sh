@@ -31,6 +31,7 @@ mapfile -t py_files < <(find patches -name '*.py' -not -path '*/__pycache__/*' |
 py_files+=(
   scripts/test-issue26-swa-min-v2.py
   scripts/test-encoding-dsv4-issue21.py
+  scripts/test-suppress-stops-in-reasoning.py
   scripts/verify-dsv4-027-equality-gate.py
 )
 python3 -m py_compile "${py_files[@]}"
@@ -41,6 +42,8 @@ python3 scripts/test-issue26-swa-min-v2.py -q
 ok "test-issue26-swa-min-v2"
 python3 scripts/test-encoding-dsv4-issue21.py -q
 ok "test-encoding-dsv4-issue21"
+python3 scripts/test-suppress-stops-in-reasoning.py -q
+ok "test-suppress-stops-in-reasoning"
 python3 scripts/verify-dsv4-027-equality-gate.py
 ok "verify-dsv4-027-equality-gate"
 bash scripts/verify-overlay-sources.sh
@@ -103,6 +106,11 @@ if grep -q 'python3 /opt/hotfix-dsv4-issue26-hybrid-swa-min.py' docker-compose.d
 else
   bad "compose entrypoint does not apply #26 + #27"
 fi
+if grep -q 'hotfix-dsv4-suppress-stops-in-reasoning.py' docker-compose.dspark.yml; then
+  ok "compose applies suppress-stops-in-reasoning"
+else
+  bad "compose missing suppress-stops-in-reasoning"
+fi
 if grep -q 'restart: ${DSPARK_RESTART_POLICY:-unless-stopped}' docker-compose.dspark.yml; then
   ok "compose restart unless-stopped"
 else
@@ -114,7 +122,8 @@ for p in \
   patches/hotfix-encoding-dsv4-issue21.py \
   patches/hotfix-dsv4-issue26-hybrid-swa-min.py \
   patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py \
-  patches/hotfix-nvfp4-ds-mla-issue22.sh
+  patches/hotfix-nvfp4-ds-mla-issue22.sh \
+  patches/hotfix-dsv4-suppress-stops-in-reasoning.py
 do
   if [ -f "$p" ]; then
     ok "present $p"
