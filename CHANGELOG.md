@@ -6,6 +6,8 @@
 
 ### Fixed
 
+- **Worker Exited (1) on every start ([Issue #38](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/38))**: the start script applied `.sh` hotfixes then `compose restart`/`stop` while vLLM was loading, which tore down head's TCPStore under rank1 (or hung the operator on `Stopping`). Those scripts now run in the compose entrypoint **before** `exec vllm`, so start no longer stops a fresh boot. Compose has `restart: unless-stopped` and `stop_grace_period: 10s`; `./stop-…` `docker rm -f`s first.
+
 - **Warm shared-prefix DSML / CJK salad after #26 ([Issue #36](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/36))**: the v1 hybrid-SWA hotfix refused to let sliding-window groups shrink `curr_hit_length`. A 21k Hermes system prefix then reported a 100% MLA cache hit while SWA had no retained tail at that length (different user turns move the replay boundary; `VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096` only keeps sparse checkpoints). Prefill was skipped and SWA KV was padded with nulls → leftover `</｜DSML｜parameter>` / Chinese / loops. v2 restores the min-across-groups length so the common hit stops at the last SWA tail. Warm hits stay large because of retention, not because we ignore a missing SWA window. Unit: `scripts/test-issue26-swa-min-v2.py`. Restart required.
 
 - **#31/#34 thinking-budget hook scanned the full prefix every decode step** *(withdrawn later the same day)*: after #34 every omitted-field request had a budget, so the V2 sampler hook no longer early-returned. Incremental scan was a stopgap; the whole hook is now removed (see Changed above).

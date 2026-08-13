@@ -111,8 +111,10 @@ stop_main_head() {
   local project="$1"
   if local_project_has_resources "$project" || docker ps -aq --filter "name=${project}-vllm-dspark" | grep -q .; then
     echo "Stopping DSpark 0731 on head (project ${project})..."
+    # rm -f first: compose down can still wait on stop_grace_period.
+    docker ps -aq --filter "name=${project}-vllm-dspark" | xargs -r docker rm -f >/dev/null 2>&1 || true
     COMPOSE_DISABLE_ENV_FILE=1 NODE_RANK=0 \
-      docker compose -p "$project" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" down || true
+      docker compose -p "$project" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" down --remove-orphans -t 1 || true
   else
     echo "No DSpark 0731 head resources for project ${project}; skipping."
   fi
@@ -129,11 +131,12 @@ stop_main_worker() {
       docker ps -aq --filter 'name=${project}-vllm-dspark'
     } | grep -q .; then
       echo 'Stopping DSpark 0731 on worker $WORKER_HOST (project $project)...'
+      docker ps -aq --filter 'name=${project}-vllm-dspark' | xargs -r docker rm -f >/dev/null 2>&1 || true
       env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS \
         COMPOSE_DISABLE_ENV_FILE=1 HF_CACHE='$WORKER_HF_CACHE' \
         VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' NODE_RANK=1 HEADLESS=1 \
         docker compose -p '$project' --env-file .env.dspark \
-          -f docker-compose.dspark.yml down || true
+          -f docker-compose.dspark.yml down --remove-orphans -t 1 || true
     else
       echo 'No DSpark 0731 worker resources for project $project on $WORKER_HOST; skipping.'
     fi

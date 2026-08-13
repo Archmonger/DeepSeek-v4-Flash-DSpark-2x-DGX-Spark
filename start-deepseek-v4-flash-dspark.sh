@@ -540,17 +540,16 @@ ssh "$WORKER_HOST" "mkdir -p $REMOTE_WORKER_DIR/recipe/vllm/v1/spec_decode"
 scp "$DSPARK_PROPOSER_FILE" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/recipe/vllm/v1/spec_decode/dspark_proposer.py"
 DSPARK_HOTFIX_FILE="$SCRIPT_DIR/patches/hotfix-nvfp4-ds-mla-issue22.sh"
 if [ -f "$DSPARK_HOTFIX_FILE" ]; then
-  echo "Syncing Issue #22 hotfix to ${WORKER_HOST}:${WORKER_DIR}"
-  scp "$DSPARK_HOTFIX_FILE" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/hotfix-nvfp4-ds-mla-issue22.sh"
+  echo "Syncing Issue #22 hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_HOTFIX_FILE" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-nvfp4-ds-mla-issue22.sh"
 fi
-# DSV4 v0.27 performance hotfixes (#50312 MTP PP buffer, #50004 adaptive topk
-# width, #49486 short-context topk skip, #48407 dense-prefill indexer skip
-# (dormant), #48957 empty-C128 compressor skip, #50298 FlashMLA workspace
-# reuse) — same sync + apply + restart lifecycle as Issue #22.
+# DSV4 v0.27 .sh hotfixes — entrypoint applies them before exec vllm (issue #38).
 for _hf_sync in hotfix-dsv4-mtp-buffer-50312.sh hotfix-dsv4-adaptive-topk-50004.sh hotfix-dsv4-skip-topk-49486.sh hotfix-dsv4-dense-prefill-indexer-48407.sh hotfix-dsv4-skip-empty-c128-48957.sh hotfix-dsv4-flashmla-workspace-50298.sh hotfix-dsv4-grammar-advance.sh; do
   if [ -f "$SCRIPT_DIR/patches/$_hf_sync" ]; then
-    echo "Syncing $_hf_sync to ${WORKER_HOST}:${WORKER_DIR}"
-    scp "$SCRIPT_DIR/patches/$_hf_sync" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/$_hf_sync"
+    echo "Syncing $_hf_sync to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+    ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+    scp "$SCRIPT_DIR/patches/$_hf_sync" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/$_hf_sync"
   fi
 done
 DSPARK_ENCODING_ISSUE21_HOTFIX="${DSPARK_ENCODING_ISSUE21_HOTFIX:-$SCRIPT_DIR/patches/hotfix-encoding-dsv4-issue21.py}"
@@ -592,72 +591,13 @@ compose_base 0 "" up -d
 # NCCL master port (VL_SIDECAR_MASTER_PORT, default 25100).
 SIDECAR_COMPOSE_FILE="${SIDECAR_COMPOSE_FILE:-$SCRIPT_DIR/docker-compose.vl-sidecar.yml}"
 
-# ---- Apply DSV4 hotfixes (Issue #22 + v0.27 perf backports) ----
-# Patches vLLM inside the running containers, then restarts them so the
-# patched files take effect.  Idempotent — skips already-applied patches.
-# Issue #22 (nvfp4_ds_mla long-context dispatch) is a baseline fix for the
-# recipe-default KV cache dtype, not a v0.27 experiment — it always applies
-# when present.  Opt-outs:
-#   DSPARK_SKIP_HOTFIX=1          skip the v0.27 perf backports only
-#   DSPARK_SKIP_ISSUE22_HOTFIX=1  also skip Issue #22 (fully clean baseline)
-DSV4_HOTFIX_FILES=()
-if [ "${DSPARK_SKIP_ISSUE22_HOTFIX:-0}" != "1" ]; then
-  DSV4_HOTFIX_FILES+=("hotfix-nvfp4-ds-mla-issue22.sh")
-fi
-if [ "${DSPARK_SKIP_HOTFIX:-0}" != "1" ]; then
-  DSV4_HOTFIX_FILES+=(
-    "hotfix-dsv4-mtp-buffer-50312.sh"
-    "hotfix-dsv4-adaptive-topk-50004.sh"
-    "hotfix-dsv4-skip-topk-49486.sh"
-    "hotfix-dsv4-dense-prefill-indexer-48407.sh"
-    "hotfix-dsv4-skip-empty-c128-48957.sh"
-    "hotfix-dsv4-flashmla-workspace-50298.sh"
-    "hotfix-dsv4-grammar-advance.sh"
-  )
-fi
-DSV4_HOTFIX_PRESENT=0
-for _hf in ${DSV4_HOTFIX_FILES[@]+"${DSV4_HOTFIX_FILES[@]}"}; do
-  if [ -f "$SCRIPT_DIR/patches/$_hf" ]; then
-    DSV4_HOTFIX_PRESENT=1
-  fi
-done
 if [ "${DSPARK_SKIP_HOTFIX:-0}" = "1" ]; then
-  if [ "${DSPARK_SKIP_ISSUE22_HOTFIX:-0}" = "1" ]; then
-    echo "Skipping DSV4 v0.27 perf hotfixes (DSPARK_SKIP_HOTFIX=1)."
-  else
-    echo "Skipping DSV4 v0.27 perf hotfixes (DSPARK_SKIP_HOTFIX=1); Issue #22 still applies."
-  fi
+  echo "Entrypoint will skip DSV4 v0.27 perf hotfixes (DSPARK_SKIP_HOTFIX=1)."
 fi
 if [ "${DSPARK_SKIP_ISSUE22_HOTFIX:-0}" = "1" ]; then
-  echo "Skipping Issue #22 hotfix (DSPARK_SKIP_ISSUE22_HOTFIX=1)."
+  echo "Entrypoint will skip Issue #22 hotfix (DSPARK_SKIP_ISSUE22_HOTFIX=1)."
 fi
-if [ "$DSV4_HOTFIX_PRESENT" = "1" ]; then
-  echo "Applying DSV4 hotfixes: ${DSV4_HOTFIX_FILES[*]} ..."
-  # Head container
-  if docker ps --format '{{.Names}}' | grep -qx "${PROJECT_NAME}-vllm-dspark-1"; then
-    for _hf in "${DSV4_HOTFIX_FILES[@]}"; do
-      [ -f "$SCRIPT_DIR/patches/$_hf" ] || continue
-      docker cp "$SCRIPT_DIR/patches/$_hf" "${PROJECT_NAME}-vllm-dspark-1:/tmp/$_hf"
-      docker exec "${PROJECT_NAME}-vllm-dspark-1" bash "/tmp/$_hf" || true
-    done
-  fi
-  # Worker container (via SSH)
-  ssh "$WORKER_HOST" "
-    docker ps --format '{{.Names}}' | grep -qx '${PROJECT_NAME}-vllm-dspark-1' || exit 0
-    for _hf in ${DSV4_HOTFIX_FILES[*]}; do
-      if [ -f '${REMOTE_WORKER_DIR}'/\$_hf ]; then
-        docker cp '${REMOTE_WORKER_DIR}'/\$_hf '${PROJECT_NAME}-vllm-dspark-1':/tmp/\$_hf
-        docker exec '${PROJECT_NAME}-vllm-dspark-1' bash /tmp/\$_hf || true
-      fi
-    done
-  " || true
-  # Restart both containers so vLLM picks up the patched files (one restart,
-  # after all hotfixes above have been applied on both nodes)
-  echo "Restarting DSpark containers to apply hotfix..."
-  ssh "$WORKER_HOST" "$REMOTE_COMPOSE $(remote_nccl_env) NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.dspark.yml restart vllm-dspark" || true
-  compose_base 0 "" restart vllm-dspark || true
-  echo "Hotfix applied and containers restarted."
-fi
+echo "Issue #22 / v0.27 .sh hotfixes run in the compose entrypoint before vllm (no mid-boot stop)."
 
 echo "Waiting for DSpark vLLM API..."
 print_initial_startup_logs
