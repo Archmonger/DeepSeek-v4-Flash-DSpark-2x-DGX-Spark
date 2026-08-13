@@ -61,6 +61,7 @@ PY
 | `VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M` | Experimental W4A16 selector |
 | `VLLM_B12X_W4A16_FORCE_TILE_CONFIG` | Experimental W4A16 selector |
 | `VLLM_HOST_IP` | Distributed bind address |
+| `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` | Issue #26: sparsify SWA prefix-cache checkpoints (default 4096). Registered on Anemll 0.1.1 hybrid coordinator. |
 | `VLLM_CACHE_ROOT` | vLLM cache root (compose sets path) |
 | `CUTE_DSL_ARCH` | **Not** `VLLM_*` — CuTeDSL/b12x compile target (`sm_121a` on GB10) |
 | `TORCH_CUDA_ARCH_LIST` / `FLASHINFER_CUDA_ARCH_LIST` | Build/JIT arch lists |

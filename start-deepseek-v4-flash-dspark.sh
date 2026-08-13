@@ -565,6 +565,12 @@ if [ -f "$DSPARK_ISSUE27_HOTFIX" ]; then
   ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
   scp "$DSPARK_ISSUE27_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py"
 fi
+DSPARK_ISSUE26_HOTFIX="${DSPARK_ISSUE26_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-issue26-hybrid-swa-min.py}"
+if [ -f "$DSPARK_ISSUE26_HOTFIX" ]; then
+  echo "Syncing Issue #26 hybrid-SWA-min hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_ISSUE26_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-issue26-hybrid-swa-min.py"
+fi
 if [ "$ENABLE_VLLM_GB10_PATCH" = "1" ]; then
   echo "Syncing GB10 vLLM patch to ${WORKER_HOST}:${WORKER_DIR}/vllm_patch_gb10"
   tar -C "$VLLM_GB10_PATCH_DIR" \
