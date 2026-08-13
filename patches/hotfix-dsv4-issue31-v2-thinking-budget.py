@@ -10,6 +10,9 @@ This patch:
   2. Installs a V2 sampler hook that counts tokens after the last
      reasoning-start marker and, once the budget is exhausted, forces the
      next sampled token(s) to the reasoning-end sequence (</think>).
+     The count is incremental (prime a short tail, then only new tokens).
+     A full-prefix Python rescan every decode step is not acceptable: #34
+     enables a default budget on every omitted-field request.
   3. Threads ReasoningConfig into the V2 Sampler so start/end ids are known.
 
 When the request omits thinking_token_budget, DEFAULT_THINKING_TOKEN_BUDGET
@@ -26,16 +29,20 @@ MARK = "# [issue31-hotfix] v2 thinking_token_budget"
 
 THINKING_BUDGET_PY = r'''# SPDX-License-Identifier: Apache-2.0
 # [issue31-hotfix] V2 thinking_token_budget (not upstream)
-"""Force reasoning-end tokens when thinking_token_budget is exhausted."""
+"""Force reasoning-end tokens when thinking_token_budget is exhausted.
+
+#34 assigns a default budget to every omitted-field request, so this hook
+runs on ordinary decode. Do **not** copy or linearly rescan the full prefix
+on every sample step — that is O(context) Python + a GPU sync per token and
+collapses long-context decode to a few tok/s.
+
+Instead: prime once from a short tail (DSV4 puts <think> at the end of the
+formatted prompt), then scan only newly appended tokens.
+"""
 
 from __future__ import annotations
 
 import os
-
-import numpy as np
-import torch
-
-from vllm.sampling_params import SamplingParams
 
 
 def _env_optional_int(name: str, default: int | None) -> int | None:
@@ -46,6 +53,27 @@ def _env_optional_int(name: str, default: int | None) -> int | None:
     if raw == "" or raw == "0":
         return None
     return int(raw)
+
+
+def _as_int_list(x) -> list[int]:
+    if x is None:
+        return []
+    if isinstance(x, (list, tuple)):
+        return [int(v) for v in x]
+    # numpy / torch: prefer a host copy when the tensor is still on device.
+    if hasattr(x, "detach"):
+        x = x.detach()
+    if hasattr(x, "cpu"):
+        try:
+            x = x.cpu()
+        except Exception:
+            pass
+    if hasattr(x, "tolist"):
+        data = x.tolist()
+        if isinstance(data, list):
+            return [int(v) for v in data]
+        return [int(data)]
+    return [int(x)]
 
 
 def _last_subseq(seq: list[int], pat: list[int]) -> int:
@@ -60,9 +88,18 @@ def _last_subseq(seq: list[int], pat: list[int]) -> int:
 
 
 class ThinkingBudgetState:
+    # DSV4 chat template emits <think> at the end of the formatted prompt.
+    # A short tail is enough to locate the active block; do not slurp 1M tokens.
+    _PRIME_TAIL = 256
+
     def __init__(self, req_states, reasoning_config, max_num_reqs: int):
         self.req_states = req_states
-        self.budget = np.full(max_num_reqs, -1, dtype=np.int32)
+        self.max_num_reqs = int(max_num_reqs)
+        self.budget = [-1] * self.max_num_reqs
+        self.last_start = [-1] * self.max_num_reqs
+        self.last_end = [-1] * self.max_num_reqs
+        self.scanned_n = [0] * self.max_num_reqs
+        self.primed = [False] * self.max_num_reqs
         start = None
         end = None
         if reasoning_config is not None:
@@ -71,55 +108,115 @@ class ThinkingBudgetState:
         self.start_ids = list(start or [])
         self.end_ids = list(end or [])
         self.enabled = bool(self.end_ids)
+        self.overlap = max(len(self.start_ids), len(self.end_ids), 1) - 1
+        # Tests / diagnostics: tokens actually read from the sequence buffer.
+        self.tokens_read = 0
 
-    def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
+    def add_request(self, req_idx: int, sampling_params) -> None:
         b = getattr(sampling_params, "thinking_token_budget", None)
         if b is None:
             b = _env_optional_int("DEFAULT_THINKING_TOKEN_BUDGET", 32768)
         self.budget[req_idx] = -1 if b is None else int(b)
+        self.last_start[req_idx] = -1
+        self.last_end[req_idx] = -1
+        self.scanned_n[req_idx] = 0
+        self.primed[req_idx] = False
 
-    def apply(
-        self,
-        logits: torch.Tensor,
-        expanded_idx_mapping: torch.Tensor,
-        expanded_local_pos: torch.Tensor,
-        idx_mapping_np: np.ndarray,
-    ) -> None:
-        if not self.enabled or not np.any(self.budget[idx_mapping_np] >= 0):
-            return
-
-        req_rows = expanded_idx_mapping.detach().to("cpu").tolist()
-        local_pos = expanded_local_pos.detach().to("cpu").tolist()
+    def _read_tokens(self, req_idx: int, start: int, end: int) -> list[int]:
+        if end <= start:
+            return []
         token_buf = self.req_states.all_token_ids
         if hasattr(token_buf, "_uva_buf"):
-            token_cpu = token_buf._uva_buf.cpu
+            row = token_buf._uva_buf.cpu[req_idx]
         else:
-            token_cpu = None
+            row = token_buf.gpu[req_idx]
+            if hasattr(row, "detach"):
+                row = row.detach()
+            if hasattr(row, "cpu"):
+                row = row.cpu()
+        sl = row[start:end]
+        if hasattr(sl, "tolist"):
+            out = [int(x) for x in sl.tolist()]
+        else:
+            out = [int(x) for x in sl]
+        self.tokens_read += len(out)
+        return out
 
-        force_rows: list[int] = []
-        force_toks: list[int] = []
-        for row, (req_idx, lpos) in enumerate(zip(req_rows, local_pos)):
-            req_idx = int(req_idx)
-            if req_idx < 0:
+    def _last_abs(self, tokens: list[int], pat: list[int], origin: int) -> int:
+        rel = _last_subseq(tokens, pat)
+        return -1 if rel < 0 else origin + rel
+
+    def _refresh(self, req_idx: int, n: int) -> None:
+        if n < self.scanned_n[req_idx]:
+            self.primed[req_idx] = False
+            self.last_start[req_idx] = -1
+            self.last_end[req_idx] = -1
+            self.scanned_n[req_idx] = 0
+        if not self.primed[req_idx]:
+            tail = min(n, max(self._PRIME_TAIL, self.overlap + 1))
+            lo = n - tail
+            toks = self._read_tokens(req_idx, lo, n)
+            self.last_start[req_idx] = self._last_abs(toks, self.start_ids, lo)
+            self.last_end[req_idx] = self._last_abs(toks, self.end_ids, lo)
+            self.scanned_n[req_idx] = n
+            self.primed[req_idx] = True
+            return
+        if n <= self.scanned_n[req_idx]:
+            return
+        lo = max(0, self.scanned_n[req_idx] - self.overlap)
+        toks = self._read_tokens(req_idx, lo, n)
+        ls = self._last_abs(toks, self.start_ids, lo)
+        le = self._last_abs(toks, self.end_ids, lo)
+        if ls >= 0:
+            self.last_start[req_idx] = ls
+        if le >= 0:
+            self.last_end[req_idx] = le
+        self.scanned_n[req_idx] = n
+
+    def decide(
+        self,
+        expanded_idx_mapping,
+        expanded_local_pos,
+        idx_mapping,
+    ) -> tuple[list[int], list[int]]:
+        """Return (logit rows, end-token ids) that must be forced this step."""
+        if not self.enabled:
+            return [], []
+        idx = _as_int_list(idx_mapping)
+        if not any(0 <= i < self.max_num_reqs and self.budget[i] >= 0 for i in idx):
+            return [], []
+
+        req_rows = _as_int_list(expanded_idx_mapping)
+        local_pos = _as_int_list(expanded_local_pos)
+        if len(local_pos) < len(req_rows):
+            local_pos = local_pos + [0] * (len(req_rows) - len(local_pos))
+
+        seen: set[int] = set()
+        for req_idx in req_rows:
+            if req_idx < 0 or req_idx in seen:
                 continue
-            budget = int(self.budget[req_idx])
-            if budget < 0:
+            if req_idx >= self.max_num_reqs or self.budget[req_idx] < 0:
                 continue
+            seen.add(req_idx)
             prefill_len = int(self.req_states.prefill_len.np[req_idx])
             n = int(self.req_states.num_computed_tokens_np[req_idx])
             if n < prefill_len:
                 continue
-            if token_cpu is not None:
-                seq = token_cpu[req_idx, :n].tolist()
-            else:
-                seq = token_buf.gpu[req_idx, :n].detach().to("cpu").tolist()
-            seq = [int(x) for x in seq]
-            last_start = _last_subseq(seq, self.start_ids)
-            last_end = _last_subseq(seq, self.end_ids)
-            if last_start < 0:
+            self._refresh(req_idx, n)
+
+        force_rows: list[int] = []
+        force_toks: list[int] = []
+        for row, (req_idx, lpos) in enumerate(zip(req_rows, local_pos)):
+            if req_idx < 0 or req_idx >= self.max_num_reqs:
                 continue
-            if last_end > last_start:
+            budget = self.budget[req_idx]
+            if budget < 0:
                 continue
+            last_start = self.last_start[req_idx]
+            last_end = self.last_end[req_idx]
+            if last_start < 0 or last_end > last_start:
+                continue
+            n = int(self.req_states.num_computed_tokens_np[req_idx])
             think_count = n - (last_start + len(self.start_ids))
             # This logit is the next generated token at offset lpos in the
             # draft+bonus window (0 = first new token this step).
@@ -129,9 +226,22 @@ class ThinkingBudgetState:
             end_i = min(overflow, len(self.end_ids) - 1)
             force_rows.append(row)
             force_toks.append(int(self.end_ids[end_i]))
+        return force_rows, force_toks
 
-        if not force_rows:
+    def apply(
+        self,
+        logits,
+        expanded_idx_mapping,
+        expanded_local_pos,
+        idx_mapping_np,
+    ) -> None:
+        force_rows, force_toks = self.decide(
+            expanded_idx_mapping, expanded_local_pos, idx_mapping_np
+        )
+        if not force_rows or logits is None:
             return
+        import torch
+
         # Wipe the forced rows then pin the end token so later top-k cannot
         # drop it.
         rows = torch.tensor(force_rows, device=logits.device, dtype=torch.long)

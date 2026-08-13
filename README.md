@@ -880,6 +880,8 @@ behavior.
 > omitted `max_tokens` → `DEFAULT_MAX_TOKENS` (**131072**). An explicit request
 > field always wins. Set either env to empty or `0` to restore the old
 > unbounded / remaining-context path ([issue #31](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/31)).
+> The V2 force-`</think>` hook is incremental (does not rescan the full prefix
+> every decode step); a restart is required to pick up hotfix updates.
 
 ### Client `max_tokens` and `thinking_token_budget`
 
