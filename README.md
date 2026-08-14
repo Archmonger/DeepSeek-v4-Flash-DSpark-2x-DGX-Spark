@@ -310,11 +310,56 @@ unmodified V2 sampler fast path and `DEFAULT_THINKING` behavior. Keep
 Inspect `finish_reason` and `completion_tokens`. `length` + null `content`
 means think ate the cap.
 
-Pi: copy [`pi-models.dspark.example.json`](pi-models.dspark.example.json) to
-`~/.pi/agent/models.json`. Use pi's thinking control (`off`/`low`/`high`/`max`);
-it maps to `chat_template_kwargs`, not generic OpenAI `reasoning_effort`. The
-example advertises `supportsThinkingTokenBudget`, so a budget is sent only when
-you set one; omit the field for the stock fast path.
+### Enabling the budget from a client
+
+`thinking_token_budget` is **opt-in per request** — the server injects no
+default when the field is omitted. To turn it on, send it from whatever client
+you use:
+
+**curl / any OpenAI-compatible client** — add `thinking_token_budget` to the
+request body. `0` disables reasoning for that one call; `N>0` caps reasoning at
+`N` generated tokens and leaves the rest of `max_tokens` for the visible
+answer:
+
+```bash
+curl :8888/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model":"deepseek-v4-flash-0731",
+  "messages":[{"role":"user","content":"Design a small rate limiter."}],
+  "max_tokens":4096,
+  "thinking_token_budget":1024,
+  "temperature":0.6,"top_p":0.95,
+  "chat_template_kwargs":{"thinking":true,"reasoning_effort":"high"}
+}'
+```
+
+**pi** — set a reasoning budget in the model entry, and pi sends the field
+for you on every request where you enable thinking. Copy
+[`pi-models.dspark.example.json`](pi-models.dspark.example.json) to
+`~/.pi/agent/models.json`, then add a `thinkingTokenBudget` (in tokens) to the
+`deepseek-v4-flash-0731` model:
+
+```json
+{
+  "id": "deepseek-v4-flash-0731",
+  "reasoning": true,
+  "thinkingTokenBudget": 1024,
+  "compat": {
+    "supportsThinkingTokenBudget": true,
+    "thinkingFormat": "chat-template",
+    "chatTemplateKwargs": {
+      "thinking":       { "$var": "thinking.enabled" },
+      "reasoning_effort": { "$var": "thinking.effort", "omitWhenOff": true },
+      "thinking_token_budget": { "$var": "model.thinkingTokenBudget", "omitWhenUnset": true }
+    }
+  }
+}
+```
+
+`supportsThinkingTokenBudget: true` advertises the capability so pi will send
+the field; `"$var": "model.thinkingTokenBudget"` with `omitWhenUnset: true`
+means the budget is only attached when you set one in the model — otherwise the
+stock fast path runs. Remove the `thinkingTokenBudget` line (or set it to `0`)
+to let the model reason freely again.
 
 ---
 

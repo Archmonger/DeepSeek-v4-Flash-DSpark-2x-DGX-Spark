@@ -6,9 +6,13 @@
 
   Live bounded 65K fresh-prefix comparison on this cluster: no-budget decode **37.2 tok/s** (1,024-token length stop) versus budgeted decode **59.3 tok/s** (256 reasoning + visible answer, 769 total), with fresh prefill **1,693–1,815 tok/s**. Short-context budgeted decode measured **67.2 tok/s**. The withdrawn implementation's ~4.5 tok/s cliff did not recur.
 
+  **Re-verified live after merge (`2689b1f` on `main`, 2026-08-14)** on 2× DGX Spark TP=2 (official 0731 @ `9e165c30`, Anemll `0.1.1`): patch applied cleanly at boot (11/11 anchors, idempotent on re-run); boot smoke exercises the budget Triton kernels on GB10/SM12.1 with no CUDA/Triton errors. A/B c=1–6, `prompt=256`, `max_tokens=4096`, `budget=1024` vs no-budget: per-stream median decode rate **at or above baseline** at every concurrency (Δ −0.0% to +19.4%, never materially below); aggregate swings are 4096-cap-hit artifacts, not budget-kernel cost. Omit-field path unchanged (no server-side default injected). Closes #48, #31, and #34; #56 stays open.
+
 ### Docs
 
-- **README rewrite for scanability**: numbered quick start at the top; default profile and “what speed to expect” in short tables; dated benches and historical lanes moved to [`results/RESULTS-2026-08-14.md`](results/RESULTS-2026-08-14.md) (includes the live 256–128K × c=1/2/4/6 matrix). Old README anchors for KV, checkpoint, `max_tokens`, and Experimental Vision are kept.
+- **README: client-side `thinking_token_budget`**: new "Enabling the budget from a client" subsection under [Thinking-token budgets](#thinking-token-budgets) shows how to turn the opt-in on from (a) `curl`/any OpenAI-compatible client (add the field to the request body; `0` disables reasoning, `N>0` caps it at `N` reasoning tokens) and (b) pi, by setting `thinkingTokenBudget` on the model plus a `"thinking_token_budget": { "$var": "model.thinkingTokenBudget", "omitWhenUnset": true }` entry in `chatTemplateKwargs`, so the field is only attached when you set one. `pi-models.dspark.example.json` already advertises `supportsThinkingTokenBudget: true`.
+
+- **README rewrite for scanability**: numbered quick start at the top; default profile and "what speed to expect" in short tables; dated benches and historical lanes moved to [`results/RESULTS-2026-08-14.md`](results/RESULTS-2026-08-14.md) (includes the live 256–128K × c=1/2/4/6 matrix). Old README anchors for KV, checkpoint, `max_tokens`, and Experimental Vision are kept.
 
 ## 2026-08-13
 
