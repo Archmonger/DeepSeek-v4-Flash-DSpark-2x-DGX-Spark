@@ -47,8 +47,9 @@ working, and the same image + HF cache on both.
    DSPARK_VLLM_IMAGE=ghcr.io/anemll/dspark-vllm-gx10:0.1.1
    ```
 
-   Leave the serving knobs in [Default profile](#default-profile) unless you
-   are deliberately changing the recipe.
+   Leave serving knobs at the defaults unless you mean to change them.
+   Meaningful on/off flags (`ABLITERATED`, thinking, vision, hotfixes) are
+   listed under [.env.dspark switches](#envdspark-switches).
 
 2. **Image on both nodes**
 
@@ -140,15 +141,96 @@ MAX_NUM_BATCHED_TOKENS=16384
 GPU_MEMORY_UTILIZATION_TEXT=0.87
 ```
 
-### Checkpoint (official vs abliterated)
+---
 
-| `ABLITERATED` | Weights |
-| --- | --- |
-| `0` | [`deepseek-ai/DeepSeek-V4-Flash-0731`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) @ `DSPARK_REVISION` |
-| `1` | [Keys abliterated](https://huggingface.co/drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32) |
+## .env.dspark switches
 
-Do not set `DSPARK_MODEL` by hand — start/prepare resolve it from the flag.
-After flipping the flag or revision: prepare if needed, then stop + start.
+Copy [`.env.dspark.example`](.env.dspark.example) → `.env.dspark`. Start syncs
+it to the worker. **Restart both ranks** after a flip (`./stop-…` then
+`./start-…`). Do not set `DSPARK_MODEL` or `GPU_MEMORY_UTILIZATION` by hand.
+
+NCCL/RoCE, CUDA arch, and compile knobs stay in the example file — they are
+cluster wiring, not product switches. Full Anemll vs Stage-C matrix:
+[docs/ENVS.md](docs/ENVS.md).
+
+### Weights
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| **`ABLITERATED`** | `0` | **`0`** = official [`deepseek-ai/DeepSeek-V4-Flash-0731`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) @ `DSPARK_REVISION`. **`1`** = [Keys abliterated](https://huggingface.co/drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32). Start and prepare pick the HF id from this flag. |
+| `DSPARK_REVISION` | `9e165c30e2704aec5d9d593cce3eebd58bbef1cb` | Official pin. Empty = tip of `main`. |
+| `DSPARK_REVISION_ABLITERATED` | empty | Abliterated pin. Empty = tip of that repo. |
+| `DSPARK_MODEL_OFFICIAL` / `DSPARK_MODEL_ABLITERATED` | the two HF ids above | Override only if you intentionally swap the repo id. |
+| `SERVED_MODEL_NAME` | `deepseek-v4-flash-0731` | Name clients send as `model`. |
+| `HF_HUB_OFFLINE` | `1` | `1` after both caches are warm (avoids filling the worker disk). Prepare forces online for the download. |
+
+Flip `ABLITERATED` like this:
+
+```bash
+# in .env.dspark
+ABLITERATED=1
+
+./prepare-dspark-model-cache.sh --yes    # or --abliterated / --official
+./stop-deepseek-v4-flash-dspark.sh
+./start-deepseek-v4-flash-dspark.sh
+```
+
+`--official` writes `ABLITERATED=0`; `--abliterated` writes `1`.
+
+### Thinking, API, vision
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| **`DEFAULT_THINKING`** | `max` | `off` / `low` / `high` / `max`. Request-level `chat_template_kwargs` still wins. |
+| `VLLM_HOST` | `0.0.0.0` | `127.0.0.1` for head-only tests. |
+| `VLLM_PORT` | `8888` | Or `./start-… --port 9000` for one launch. |
+| **`ENABLE_VL_SIDECAR`** | `0` | `1` = Qwen3-VL on `:8889` + MCP; also switches main util to `GPU_MEMORY_UTILIZATION_VISION`. |
+| `PREPARE_VL_SIDECAR_MODEL` | `0` | `1` = prepare also downloads VL weights. |
+| `INSTALL_VISION_MCP` | on when VL is on | `0` = sidecar only, skip harness MCP install. |
+
+There is **no** `thinking_token_budget` on this image (HTTP 400). Size client
+`max_tokens` so a `max` think cannot empty `content`. See
+[Thinking and `max_tokens`](#thinking-and-max_tokens).
+
+### Serve shape (not on/off, but the knobs that change the lane)
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `MAX_MODEL_LEN` | `1048576` | Per-request ceiling (1M). `200000` is the high-concurrency / Keys profile. |
+| `MAX_NUM_SEQS` | `6` | Concurrent slots. `16` only with the 200K + Stage-C path. |
+| `MAX_NUM_BATCHED_TOKENS` | `8192` | Prefill tokens per step. `16384` for big-prompt coding. |
+| `LONG_PREFILL_TOKEN_THRESHOLD` | `1024` | Issue **#27** chunk cap. `0` lets one prefill eat the whole batch (decode starves). |
+| `GPU_MEMORY_UTILIZATION_TEXT` | `0.835` | Used when `ENABLE_VL_SIDECAR=0`. Larger = bigger KV pool. |
+| `GPU_MEMORY_UTILIZATION_VISION` | `0.80` | Used when VL is on. |
+| `MTP_NUM_TOKENS` | `5` | DSpark draft depth. Must be ≥ 5. Capture size = `seqs * (k+1)`. |
+| `VLLM_USE_BREAKABLE_CUDAGRAPH` | `0` | **Keep 0.** Unset enables Anemll’s slower breakable graphs. |
+| `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` | `4096` | Issue **#26** SWA prefix-cache spacing. Leave unless you are debugging warm-cache hits. |
+
+### Hotfixes and diagnostics (on by default unless you skip)
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `DSPARK_SUPPRESS_STOPS_IN_REASONING` | `1` | `0` = client `stop` strings can fire inside `<think>` (blank `content`). |
+| `DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX` | `0` | `1` = do not apply that patch at all. |
+| `DSPARK_SKIP_ISSUE22_HOTFIX` | `0` | `1` = skip the `nvfp4_ds_mla` long-context decode fix. Don’t, on this recipe. |
+| `DSPARK_SKIP_HOTFIX` | `0` | `1` = skip the six v0.27 perf backports only (#22 still applies). |
+| `DSPARK_ISSUE43_SCHED_DIAG` | `0` | `1` = one scheduler line per step in the vLLM log (mixed prefill/decode). |
+| `ENABLE_VLLM_GB10_PATCH` | `0` | `1` = experimental hybrid NVFP4 plugin (`--quantization modelopt_gb10_hybrid`). |
+
+Issue **#21 / #26 / #27 / #43** Python hotfixes always run at container start
+(they are not skipped by `DSPARK_SKIP_HOTFIX`). `#27` + the 1024 prefill cap
+is why six huge cold prompts queue instead of starving decode.
+
+### Stage-C only (no-ops on Anemll `0.1.1`)
+
+These warn `Unknown vLLM environment variable` on the default image. They
+matter only after you switch `DSPARK_VLLM_IMAGE` to Stage-C **and** merge
+`docker-compose.stage-c.override.yml`:
+
+`VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK`, `VLLM_USE_B12X_WO_PROJECTION`,
+`VLLM_DSPARK_LOCAL_ARGMAX`, `VLLM_DSPARK_REPLICATE_MARKOV_W1`,
+`DSPARK_SLOT_CLAMP`, and the rest of the commented Stage-C block in the
+example. See [Optional: Stage-C / 200K-16](#optional-stage-c--200k-16).
 
 ---
 
