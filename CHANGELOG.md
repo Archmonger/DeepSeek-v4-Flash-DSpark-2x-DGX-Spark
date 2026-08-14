@@ -1,3 +1,9 @@
+## 2026-08-14
+
+### Docs
+
+- **README rewrite for scanability**: numbered quick start at the top; default profile and “what speed to expect” in short tables; dated benches and historical lanes moved to [`results/RESULTS-2026-08-14.md`](results/RESULTS-2026-08-14.md) (includes the live 256–128K × c=1/2/4/6 matrix). Old README anchors for KV, checkpoint, `max_tokens`, and Experimental Vision are kept.
+
 ## 2026-08-13
 
 ### Changed
