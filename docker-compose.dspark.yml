@@ -66,6 +66,8 @@ services:
       # Pin HF revision (issue #19). Empty → tip of default branch / refs/main.
       DSPARK_REVISION: "${DSPARK_REVISION:-}"
       DSPARK_ENCODING_FILE: "${DSPARK_ENCODING_FILE:-}"
+      # Optional API key for the OpenAI endpoint. Empty = no auth (default).
+      VLLM_API_KEY: "${VLLM_API_KEY:-}"
       VLLM_CACHE_ROOT: /cache/huggingface/vllm-cache
       VLLM_HOST_IP: "${VLLM_HOST_IP:-}"
 

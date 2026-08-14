@@ -8,12 +8,17 @@ PROJECT_NAME="${PROJECT_NAME:-deepseek-v4-flash}"
 LEGACY_PROJECT_NAME="${LEGACY_PROJECT_NAME:-$(basename "$SCRIPT_DIR" | tr '[:upper:]' '[:lower:]')}"
 API_URL="${API_URL:-http://127.0.0.1:8888/v1/models}"
 PORT="${PORT:-8888}"
+AUTH_HEADER_ARGS=()
 
 if [ -f "$ENV_FILE" ]; then
   set -a
   # shellcheck disable=SC1090
   source "$ENV_FILE"
   set +a
+fi
+
+if [ -n "${VLLM_API_KEY:-}" ]; then
+  AUTH_HEADER_ARGS=(-H "Authorization: Bearer $VLLM_API_KEY")
 fi
 
 : "${WORKER_HOST:?WORKER_HOST must be set in $ENV_FILE or environment}"
@@ -51,5 +56,5 @@ echo "== port/API =="
 if command -v ss >/dev/null 2>&1; then
   ss -ltn "( sport = :$PORT )" || true
 fi
-curl -fsS --max-time 5 "$API_URL" || true
+curl -fsS --max-time 5 "${AUTH_HEADER_ARGS[@]}" "$API_URL" || true
 echo
