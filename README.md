@@ -472,6 +472,23 @@ Optional GB10 hybrid plugin: `ENABLE_VLLM_GB10_PATCH=1 ./start-…`
 CI on every push ([`.github/workflows/validate.yml`](.github/workflows/validate.yml))
 is **CPU-only** (`scripts/ci-validate.sh`). Live tok/s still needs the 2× Spark pair.
 
+### Strict Responses API verification
+
+After the server is ready, run the dependency-free live verifier to check
+Responses text/SSE, stateful tool continuation, strict JSON schema, reasoning,
+invalid-field errors, appended multi-turn prefix reuse, and disconnect cleanup:
+
+```bash
+python3 scripts/verify-responses-api-live.py \
+  --base-url http://127.0.0.1:8888/v1 \
+  --model deepseek-v4-flash-0731 \
+  --output results/responses-api-live.json
+```
+
+The full run intentionally creates a ~21K-token appended conversation and a
+forced client disconnect. Use `--skip-multiturn` or `--skip-disconnect` only
+when the corresponding live behavior is outside the test scope.
+
 ---
 
 ## Files
@@ -484,6 +501,7 @@ is **CPU-only** (`scripts/ci-validate.sh`). Live tok/s still needs the 2× Spark
 | `start-` / `stop-` / `status-` / `logs-` / `smoke-*.sh` | Two-node ops |
 | `prepare-dspark-model-cache.sh` | 0731 (and optional VL) on head **and** worker |
 | `scripts/benchmark-0731.py` | Prompt × concurrency sweep |
+| `scripts/verify-responses-api-live.py` | Strict Responses, multi-turn cache, and disconnect gates |
 | [docs/ENVS.md](docs/ENVS.md) | Anemll vs Stage-C env matrix |
 | [docs/PATCHES.md](docs/PATCHES.md) | Keys / #27 / #22 notes |
 | `patches/` | Issue hotfixes applied at container start |
