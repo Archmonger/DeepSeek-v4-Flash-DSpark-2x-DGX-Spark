@@ -276,9 +276,14 @@ Capture: [docs/benchmarks.png](docs/benchmarks.png).
 `max_tokens` counts **think + answer** (reasoning + visible response + tool
 markup). With `DEFAULT_THINKING=max`, a harness cap of 256/512/800 often
 returns `content: null` / `finish_reason: length` because reasoning eats the
-whole budget. Raise `max_tokens`, set thinking `low` / `off`, or send an
+whole budget — `max` ships a checkpoint-level directive ("do not stop reasoning
+until … no error remains undiscovered") and produced **~50,000 reasoning chars
+(~12.5k tokens) on a moderate prompt** in live measurement. So "size `max_tokens`
+accordingly" means **tens of thousands of tokens**, not a small bump. Raise
+`max_tokens`, set thinking `low` / `off`, or — the supported path — send an
 explicit `thinking_token_budget` (see
-[Thinking-token budgets](#thinking-token-budgets)).
+[Thinking-token budgets](#thinking-token-budgets)) so reasoning is hard-capped
+and the rest of `max_tokens` is left for the visible answer.
 
 Client `stop` strings used to fire inside `<think>`. The recipe applies
 `patches/hotfix-dsv4-suppress-stops-in-reasoning.py` so they wait for

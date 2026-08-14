@@ -12,6 +12,8 @@
 
 - **README: client-side `thinking_token_budget`**: new "Enabling the budget from a client" subsection under [Thinking-token budgets](#thinking-token-budgets) shows how to turn the opt-in on from (a) `curl`/any OpenAI-compatible client (add the field to the request body; `0` disables reasoning, `N>0` caps it at `N` reasoning tokens) and (b) pi, by setting `thinkingTokenBudget` on the model plus a `"thinking_token_budget": { "$var": "model.thinkingTokenBudget", "omitWhenUnset": true }` entry in `chatTemplateKwargs`, so the field is only attached when you set one. `pi-models.dspark.example.json` already advertises `supportsThinkingTokenBudget: true`.
 
+- **README: `max` reasoning magnitude**: the _Thinking and `max_tokens`_ section now states that `DEFAULT_THINKING=max` produced **~50,000 reasoning chars (~12.5k tokens) on a moderate prompt** (the checkpoint's `reasoning_effort=max` directive is "do not stop until … no error remains undiscovered"), so sizing `max_tokens` for `max` means tens of thousands of tokens — and points clients at `thinking_token_budget` as the supported way to hard-cap reasoning. Documents issue #56 (closed as resolved-by-#48).
+
 - **README rewrite for scanability**: numbered quick start at the top; default profile and "what speed to expect" in short tables; dated benches and historical lanes moved to [`results/RESULTS-2026-08-14.md`](results/RESULTS-2026-08-14.md) (includes the live 256–128K × c=1/2/4/6 matrix). Old README anchors for KV, checkpoint, `max_tokens`, and Experimental Vision are kept.
 
 ## 2026-08-13
