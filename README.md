@@ -77,6 +77,7 @@ working, and the same image + HF cache on both.
    bash scripts/ci-validate.sh
    ```
 
+
 5. **Start** (worker first, then head)
 
    ```bash
@@ -188,9 +189,10 @@ ABLITERATED=1
 | `PREPARE_VL_SIDECAR_MODEL` | `0` | `1` = prepare also downloads VL weights. |
 | `INSTALL_VISION_MCP` | on when VL is on | `0` = sidecar only, skip harness MCP install. |
 
-There is **no** `thinking_token_budget` on this image (HTTP 400). Size client
-`max_tokens` so a `max` think cannot empty `content`. See
-[Thinking and `max_tokens`](#thinking-and-max_tokens).
+An explicit `thinking_token_budget` is supported (opt-in per request). Omit
+the field to keep the stock V2 sampler fast path; `DEFAULT_THINKING=max` still
+needs a generous `max_tokens` or a budget or thinking won't end. See
+[Thinking-token budgets](#thinking-token-budgets).
 
 ### Serve shape (not on/off, but the knobs that change the lane)
 
@@ -265,24 +267,54 @@ Capture: [docs/benchmarks.png](docs/benchmarks.png).
 
 ## Thinking and `max_tokens`
 
-This image **rejects** `thinking_token_budget` (HTTP 400). The #31/#34 hook was
-withdrawn. `max_tokens` counts **think + answer**. With
-`DEFAULT_THINKING=max`, a harness cap of 256/512/800 often returns
-`content: null` / `finish_reason: length`. Raise `max_tokens` or set thinking
-`low` / `off`.
+> [!IMPORTANT]
+> The replacement #31 implementation is opt-in per request and keeps its
+> counters, request mapping, boundary enforcement, and accepted-token
+> observation on the GPU. It does not scan or copy the prefix to Python on
+> decode steps, and it does not add a budget when the field is omitted.
+
+`max_tokens` counts **think + answer** (reasoning + visible response + tool
+markup). With `DEFAULT_THINKING=max`, a harness cap of 256/512/800 often
+returns `content: null` / `finish_reason: length` because reasoning eats the
+whole budget. Raise `max_tokens`, set thinking `low` / `off`, or send an
+explicit `thinking_token_budget` (see
+[Thinking-token budgets](#thinking-token-budgets)).
 
 Client `stop` strings used to fire inside `<think>`. The recipe applies
 `patches/hotfix-dsv4-suppress-stops-in-reasoning.py` so they wait for
 `</think>`. Opt out: `DSPARK_SUPPRESS_STOPS_IN_REASONING=0`.
 
-### Client `max_tokens`
+
+### Thinking-token budgets
+
+`max_tokens` caps **all** new tokens (reasoning + visible answer + tool
+markup). `thinking_token_budget` caps only the reasoning portion and forces a
+single `</think>` at the boundary, leaving the rest of `max_tokens` available
+for the visible answer or tool call. A budget of `0` disables reasoning for
+that request. Natural `</think>` remains untouched.
+
+Send the field explicitly when a hard cap is required. Omitting it retains the
+unmodified V2 sampler fast path and `DEFAULT_THINKING` behavior. Keep
+`max_tokens` comfortably above the thinking budget so the answer has room.
+
+```json
+{
+  "max_tokens": 8192,
+  "thinking_token_budget": 1024,
+  "temperature": 0.6,
+  "top_p": 0.95,
+  "chat_template_kwargs": {"thinking": true, "reasoning_effort": "high"}
+}
+```
 
 Inspect `finish_reason` and `completion_tokens`. `length` + null `content`
 means think ate the cap.
 
 Pi: copy [`pi-models.dspark.example.json`](pi-models.dspark.example.json) to
-`~/.pi/agent/models.json`. Use pi’s thinking control (`off`/`low`/`high`/`max`);
-it maps to `chat_template_kwargs`, not generic OpenAI `reasoning_effort`.
+`~/.pi/agent/models.json`. Use pi's thinking control (`off`/`low`/`high`/`max`);
+it maps to `chat_template_kwargs`, not generic OpenAI `reasoning_effort`. The
+example advertises `supportsThinkingTokenBudget`, so a budget is sent only when
+you set one; omit the field for the stock fast path.
 
 ---
 
