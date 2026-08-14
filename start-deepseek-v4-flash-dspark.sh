@@ -571,6 +571,12 @@ if [ -f "$DSPARK_ISSUE31_GPU_HOTFIX" ]; then
   ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
   scp "$DSPARK_ISSUE31_GPU_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-issue31-v2-thinking-budget-gpu.py"
 fi
+DSPARK_ISSUE55_HOTFIX="${DSPARK_ISSUE55_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-issue55-tool-truncation.py}"
+if [ -f "$DSPARK_ISSUE55_HOTFIX" ]; then
+  echo "Syncing Issue #55 tool-call truncation hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_ISSUE55_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-issue55-tool-truncation.py"
+fi
 DSPARK_ISSUE27_HOTFIX="${DSPARK_ISSUE27_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py}"
 if [ -f "$DSPARK_ISSUE27_HOTFIX" ]; then
   echo "Syncing Issue #27 partial-prefill hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"

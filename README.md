@@ -289,6 +289,16 @@ Client `stop` strings used to fire inside `<think>`. The recipe applies
 `patches/hotfix-dsv4-suppress-stops-in-reasoning.py` so they wait for
 `</think>`. Opt out: `DSPARK_SUPPRESS_STOPS_IN_REASONING=0`.
 
+A tool call cut off by `max_tokens` used to report `finish_reason: "tool_calls"`
+with **invalid JSON** `arguments` and silently poison the transcript (HTTP 400 on
+the next turn). The recipe applies `patches/hotfix-dsv4-issue55-tool-truncation.py`
+so a truncated call reports `finish_reason: "length"` (not `"tool_calls"`) and any
+non-JSON-parseable `arguments` are dropped. Clients that read `length` can discard
+the in-flight call and retry; normal model-stopped tool calls keep
+`finish_reason: "tool_calls"`. Harnesses that **ignore** `finish_reason` and
+blindly replay `args` from streaming deltas can still hit a 400 - verify your
+client drops an in-progress tool call on `finish_reason: "length"`.
+
 
 ### Thinking-token budgets
 
