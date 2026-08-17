@@ -67,12 +67,12 @@ def pad_to_length(base_url: str, model: str, text: str, target: int) -> str:
     return text
 
 
-def chat(base_url: str, model: str, prompt: str, max_tokens: int = 256,
-         temperature: float = 0.0) -> tuple[str, float]:
+def chat(base_url: str, model: str, prompt: str, max_tokens: int = 512,
+         temperature: float = 0.0, thinking_key: str = "thinking") -> tuple[str, float]:
     body = {"model": model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens, "temperature": temperature,
-            "chat_template_kwargs": {"thinking": False}}
+            "chat_template_kwargs": {thinking_key: False}}
     t0 = time.perf_counter()
     d = request_json(base_url + CHAT_URL_SUFFIX, body)
     wall = time.perf_counter() - t0
@@ -197,7 +197,8 @@ def score_answer(pred: str, golds: list[str], task: str) -> bool:
     return any(norm(g) == p for g in golds)
 
 
-def run_case(base_url: str, model: str, length: int, make_task, rng: random.Random):
+def run_case(base_url: str, model: str, length: int, make_task, rng: random.Random,
+             thinking_key: str = "thinking", max_tokens: int = 512):
     result = make_task(rng)
     if len(result) == 4:
         prompt, golds, answer_prefix, task = result
@@ -206,7 +207,7 @@ def run_case(base_url: str, model: str, length: int, make_task, rng: random.Rand
         prompt, golds, task = result
     padded = pad_to_length(base_url, model, prompt, length)
     actual = tokenize(base_url, model, padded)
-    pred, wall = chat(base_url, model, padded)
+    pred, wall = chat(base_url, model, padded, thinking_key=thinking_key, max_tokens=max_tokens)
     ok = score_answer(pred, golds, task)
     return {"task": task, "target": length, "actual_tokens": actual,
             "ok": ok, "prediction": pred[:100], "gold": golds, "secs": round(wall, 1)}
@@ -220,6 +221,13 @@ def main() -> int:
     ap.add_argument("--tasks", default="sniah,mkniah,vartrack,cwe")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--output", default="")
+    ap.add_argument("--thinking-key", default="thinking",
+                    help="chat_template_kwargs key to disable thinking: 'thinking' (DeepSeek) "
+                         "or 'enable_thinking' (Qwen3). Qwen3 ignores 'thinking' and burns the "
+                         "budget on reasoning -> empty content -> false FAILs.")
+    ap.add_argument("--max-tokens", type=int, default=512,
+                    help="generation budget; verbose models (Qwen3.8-27B) write prose before "
+                         "the answer, so 256 truncates the word list -> false FAIL. 512 covers it.")
     args = ap.parse_args()
 
     lengths = [int(x) for x in args.lengths.split(",")]
@@ -235,7 +243,7 @@ def main() -> int:
     for length in lengths:
         for make_task in tasks:
             try:
-                case = run_case(args.base_url, args.model, length, make_task, rng)
+                case = run_case(args.base_url, args.model, length, make_task, rng, args.thinking_key, args.max_tokens)
             except urllib.error.HTTPError as e:
                 case = {"task": make_task.__name__, "target": length, "ok": False,
                         "error": f"HTTP {e.code}: {e.read().decode()[:200]}"}
