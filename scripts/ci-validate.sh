@@ -143,6 +143,13 @@ if grep -q 'restart: ${DSPARK_RESTART_POLICY:-unless-stopped}' docker-compose.ds
 else
   bad "compose missing restart: unless-stopped"
 fi
+if grep -q 'exit 3' start-deepseek-v4-flash-dspark.sh \
+  && grep -q 'SuccessExitStatus=3' start-deepseek-v4-flash-dspark.sh \
+  && grep -q 'SuccessExitStatus=3' docs/ENVS.md; then
+  ok "start already-running is exit 3 (#72)"
+else
+  bad "start missing already-running exit 3 (#72)"
+fi
 
 # Mounted hotfix files must exist.
 for p in \

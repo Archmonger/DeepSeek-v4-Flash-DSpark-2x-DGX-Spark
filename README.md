@@ -85,6 +85,7 @@ working, and the same image + HF cache on both.
    ```
 
    One-shot bind override: `./start-deepseek-v4-flash-dspark.sh --host 0.0.0.0 --port 9000`.
+   After a reboot, dockerd may already have restored the ranks (`restart: unless-stopped`); start then exits **3** (already running), not 1. That is expected — do not `./stop` unless you want a cold start. systemd: `SuccessExitStatus=3`.
 
 6. **Check it is up**
 

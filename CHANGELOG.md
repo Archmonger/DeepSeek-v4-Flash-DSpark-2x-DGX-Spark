@@ -1,3 +1,9 @@
+## 2026-08-17
+
+### Fixed
+
+- **Start script vs `unless-stopped` after reboot ([Issue #72](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/72))**: dockerd restores both ranks, then `./start-…` used to `exit 1` on the existing-container guard — the same code as a real failure, which turns a systemd `Restart=on-failure` unit into a retry storm against a serving cluster. If the **head** container is already up, start now **exits 3** with a hint that this is expected after reboot; real failures stay `1`. A leftover **worker** with head down still exits 1 (stale rank after a head-only reboot — rebuild, do not treat as success). Supervisors: `SuccessExitStatus=3` + `RemainAfterExit=yes`, or `DSPARK_RESTART_POLICY=no`. Documented next to `DSPARK_RESTART_POLICY` in `docs/ENVS.md` / `.env.dspark.example`. This is not an adopt/attach path and does not claim the TP group is healthy.
+
 ## 2026-08-14
 
 ### Fixed
