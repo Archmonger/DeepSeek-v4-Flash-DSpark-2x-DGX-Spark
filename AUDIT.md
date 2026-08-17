@@ -1,6 +1,6 @@
 # Serving audit suite (verified on 2x DGX Spark / Anemll 0.1.1, 2026-08-16)
 
-This fork adds a **serving audit suite** — tests that answer "is this deployment
+This repo includes a **serving audit suite** — tests that answer "is this deployment
 actually good?" beyond "does it respond?" They were designed from first
 principles after a false-alarm hunt (a naive benchmark read 45 tok/s where the
 truth was 73+; a garble sweep scored the server's *correct* context-limit 400

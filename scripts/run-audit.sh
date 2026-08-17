@@ -17,6 +17,16 @@ MODEL="${MODEL:-deepseek-v4-flash-0731}"
 LENGTHS="${LENGTHS:-8192,32768,131072,262144}"
 TOOL_LENGTHS="${TOOL_LENGTHS:-32768,131072}"
 GARBLE_LENGTHS="${GARBLE_LENGTHS:-2048,32768,131072}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --base-url) BASE_URL="$2"; shift 2 ;;
+    --model) MODEL="$2"; shift 2 ;;
+    --lengths) LENGTHS="$2"; shift 2 ;;
+    --tool-lengths) TOOL_LENGTHS="$2"; shift 2 ;;
+    --garble-lengths) GARBLE_LENGTHS="$2"; shift 2 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STAMP=$(date +%Y%m%d-%H%M%S)
 REPORT_DIR="results/audit-${STAMP}"
@@ -25,28 +35,30 @@ echo "=== DS4 audit $STAMP | $BASE_URL | $MODEL ==="
 
 fail=0
 run_phase() {
-  local name="$1"; shift
+  local name="$1" log="$2"
+  shift 2
   echo; echo "########## Phase: $name ##########"
-  if "$@"; then echo "## $name: PASS"; else echo "## $name: FAIL"; fail=1; fi
+  set +e
+  "$@" | tee "$log"
+  local rc="${PIPESTATUS[0]}"
+  if [ "$rc" -eq 0 ]; then echo "## $name: PASS"; else echo "## $name: FAIL"; fail=1; fi
 }
 
-run_phase "1 throughput" python3 "$SCRIPT_DIR/bench-miaai.py" --base-url "$BASE_URL" --model "$MODEL" \
-  --prompt 256 --concurrency 1 --repeat 5 | tee "$REPORT_DIR/throughput.log"
+run_phase "1 throughput" "$REPORT_DIR/throughput.log" python3 "$SCRIPT_DIR/bench-miaai.py" --base-url "$BASE_URL" --model "$MODEL" \
+  --prompt 256 --concurrency 1 --repeat 5
 
-run_phase "2 spec-acceptance" python3 "$SCRIPT_DIR/spec-acceptance.py" --base-url "$BASE_URL" \
-  --model "$MODEL" --trials 5 --bench-script "$SCRIPT_DIR/bench-miaai.py" | tee "$REPORT_DIR/acceptance.log"
+run_phase "2 spec-acceptance" "$REPORT_DIR/acceptance.log" python3 "$SCRIPT_DIR/spec-acceptance.py" --base-url "$BASE_URL" \
+  --model "$MODEL" --trials 5 --bench-script "$SCRIPT_DIR/bench-miaai.py"
 
-run_phase "3 ruler-lite quality" python3 "$SCRIPT_DIR/ruler-lite.py" --base-url "$BASE_URL" \
-  --model "$MODEL" --lengths "$LENGTHS" --output "$REPORT_DIR/ruler-lite.json" | tee "$REPORT_DIR/ruler.log"
+run_phase "3 ruler-lite quality" "$REPORT_DIR/ruler.log" python3 "$SCRIPT_DIR/ruler-lite.py" --base-url "$BASE_URL" \
+  --model "$MODEL" --lengths "$LENGTHS" --output "$REPORT_DIR/ruler-lite.json"
 
-run_phase "4 tool battery" python3 "$SCRIPT_DIR/tool-battery.py" "$BASE_URL/chat/completions" "$MODEL" | tee "$REPORT_DIR/tool.log"
+run_phase "4 tool battery" "$REPORT_DIR/tool.log" python3 "$SCRIPT_DIR/tool-battery.py" "$BASE_URL/chat/completions" "$MODEL"
 
-if command -v python3 >/dev/null; then
-  run_phase "5 deep-context tool" python3 "$SCRIPT_DIR/deepctx-tool-battery.py" "$BASE_URL/chat/completions" "$MODEL" "$TOOL_LENGTHS" | tee "$REPORT_DIR/deeptool.log"
-fi
+run_phase "5 deep-context tool" "$REPORT_DIR/deeptool.log" python3 "$SCRIPT_DIR/deepctx-tool-battery.py" "$BASE_URL/chat/completions" "$MODEL" "$TOOL_LENGTHS"
 
-run_phase "6 garble sweep" python3 "$SCRIPT_DIR/context-garble-sweep.py" --url "$BASE_URL" \
-  --model "$MODEL" --lengths "$GARBLE_LENGTHS" --runs 1 --out "$REPORT_DIR/garble.md" | tee "$REPORT_DIR/garble.log"
+run_phase "6 garble sweep" "$REPORT_DIR/garble.log" python3 "$SCRIPT_DIR/context-garble-sweep.py" --url "$BASE_URL" \
+  --model "$MODEL" --lengths "$GARBLE_LENGTHS" --runs 1 --out "$REPORT_DIR/garble.md"
 
 echo; echo "=== AUDIT COMPLETE: $([ $fail -eq 0 ] && echo ALL-PASS || echo FAILURES) — reports in $REPORT_DIR ==="
 exit $fail

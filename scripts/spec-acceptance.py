@@ -63,8 +63,11 @@ def main() -> int:
     subprocess.run(cmd, capture_output=True)
 
     m2 = get_metrics(args.base_url)
+    if m1["drafted"] is None or m2["drafted"] is None:
+        print("NO draft counters in /metrics — is spec-decode on? (check MTP_NUM_TOKENS)")
+        return 0
     d = m2["drafted"] - (m1["drafted"] or 0)
-    a = m2["accepted"] - (m1["accepted"] or 0)
+    a = (m2["accepted"] or 0) - (m1["accepted"] or 0)
     print(f"after:  drafted={m2['drafted']:.0f} accepted={m2['accepted']:.0f}")
 
     print(f"\nDELTA over {args.trials} trials: drafted={d:.0f} accepted={a:.0f}")

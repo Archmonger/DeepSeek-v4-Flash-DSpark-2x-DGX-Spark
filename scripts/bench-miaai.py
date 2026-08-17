@@ -5,7 +5,7 @@ ignore_eos, numbered-word instruction. Reports median per-stream decode tok/s
 after first token (their cell value) + acceptance-ish stats from server logs are
 read separately.  Usage: bench_miaai.py --base-url ... --prompt 256 --concurrency 1
 """
-import argparse, asyncio, json, statistics, time, urllib.request
+import argparse, asyncio, json, statistics, time, urllib.error, urllib.request
 
 def request_json(url, body):
     for attempt in range(4):

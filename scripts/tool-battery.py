@@ -67,17 +67,22 @@ print(f"2. complex_schema   {'PASS' if ok else 'FAIL'} finish={fr} {det} ({w:.1f
 
 # 3. Multi-turn: tool call -> result -> final answer
 d, w = call([{"role": "user", "content": "What's the weather in Paris? Use get_weather in celsius."}], TOOLS)
-tc = d["choices"][0]["message"]["tool_calls"][0]
-fn = tc["function"]["name"]; args = json.loads(tc["function"]["arguments"])
-msg2 = {"role": "user", "content": "The weather tool returned: 22C, partly cloudy. Now tell me if I should wear a jacket."}
-d2, w2 = call([{"role": "user", "content": "What's the weather in Paris? Use get_weather in celsius."},
-               {"role": "assistant", "content": None, "tool_calls": [tc]},
-               {"role": "tool", "tool_call_id": tc["id"], "name": fn, "content": "22C partly cloudy"},
-               msg2], TOOLS)
-c2 = d2["choices"][0]["message"].get("content") or ""
-multiturn_ok = bool(c2.strip()) and not (d2["choices"][0]["message"].get("tool_calls"))
-results["multiturn"] = (multiturn_ok, d2["choices"][0].get("finish_reason"), [c2[:60]])
-print(f"3. multiturn        {'PASS' if multiturn_ok else 'FAIL'} content={c2[:60]!r} ({w+w2:.1f}s)")
+tcs = d["choices"][0]["message"].get("tool_calls") or []
+if not tcs:
+    results["multiturn"] = (False, d["choices"][0].get("finish_reason"), ["no tool_calls"])
+    print(f"3. multiturn        FAIL no tool_calls ({w:.1f}s)")
+else:
+    tc = tcs[0]
+    fn = tc["function"]["name"]; args = json.loads(tc["function"]["arguments"])
+    msg2 = {"role": "user", "content": "The weather tool returned: 22C, partly cloudy. Now tell me if I should wear a jacket."}
+    d2, w2 = call([{"role": "user", "content": "What's the weather in Paris? Use get_weather in celsius."},
+                   {"role": "assistant", "content": None, "tool_calls": [tc]},
+                   {"role": "tool", "tool_call_id": tc["id"], "name": fn, "content": "22C partly cloudy"},
+                   msg2], TOOLS)
+    c2 = d2["choices"][0]["message"].get("content") or ""
+    multiturn_ok = bool(c2.strip()) and not (d2["choices"][0]["message"].get("tool_calls"))
+    results["multiturn"] = (multiturn_ok, d2["choices"][0].get("finish_reason"), [c2[:60]])
+    print(f"3. multiturn        {'PASS' if multiturn_ok else 'FAIL'} content={c2[:60]!r} ({w+w2:.1f}s)")
 
 # 4. Parallel tool calls
 d, w = call([{"role": "user", "content": "I need weather for both Berlin and Madrid right now — call get_weather for both."}], TOOLS)
@@ -121,3 +126,4 @@ for k, (ok, fr, det) in results.items():
     print(f"  {k:15s} {'PASS' if ok else 'FAIL'}  {det}")
 npass = sum(1 for v in results.values() if v[0])
 print(f"\n{ npass}/{len(results)} tool-calling checks PASSED")
+sys.exit(0 if npass == len(results) else 1)

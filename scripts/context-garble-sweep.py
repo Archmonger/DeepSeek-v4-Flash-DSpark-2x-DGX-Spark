@@ -89,11 +89,13 @@ def score(r):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:8888/v1")
-    ap.add_argument("--model", default="SuperDeepseek-V4-Flash-abliterated-MQ-2xDGX")
-    ap.add_argument("--lengths", nargs="+", type=int, default=[2048, 8192, 32768, 131072])
+    ap.add_argument("--model", default="deepseek-v4-flash-0731")
+    ap.add_argument("--lengths", default="2048,8192,32768,131072",
+                    help="Comma-separated context lengths (also accepts a single CSV token from run-audit.sh)")
     ap.add_argument("--runs", type=int, default=2)
     ap.add_argument("--out", default="/tmp/garble-sweep.md")
     a = ap.parse_args()
+    a.lengths = [int(x) for x in str(a.lengths).replace(" ", ",").split(",") if x.strip()]
 
     lines = [f"# Context Garble Sweep — {time.strftime('%Y-%m-%d %H:%M')}", "",
              f"model: {a.model} | endpoint: {a.url} | runs/length: {a.runs} | cold prefill: forced (unique nonce)",
