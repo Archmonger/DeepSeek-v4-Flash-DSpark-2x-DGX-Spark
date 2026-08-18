@@ -1,3 +1,9 @@
+## 2026-08-19
+
+### Fixed
+
+- **RULER-lite never reached its advertised context lengths ([Issue #81](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/81))**: `pad_to_length` appended one haystack sentence per loop with `guard < 200`, so every cell capped at ~4.8k tokens while still exiting 0. It now bulk-pads and `run_case` fails if `/tokenize` is under 97% of the target.
+
 ## 2026-08-18
 
 ### Changed

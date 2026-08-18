@@ -35,6 +35,9 @@ py_files+=(
   scripts/test-responses-api-live.py
   scripts/test-encoding-dsv4-issue21.py
   scripts/test-suppress-stops-in-reasoning.py
+  scripts/test-assistant-final-continuation.py
+  scripts/test-ruler-lite-pad.py
+  scripts/ruler-lite.py
   scripts/verify-dsv4-027-equality-gate.py
 )
 python3 -m py_compile "${py_files[@]}"
@@ -55,6 +58,8 @@ python3 scripts/test-suppress-stops-in-reasoning.py -q
 ok "test-suppress-stops-in-reasoning"
 python3 scripts/test-assistant-final-continuation.py -q
 ok "test-assistant-final-continuation"
+python3 scripts/test-ruler-lite-pad.py -q
+ok "test-ruler-lite-pad"
 python3 scripts/verify-dsv4-027-equality-gate.py
 ok "verify-dsv4-027-equality-gate"
 bash scripts/verify-overlay-sources.sh

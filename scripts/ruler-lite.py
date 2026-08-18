@@ -58,11 +58,26 @@ def tokenize(base_url: str, model: str, text: str) -> int:
                         {"model": model, "prompt": text})["count"]
 
 
-def pad_to_length(base_url: str, model: str, text: str, target: int) -> str:
-    """Pad with haystack noise until /tokenize reports >= target tokens."""
+def haystack_reps(needed_tokens: int, unit_tokens: int) -> int:
+    """How many haystack copies to append to close `needed_tokens`."""
+    unit = max(1, int(unit_tokens))
+    return max(1, int(needed_tokens) // unit + 1)
+
+
+def pad_to_length(base_url: str, model: str, text: str, target: int,
+                  tokenize_fn=None) -> str:
+    """Pad with haystack noise until /tokenize reports >= target tokens.
+
+    Appends in bulk. A one-sentence-per-loop cap of 200 used to ceiling every
+    prompt at ~4.8k tokens (issue #81), so 32k/262k RULER-lite cells were fake.
+    """
+    tok = tokenize_fn or (lambda t: tokenize(base_url, model, t))
+    unit = tok(HAYSTACK_SENTENCE) or 1
+    n = tok(text)
     guard = 0
-    while tokenize(base_url, model, text) < target and guard < 200:
-        text += " " + HAYSTACK_SENTENCE
+    while n < target and guard < 40:
+        text += (" " + HAYSTACK_SENTENCE) * haystack_reps(target - n, unit)
+        n = tok(text)
         guard += 1
     return text
 
@@ -207,6 +222,9 @@ def run_case(base_url: str, model: str, length: int, make_task, rng: random.Rand
         prompt, golds, task = result
     padded = pad_to_length(base_url, model, prompt, length)
     actual = tokenize(base_url, model, padded)
+    if actual < int(length * 0.97):
+        raise RuntimeError(
+            f"padding fell short: {actual} tokens for a target of {length}")
     pred, wall = chat(base_url, model, padded, thinking_key=thinking_key, max_tokens=max_tokens)
     ok = score_answer(pred, golds, task)
     return {"task": task, "target": length, "actual_tokens": actual,
