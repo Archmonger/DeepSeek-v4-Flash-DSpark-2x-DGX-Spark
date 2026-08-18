@@ -222,13 +222,13 @@ Self-sustaining: the harness records the empty turn, so the next request is
 also assistant-final.
 
 ### Fix
-Widen the generation-header branch condition to also match a trailing
-assistant message only when `add_generation_prompt=True`
-(`patches/hotfix-dsv4-assistant-final-continuation.py`). With
-`add_generation_prompt=False`, rendering remains byte-identical to stock.
-Reopening the turn with `wo_eos` was measured worse (1-token empty generation
-on a complete turn) and is not used. Runs after the entrypoint copies the
-encoder into place.
+Widen the separate generation-header transition condition to also match only
+the final assistant message
+(`patches/hotfix-dsv4-assistant-final-continuation.py`). The checkpoint encoder
+has no `add_generation_prompt` input; the patch preserves the closed assistant
+turn, then appends a fresh generation header. Reopening the turn with `wo_eos`
+was measured worse (1-token empty generation on a complete turn) and is not
+used. Runs after the entrypoint copies the encoder into place.
 
 ### Flag (default OFF = stock)
 | value | behavior |
@@ -243,16 +243,16 @@ aborts; a failed self-check **restores the original file bytes** first. An
 already-patched encoder is re-validated (idempotent), never double-patched.
 
 ### Evidence status
-Render/no-regression evidence is from prior head `f08cd6c`; its tested
-`add_generation_prompt=True` replacement is unchanged, while this head adds a
-stock-preserving guard for `add_generation_prompt=False`. The measured
+Render/no-regression evidence is from prior head `f08cd6c`. The measured
 positive-path evidence is a causal one-prompt A/B via `/v1/completions`:
-trailing turn left open → 183
-tokens, coherent continuation; closed with EOS → 400 tokens of raw
-`<|DSML|tool_calls>` markup emitted as text. **No rescue claim**: the live
-no-op-loop defect did not reproduce in that session, so no measured
-stuck-harness recovery exists. Runtime proof of the gated ON path on the new
-head (`50b462dc`) is still pending a live serve.
+trailing turn left open → 183 tokens, coherent continuation; closed with EOS →
+400 tokens of raw `<|DSML|tool_calls>` markup emitted as text. **No rescue
+claim**: the live no-op-loop defect did not reproduce in that session, so no
+measured stuck-harness recovery exists. A first gated-ON boot attempt on
+`d4b31daf` failed closed before serving because a review-requested guard named
+the nonexistent checkpoint variable `add_generation_prompt`; the original
+encoder bytes were restored. Runtime proof of the corrected gated-ON path is
+pending a new live serve.
 
 ### Test
 ```bash

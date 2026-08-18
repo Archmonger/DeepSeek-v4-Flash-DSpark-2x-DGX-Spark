@@ -26,11 +26,11 @@ COMPOSE = ROOT / "docker-compose.dspark.yml"
 ENV_EXAMPLE = ROOT / ".env.dspark.example"
 START = ROOT / "start-deepseek-v4-flash-dspark.sh"
 
-# Minimal but faithful shape of the stock checkpoint encoder
-# (encoding_dsv4.py, installed as deepseek_v4_encoding.py): render_message()
-# is an if/elif chain where the assistant role falls through to the final
-# else and is closed with EOS, and the user/developer branch (the hotfix
-# anchor) appends the generation header only for the trailing message.
+# Minimal but faithful control flow and call signature from the stock checkpoint
+# encoder (encoding_dsv4.py, installed as deepseek_v4_encoding.py). The role is
+# rendered first; then the separate transition branch appends a generation
+# header for user/developer. A trailing assistant therefore closes with EOS and
+# falls past that branch. The hotfix widens only the transition condition.
 STOCK_ENCODER = '''\
 eos_token = "<|end of sentence|>"
 user_sp_token = "<|User|>"
@@ -38,32 +38,44 @@ assistant_sp_token = "<|Assistant|>"
 thinking_start_token = "<think>"
 
 
-def render_message(messages, index, add_generation_prompt, thinking):
+def render_message(index, messages, thinking_mode, drop_thinking=True, reasoning_effort=None):
     role = messages[index].get("role")
     content = messages[index].get("content", "")
     if role == "system":
-        return [content]
+        out = [content]
     elif role == "tool":
-        return [content]
-    elif messages[index].get("role") in ["user", "developer"]:
-        # Normal generation: append Assistant + thinking token
+        out = [content]
+    elif role in ["user", "developer"]:
         out = []
         if role == "user":
             out.append(user_sp_token)
         out.append(content)
-        if add_generation_prompt and index == len(messages) - 1:
-            out.append(assistant_sp_token)
-            if thinking:
-                out.append(thinking_start_token)
-        return out
+    elif role == "assistant":
+        out = [content, eos_token]
     else:
-        return [content, eos_token]
+        raise NotImplementedError(role)
+
+    if index + 1 < len(messages) and messages[index + 1].get("role") not in ["assistant", "latest_reminder"]:
+        return out
+
+    task = messages[index].get("task")
+    if task is not None:
+        out.append("<task>")
+    elif messages[index].get("role") in ["user", "developer"]:
+        # Normal generation: append Assistant + thinking token
+        out.append(assistant_sp_token)
+        if thinking_mode == "thinking":
+            out.append(thinking_start_token)
+    return out
 
 
-def encode_messages(messages, thinking, add_generation_prompt=True, **kwargs):
+def encode_messages(messages, thinking_mode, context=None, drop_thinking=True,
+                    add_default_bos_token=True, reasoning_effort=None):
     tokens = []
     for index in range(len(messages)):
-        tokens.extend(render_message(messages, index, add_generation_prompt, thinking))
+        tokens.extend(render_message(
+            index, messages, thinking_mode, drop_thinking, reasoning_effort
+        ))
     return tokens
 '''
 
@@ -155,31 +167,16 @@ class AssistantFinalHotfixTest(unittest.TestCase):
             stock_out = stock["encode_messages"](
                 TRAILING_ASSISTANT, "thinking", reasoning_effort="high"
             )
-            # Stock dead state: trailing assistant closes with EOS, no header.
+            # Stock dead state: trailing assistant closes with EOS, no fresh
+            # header. Patched rendering preserves those stock bytes and appends
+            # exactly one generation header (assistant speaker + thinking token).
             self.assertEqual(stock_out[-1], "<|end of sentence|>")
-            self.assertNotIn("<think>", stock_out)
-            # Patched: the same transcript gains exactly one generation header
-            # (assistant speaker + thinking token) at the tail.
             self.assertEqual(
                 out,
-                stock_out[:-1] + ["<|Assistant|>", "<think>"],
+                stock_out + ["<|Assistant|>", "<think>"],
             )
-            self.assertEqual(out.count("<|Assistant|>"), 1)
+            self.assertEqual(len(out), len(stock_out) + 2)
 
-    def test_trailing_assistant_without_generation_prompt_is_byte_identical(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self._write(tmp, STOCK_ENCODER)
-            self.assertEqual(self._run(path), 0)
-            patched = _load_module_from(path)
-            stock = _exec_dict(STOCK_ENCODER)
-            self.assertEqual(
-                patched.encode_messages(
-                    TRAILING_ASSISTANT, "thinking", add_generation_prompt=False
-                ),
-                stock["encode_messages"](
-                    TRAILING_ASSISTANT, "thinking", add_generation_prompt=False
-                ),
-            )
 
     def test_unrelated_shapes_byte_identical(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -188,12 +185,11 @@ class AssistantFinalHotfixTest(unittest.TestCase):
             patched = _load_module_from(path)
             stock = _exec_dict(STOCK_ENCODER)
             for messages in UNRELATED_SHAPES:
-                for add_gen in (True, False):
-                    self.assertEqual(
-                        patched.encode_messages(messages, "thinking", add_gen),
-                        stock["encode_messages"](messages, "thinking", add_gen),
-                        f"render changed for {messages} (add_generation_prompt={add_gen})",
-                    )
+                self.assertEqual(
+                    patched.encode_messages(messages, "thinking"),
+                    stock["encode_messages"](messages, "thinking"),
+                    f"render changed for {messages}",
+                )
 
     def test_idempotent_and_already_patched_validates(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -227,9 +223,13 @@ class AssistantFinalHotfixTest(unittest.TestCase):
         # suppresses the header for assistant turns, so the post-write
         # self-check must fail and the original bytes must be restored.
         sabotaged = STOCK_ENCODER.replace(
-            "if add_generation_prompt and index == len(messages) - 1:",
-            'if add_generation_prompt and index == len(messages) - 1'
-            ' and messages[index].get("role") != "assistant":',
+            "        out.append(assistant_sp_token)\n"
+            "        if thinking_mode == \"thinking\":\n"
+            "            out.append(thinking_start_token)\n",
+            "        if messages[index].get(\"role\") != \"assistant\":\n"
+            "            out.append(assistant_sp_token)\n"
+            "            if thinking_mode == \"thinking\":\n"
+            "                out.append(thinking_start_token)\n",
         )
         self.assertIn(self.hf.OLD, sabotaged)
         with tempfile.TemporaryDirectory() as tmp:

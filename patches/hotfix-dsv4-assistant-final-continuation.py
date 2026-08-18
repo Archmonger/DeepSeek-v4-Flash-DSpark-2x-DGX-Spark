@@ -45,15 +45,14 @@ prompt via /v1/completions, generated tokens:
 
 Reopening a *complete* assistant turn just moves the dead state: the model has
 nothing left to add and emits EOS immediately. Appending a fresh generation
-header is correct for both shapes, and matches `add_generation_prompt=True`
-semantics that OpenAI-compatible clients already assume.
+header after the closed assistant turn is correct for both shapes and matches
+the checkpoint encoder's existing generation transition.
 
 Scope
 -----
 Only the final message of a request is affected, and only when it is an
-assistant turn with `add_generation_prompt=True`. Every other rendering path,
-including trailing assistant with `add_generation_prompt=False` and
-consecutive assistant messages mid-transcript, is untouched.
+assistant turn. Every other rendering path, including consecutive assistant
+messages mid-transcript, is untouched.
 
 Gating and fail-closed operation
 --------------------------------
@@ -99,7 +98,6 @@ NEW = (
     "        # prompt ends on a bare EOS and the model generates from a dead\n"
     "        # state: immediate EOS, or raw DSML markup emitted as text.\n"
     "        messages[index].get(\"role\") == \"assistant\"\n"
-    "        and add_generation_prompt\n"
     "        and index == len(messages) - 1\n"
     "    ):\n"
     "        # Normal generation: append Assistant + thinking token\n"
@@ -118,7 +116,7 @@ def _self_check(target: Path) -> tuple[bool, str]:
     enc = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(enc)
-        tail = enc.encode_messages(
+        rendered = enc.encode_messages(
             [
                 {"role": "system", "content": "s"},
                 {"role": "user", "content": "u"},
@@ -126,12 +124,24 @@ def _self_check(target: Path) -> tuple[bool, str]:
             ],
             "thinking",
             reasoning_effort="high",
-        )[-40:]
+        )
+        speaker = getattr(
+            enc, "ASSISTANT_SP_TOKEN", getattr(enc, "assistant_sp_token", None)
+        )
+        thinking = getattr(enc, "thinking_start_token", None)
     except Exception as err:  # broken/unimportable patch must fail closed
         return False, f"self-check raised {type(err).__name__}: {err}"
-    if getattr(enc, "thinking_start_token", None) in tail:
-        return True, "generation header present in trailing-assistant tail"
-    return False, f"no generation header in tail: {tail!r}"
+    if not speaker or not thinking:
+        return False, "generation-header tokens are unavailable"
+    if isinstance(rendered, str):
+        valid = rendered.endswith(speaker + thinking)
+    elif isinstance(rendered, (list, tuple)):
+        valid = list(rendered[-2:]) == [speaker, thinking]
+    else:
+        return False, f"unexpected encoder output type: {type(rendered).__name__}"
+    if valid:
+        return True, "generation header terminates trailing-assistant render"
+    return False, f"generation header does not terminate render: {rendered[-80:]!r}"
 
 
 def main(argv: list[str]) -> int:
