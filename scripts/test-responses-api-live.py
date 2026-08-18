@@ -21,6 +21,50 @@ def load_target():
     return module
 
 
+class ContinuationFailureClient:
+    api_path = "/v1"
+
+    def __init__(self, error):
+        self.error = error
+        self.json_calls = 0
+
+    def json(self, method, path, body=None):
+        self.json_calls += 1
+        if self.json_calls == 1:
+            return {
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "output": [{"type": "message", "content": [
+                    {"type": "output_text", "text": "RESPONSES"},
+                ]}],
+            }
+        if self.json_calls == 2:
+            return {
+                "id": "resp-1",
+                "output": [{"type": "function_call", "name": "ping",
+                            "call_id": "call-1", "arguments": "{}"}],
+            }
+        if self.json_calls == 3:
+            raise self.error
+        raise AssertionError("unexpected JSON request")
+
+    def request(self, method, path, body=None):
+        frames = [
+            ("response.output_text.delta", {
+                "type": "response.output_text.delta", "delta": "RESPONSES",
+            }),
+            ("response.completed", {
+                "type": "response.completed",
+                "response": {
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            }),
+        ]
+        return 200, b"".join(
+            f"event: {name}\ndata: {json.dumps(value)}\n\n".encode()
+            for name, value in frames
+        )
+
+
 class ResponsesApiLiveTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -110,6 +154,29 @@ vllm:prefix_cache_hits_total{model_name="x"} 80
         self.assertTrue(self.module.disconnect_counter_chain_valid(before, opened, [idle, idle]))
         completed = {**idle, "successful_requests": 3.0}
         self.assertFalse(self.module.disconnect_counter_chain_valid(before, opened, [completed, completed]))
+
+    def test_continuation_404_names_store_remediation(self):
+        original = self.module.ResponseHTTPError(
+            "POST", "/v1/responses", 404, b'{"error":"missing"}')
+        client = ContinuationFailureClient(original)
+        with self.assertRaisesRegex(
+                RuntimeError,
+                "previous_response_id.*VLLM_ENABLE_RESPONSES_API_STORE=1") as caught:
+            self.module.check_responses(client, "model")
+        self.assertIs(caught.exception.__cause__, original)
+
+    def test_unrelated_continuation_http_failure_is_unchanged(self):
+        original = self.module.ResponseHTTPError(
+            "POST", "/v1/responses", 500, b"upstream")
+        client = ContinuationFailureClient(original)
+        with self.assertRaises(self.module.ResponseHTTPError) as caught:
+            self.module.check_responses(client, "model")
+        self.assertIs(caught.exception, original)
+        self.assertEqual(
+            str(caught.exception),
+            "POST /v1/responses returned HTTP 500: b'upstream'")
+        self.assertNotIn(
+            "VLLM_ENABLE_RESPONSES_API_STORE", str(caught.exception))
 
 
 if __name__ == "__main__":

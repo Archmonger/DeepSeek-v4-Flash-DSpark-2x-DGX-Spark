@@ -163,6 +163,16 @@ def disconnect_counter_chain_valid(before: dict[str, float],
                     for row in samples[idle_index:]))
 
 
+class ResponseHTTPError(RuntimeError):
+    def __init__(self, method: str, path: str, status: int, body: bytes):
+        self.method = method
+        self.path = path
+        self.status = status
+        self.body = body
+        super().__init__(
+            f"{method} {path} returned HTTP {status}: {body[:300]!r}")
+
+
 class Client:
     def __init__(self, base_url: str, timeout: float):
         parsed = urllib.parse.urlparse(base_url.rstrip("/"))
@@ -191,7 +201,7 @@ class Client:
              body: dict[str, Any] | None = None) -> dict[str, Any]:
         status, raw = self.request(method, path, body)
         if status != 200:
-            raise RuntimeError(f"{method} {path} returned HTTP {status}: {raw[:300]!r}")
+            raise ResponseHTTPError(method, path, status, raw)
         value = json.loads(raw)
         if not isinstance(value, dict):
             raise RuntimeError(f"{method} {path} did not return an object")
@@ -255,14 +265,23 @@ def check_responses(client: Client, model: str) -> dict[str, Any]:
         "tool_choice": {"type": "function", "name": "ping"}}
     tool = client.json("POST", client.api_path + "/responses", tool_request)
     call_id, response_id = response_function_call(tool, "ping")
-    continuation = client.json("POST", client.api_path + "/responses", {
-        "model": model, "previous_response_id": response_id,
-        "input": [{"type": "function_call_output", "call_id": call_id,
-                   "output": '{"ok":true}'},
-                  {"role": "user", "content": "Reply with exactly TOOL_OK."}],
-        "max_output_tokens": 64, "temperature": 0,
-        "reasoning": {"effort": "none"}, "store": False,
-    })
+    try:
+        continuation = client.json("POST", client.api_path + "/responses", {
+            "model": model, "previous_response_id": response_id,
+            "input": [{"type": "function_call_output", "call_id": call_id,
+                       "output": '{"ok":true}'},
+                      {"role": "user", "content": "Reply with exactly TOOL_OK."}],
+            "max_output_tokens": 64, "temperature": 0,
+            "reasoning": {"effort": "none"}, "store": False,
+        })
+    except ResponseHTTPError as error:
+        if error.status == 404:
+            raise RuntimeError(
+                "Responses stateful continuation returned HTTP 404 for "
+                "previous_response_id; vLLM disables the Responses API store "
+                "by default. Restart vLLM with "
+                "VLLM_ENABLE_RESPONSES_API_STORE=1.") from error
+        raise
     if responses_output_text(continuation).strip() != "TOOL_OK":
         raise RuntimeError("Responses stateful tool continuation failed")
 

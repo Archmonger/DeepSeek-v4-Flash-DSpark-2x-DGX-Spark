@@ -474,6 +474,16 @@ is **CPU-only** (`scripts/ci-validate.sh`). Live tok/s still needs the 2× Spark
 
 ### Strict Responses API verification
 
+Stateful `previous_response_id` continuation requires starting vLLM with
+`VLLM_ENABLE_RESPONSES_API_STORE=1`. vLLM keeps the Responses API store off
+by default; when enabled, stored response state consumes memory and is retained
+until the server restarts. A continuation `response_id` 404 while the other
+gates pass indicates this configuration is off, not a verifier regression.
+
+Existing live evidence: the stock configuration passed 3/4 gates, with only
+the known configuration 404; a controlled
+`VLLM_ENABLE_RESPONSES_API_STORE=1` run passed all four gates.
+
 After the server is ready, run the dependency-free live verifier to check
 Responses text/SSE, stateful tool continuation, strict JSON schema, reasoning,
 invalid-field errors, appended multi-turn prefix reuse, and disconnect cleanup:
