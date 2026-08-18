@@ -1,3 +1,9 @@
+## 2026-08-18
+
+### Fixed
+
+- **vLLM shm spin-wait wasting Grace P-cores on TP=2 ([Issue #79](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/79))**: `patches/hotfix-gb10-spin-wait.sh` flips `SpinCondition.busy_loop_s` from `1` to `0.002` in-image before `exec vllm`. Decode IPC always lands inside the old 1s window, so `sched_yield` never fell through to sleep. Opt out with `DSPARK_SKIP_SPIN_WAIT_HOTFIX=1`. Not gated by `DSPARK_SKIP_HOTFIX`. Same one-line change as PRs #71/#74.
+
 ## 2026-08-17
 
 ### Fixed

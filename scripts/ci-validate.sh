@@ -162,6 +162,7 @@ for p in \
   patches/hotfix-dsv4-issue26-hybrid-swa-min.py \
   patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py \
   patches/hotfix-nvfp4-ds-mla-issue22.sh \
+  patches/hotfix-gb10-spin-wait.sh \
   patches/hotfix-dsv4-suppress-stops-in-reasoning.py
 do
   if [ -f "$p" ]; then
