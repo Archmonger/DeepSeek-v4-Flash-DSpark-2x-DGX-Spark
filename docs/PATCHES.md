@@ -248,11 +248,19 @@ positive-path evidence is a causal one-prompt A/B via `/v1/completions`:
 trailing turn left open → 183 tokens, coherent continuation; closed with EOS →
 400 tokens of raw `<|DSML|tool_calls>` markup emitted as text. **No rescue
 claim**: the live no-op-loop defect did not reproduce in that session, so no
-measured stuck-harness recovery exists. A first gated-ON boot attempt on
-`d4b31daf` failed closed before serving because a review-requested guard named
-the nonexistent checkpoint variable `add_generation_prompt`; the original
-encoder bytes were restored. Runtime proof of the corrected gated-ON path is
-pending a new live serve.
+measured stuck-harness recovery exists.
+
+A first gated-ON boot on `d4b31daf` failed closed before serving because a
+review-requested guard named the nonexistent checkpoint variable
+`add_generation_prompt`; the original encoder bytes were restored. Corrected
+code commit `0864014` then passed serialized live proof on both ranks. OFF:
+effective flag `0`, no patch marker, and the assistant-final render ended on
+EOS. ON: effective flag `1`, both ranks logged `patched and verified`, and the
+same 98 stock token IDs were preserved with exactly
+`<|Assistant|><think>` appended. A live continuation completed with
+`alpha beta`. Re-running the patcher on both ranks reported
+`already applied and verified`. A deliberate anchor-drift boot exited `1` on
+both ranks, entered restart/failure state, and never served the API.
 
 ### Test
 ```bash
