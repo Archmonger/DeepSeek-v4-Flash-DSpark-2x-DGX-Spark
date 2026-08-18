@@ -577,6 +577,17 @@ if [ -f "$DSPARK_SPIN_WAIT_HOTFIX" ]; then
   ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
   scp "$DSPARK_SPIN_WAIT_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-gb10-spin-wait.sh"
 fi
+# DSV4 sparse-MLA autotune production-dense coverage hotfix (pair: .sh + .json).
+DSPARK_DSV4_AUTOTUNE_HOTFIX="${DSPARK_DSV4_AUTOTUNE_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-autotune-prod-dense.sh}"
+DSPARK_DSV4_AUTOTUNE_SUPP="${DSPARK_DSV4_AUTOTUNE_SUPP:-$SCRIPT_DIR/patches/dsv4-autotune-prod-dense-supp.json}"
+if [ -f "$DSPARK_DSV4_AUTOTUNE_HOTFIX" ]; then
+  echo "Syncing DSV4 autotune prod-dense hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_DSV4_AUTOTUNE_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-autotune-prod-dense.sh"
+  if [ -f "$DSPARK_DSV4_AUTOTUNE_SUPP" ]; then
+    scp "$DSPARK_DSV4_AUTOTUNE_SUPP" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/dsv4-autotune-prod-dense-supp.json"
+  fi
+fi
 # DSV4 v0.27 .sh hotfixes — entrypoint applies them before exec vllm (issue #38).
 for _hf_sync in hotfix-dsv4-mtp-buffer-50312.sh hotfix-dsv4-adaptive-topk-50004.sh hotfix-dsv4-skip-topk-49486.sh hotfix-dsv4-dense-prefill-indexer-48407.sh hotfix-dsv4-skip-empty-c128-48957.sh hotfix-dsv4-flashmla-workspace-50298.sh hotfix-dsv4-grammar-advance.sh; do
   if [ -f "$SCRIPT_DIR/patches/$_hf_sync" ]; then

@@ -1,0 +1,106 @@
+{
+  "_metadata": {
+    "flashinfer_version": "0.6.15",
+    "cuda_version": "13.0",
+    "cublas_version": "13.1.0",
+    "cudnn_version": "91900",
+    "cudnn_frontend_version": "1.26.0",
+    "gpu": "NVIDIA GB10"
+  },
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((1, 32, 512), (1, 128), (-1, 32, 130, 512), (-1, 32, 130), (-1, 32, 512), (-1, 32), (1,), (32,), (1, 8192), (1,)), (True, True, 8192, True))": [
+    "SparseMlaDecodeV3Runner",
+    6
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((1, 32, 512), (1, 128), (-1, 32, 18, 512), (-1, 32, 18), (-1, 32, 512), (-1, 32), (1,), (32,), (1, 1024), (1,)), (True, True, 1024, True))": [
+    "SparseMlaDecodeV3Runner",
+    1
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((1, 32, 512), (1, 128), (-1, 32, 34, 512), (-1, 32, 34), (-1, 32, 512), (-1, 32), (1,), (32,), (1, 2048), (1,)), (True, True, 2048, True))": [
+    "SparseMlaDecodeV3Runner",
+    2
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((1, 32, 512), (1, 128), (-1, 32, 6, 512), (-1, 32, 6), (-1, 32, 512), (-1, 32), (1,), (32,), (1, 256), (1,)), (True, True, 256, True))": [
+    "SparseMlaDecodeV3Runner",
+    1
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((16, 32, 512), (16, 128), (-1, 32, 130, 512), (-1, 32, 130), (-1, 32, 512), (-1, 32), (16,), (32,), (16, 8192), (16,)), (True, True, 8192, True))": [
+    "SparseMlaDecodeV3Runner",
+    92
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((16, 32, 512), (16, 128), (-1, 32, 18, 512), (-1, 32, 18), (-1, 32, 512), (-1, 32), (16,), (32,), (16, 1024), (16,)), (True, True, 1024, True))": [
+    "SparseMlaDecodeV3Runner",
+    13
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((16, 32, 512), (16, 128), (-1, 32, 34, 512), (-1, 32, 34), (-1, 32, 512), (-1, 32), (16,), (32,), (16, 2048), (16,)), (True, True, 2048, True))": [
+    "SparseMlaDecodeV3Runner",
+    24
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((16, 32, 512), (16, 128), (-1, 32, 6, 512), (-1, 32, 6), (-1, 32, 512), (-1, 32), (16,), (32,), (16, 256), (16,)), (True, True, 256, True))": [
+    "SparseMlaDecodeV3Runner",
+    5
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((32, 32, 512), (32, 128), (-1, 32, 130, 512), (-1, 32, 130), (-1, 32, 512), (-1, 32), (32,), (32,), (32, 8192), (32,)), (True, True, 8192, True))": [
+    "SparseMlaDecodeV3Runner",
+    79
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((32, 32, 512), (32, 128), (-1, 32, 18, 512), (-1, 32, 18), (-1, 32, 512), (-1, 32), (32,), (32,), (32, 1024), (32,)), (True, True, 1024, True))": [
+    "SparseMlaDecodeV3Runner",
+    12
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((32, 32, 512), (32, 128), (-1, 32, 34, 512), (-1, 32, 34), (-1, 32, 512), (-1, 32), (32,), (32,), (32, 2048), (32,)), (True, True, 2048, True))": [
+    "SparseMlaDecodeV3Runner",
+    21
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((32, 32, 512), (32, 128), (-1, 32, 6, 512), (-1, 32, 6), (-1, 32, 512), (-1, 32), (32,), (32,), (32, 256), (32,)), (True, True, 256, True))": [
+    "SparseMlaDecodeV3Runner",
+    4
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((4, 32, 512), (4, 128), (-1, 32, 130, 512), (-1, 32, 130), (-1, 32, 512), (-1, 32), (4,), (32,), (4, 8192), (4,)), (True, True, 8192, True))": [
+    "SparseMlaDecodeV3Runner",
+    22
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((4, 32, 512), (4, 128), (-1, 32, 18, 512), (-1, 32, 18), (-1, 32, 512), (-1, 32), (4,), (32,), (4, 1024), (4,)), (True, True, 1024, True))": [
+    "SparseMlaDecodeV3Runner",
+    3
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((4, 32, 512), (4, 128), (-1, 32, 34, 512), (-1, 32, 34), (-1, 32, 512), (-1, 32), (4,), (32,), (4, 2048), (4,)), (True, True, 2048, True))": [
+    "SparseMlaDecodeV3Runner",
+    6
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((4, 32, 512), (4, 128), (-1, 32, 6, 512), (-1, 32, 6), (-1, 32, 512), (-1, 32), (4,), (32,), (4, 256), (4,)), (True, True, 256, True))": [
+    "SparseMlaDecodeV3Runner",
+    1
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((64, 32, 512), (64, 128), (-1, 32, 130, 512), (-1, 32, 130), (-1, 32, 512), (-1, 32), (64,), (32,), (64, 8192), (64,)), (True, True, 8192, True))": [
+    "SparseMlaDecodeV3Runner",
+    74
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((64, 32, 512), (64, 128), (-1, 32, 18, 512), (-1, 32, 18), (-1, 32, 512), (-1, 32), (64,), (32,), (64, 1024), (64,)), (True, True, 1024, True))": [
+    "SparseMlaDecodeV3Runner",
+    18
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((64, 32, 512), (64, 128), (-1, 32, 34, 512), (-1, 32, 34), (-1, 32, 512), (-1, 32), (64,), (32,), (64, 2048), (64,)), (True, True, 2048, True))": [
+    "SparseMlaDecodeV3Runner",
+    20
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((64, 32, 512), (64, 128), (-1, 32, 6, 512), (-1, 32, 6), (-1, 32, 512), (-1, 32), (64,), (32,), (64, 256), (64,)), (True, True, 256, True))": [
+    "SparseMlaDecodeV3Runner",
+    6
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((8, 32, 512), (8, 128), (-1, 32, 130, 512), (-1, 32, 130), (-1, 32, 512), (-1, 32), (8,), (32,), (8, 8192), (8,)), (True, True, 8192, True))": [
+    "SparseMlaDecodeV3Runner",
+    44
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((8, 32, 512), (8, 128), (-1, 32, 18, 512), (-1, 32, 18), (-1, 32, 512), (-1, 32), (8,), (32,), (8, 1024), (8,)), (True, True, 1024, True))": [
+    "SparseMlaDecodeV3Runner",
+    6
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((8, 32, 512), (8, 128), (-1, 32, 34, 512), (-1, 32, 34), (-1, 32, 512), (-1, 32), (8,), (32,), (8, 2048), (8,)), (True, True, 2048, True))": [
+    "SparseMlaDecodeV3Runner",
+    12
+  ],
+  "('sparse_mla_sm120_decode_dsv4', 'SparseMlaDecodeV3Runner', ((8, 32, 512), (8, 128), (-1, 32, 6, 512), (-1, 32, 6), (-1, 32, 512), (-1, 32), (8,), (32,), (8, 256), (8,)), (True, True, 256, True))": [
+    "SparseMlaDecodeV3Runner",
+    2
+  ]
+}
