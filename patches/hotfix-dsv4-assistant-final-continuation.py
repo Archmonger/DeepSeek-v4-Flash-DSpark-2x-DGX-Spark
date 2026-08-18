@@ -51,15 +51,39 @@ semantics that OpenAI-compatible clients already assume.
 Scope
 -----
 Only the final message of a request is affected, and only when it is an
-assistant turn. Every other rendering path, including consecutive assistant
-messages mid-transcript, is untouched.
+assistant turn with `add_generation_prompt=True`. Every other rendering path,
+including trailing assistant with `add_generation_prompt=False` and
+consecutive assistant messages mid-transcript, is untouched.
 
-Idempotent. Patches the encoding module the server actually loads, so it must
-run AFTER the compose entrypoint copies `encoding_dsv4.py` into place.
+Gating and fail-closed operation
+--------------------------------
+The compose entrypoint invokes this script only when
+`DSPARK_ENABLE_ASSISTANT_FINAL_HOTFIX` is exactly `1` (default `0` = stock
+renderer, this script never runs), and chains it with `|| exit 1`. Because an
+invocation means the operator asked for the fix, everything fails nonzero:
+
+- encoder file missing (the prerequisite `encoding_dsv4.py` copy did not
+  happen) — a gated-ON boot must not silently serve the buggy stock renderer;
+- anchor text missing (upstream encoder drifted) — nothing is written;
+- post-write self-check failure (patched module does not import, or a
+  trailing-assistant transcript still renders without a generation header) —
+  the original file bytes are restored first, then exit 1.
+
+Idempotent: an already-patched encoder is not rewritten, but it must still pass
+the self-check. Patches the encoding module the server actually loads, so it
+must run AFTER the compose entrypoint copies `encoding_dsv4.py` into place.
+
+Usage (inside container, after encoder copy):
+  python3 hotfix-dsv4-assistant-final-continuation.py
+  python3 hotfix-dsv4-assistant-final-continuation.py /path/to/deepseek_v4_encoding.py
 """
+from __future__ import annotations
+
+import importlib.util
+import sys
 from pathlib import Path
 
-TARGET = Path(
+DEFAULT_TARGET = Path(
     "/usr/local/lib/python3.12/dist-packages/vllm/tokenizers/deepseek_v4_encoding.py"
 )
 MARK = "[assistant-final-hotfix]"
@@ -75,45 +99,81 @@ NEW = (
     "        # prompt ends on a bare EOS and the model generates from a dead\n"
     "        # state: immediate EOS, or raw DSML markup emitted as text.\n"
     "        messages[index].get(\"role\") == \"assistant\"\n"
+    "        and add_generation_prompt\n"
     "        and index == len(messages) - 1\n"
     "    ):\n"
     "        # Normal generation: append Assistant + thinking token\n"
 )
 
 
-def main() -> None:
-    if not TARGET.exists():
-        # The encoder is copied in from the checkpoint by the compose
-        # entrypoint; if that did not happen there is nothing to patch.
-        print(f"[assistant-final-hotfix] not found, skipping: {TARGET}")
-        return
+def _self_check(target: Path) -> tuple[bool, str]:
+    """Import the patched encoder and confirm the fix actually renders.
 
-    src = TARGET.read_text()
-    if MARK in src:
-        print("[assistant-final-hotfix] already applied")
-        return
-    if OLD not in src:
-        raise SystemExit(f"[assistant-final-hotfix] anchor not found in {TARGET}")
-
-    TARGET.write_text(src.replace(OLD, NEW, 1))
-    print(f"[assistant-final-hotfix] patched {TARGET}")
-
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location("enc_check", TARGET)
+    A trailing-assistant transcript must end with the generation header
+    (assistant speaker token + thinking token) instead of a bare EOS.
+    """
+    spec = importlib.util.spec_from_file_location("enc_check", target)
+    if spec is None or spec.loader is None:
+        return False, f"cannot load module spec from {target}"
     enc = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(enc)
-    msgs = [
-        {"role": "system", "content": "s"},
-        {"role": "user", "content": "u"},
-        {"role": "assistant", "content": "A finished answer."},
-    ]
-    tail = enc.encode_messages(msgs, "thinking", reasoning_effort="high")[-40:]
-    if enc.thinking_start_token in tail:
-        print("[assistant-final-hotfix] verified: generation header present")
-    else:
-        print(f"[assistant-final-hotfix] WARNING: no header in tail: {tail!r}")
+    try:
+        spec.loader.exec_module(enc)
+        tail = enc.encode_messages(
+            [
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "u"},
+                {"role": "assistant", "content": "A finished answer."},
+            ],
+            "thinking",
+            reasoning_effort="high",
+        )[-40:]
+    except Exception as err:  # broken/unimportable patch must fail closed
+        return False, f"self-check raised {type(err).__name__}: {err}"
+    if getattr(enc, "thinking_start_token", None) in tail:
+        return True, "generation header present in trailing-assistant tail"
+    return False, f"no generation header in tail: {tail!r}"
+
+
+def main(argv: list[str]) -> int:
+    target = Path(argv[1]) if len(argv) > 1 else DEFAULT_TARGET
+
+    if not target.is_file():
+        # Invoked == gated ON: a missing encoder is a prerequisite failure,
+        # not a skip (compose chains this with `|| exit 1`).
+        print(f"[FAIL] {MARK} encoder file not found: {target}", file=sys.stderr)
+        return 1
+
+    src = target.read_text(encoding="utf-8")
+
+    if MARK in src:
+        ok, why = _self_check(target)
+        if ok:
+            print(f"[OK] {MARK} already applied and verified: {target}")
+            return 0
+        print(
+            f"[FAIL] {MARK} already applied but self-check failed: {why}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if OLD not in src:
+        print(f"[FAIL] {MARK} anchor not found in {target}", file=sys.stderr)
+        return 1
+
+    target.write_text(src.replace(OLD, NEW, 1), encoding="utf-8")
+    ok, why = _self_check(target)
+    if ok:
+        print(f"[OK] {MARK} patched and verified: {target}")
+        return 0
+
+    # Fail closed: never leave a written-but-unverified encoder behind.
+    target.write_text(src, encoding="utf-8")
+    print(
+        f"[FAIL] {MARK} self-check failed, original restored ({target}): {why}",
+        file=sys.stderr,
+    )
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main(sys.argv))
