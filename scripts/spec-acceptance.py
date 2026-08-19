@@ -18,29 +18,37 @@ Usage:
 """
 import argparse
 import json
+import re
 import statistics
 import subprocess
 import sys
 import time
 import urllib.request
 
+POSITION_RE = re.compile(r'position="(\d+)"')
+
 
 def get_metrics(base_url: str) -> dict:
     url = base_url.removesuffix("/v1") + "/metrics"
     with urllib.request.urlopen(url, timeout=30) as r:
         txt = r.read().decode()
-    out = {"drafted": None, "accepted": None, "per_pos": {}}
+    out = {"drafted": None, "accepted": None, "drafts": None, "per_pos": {}}
     for line in txt.splitlines():
         if line.startswith("vllm:spec_decode_num_draft_tokens_total"):
             out["drafted"] = float(line.split()[-1])
         elif line.startswith("vllm:spec_decode_num_accepted_tokens_total"):
             out["accepted"] = float(line.split()[-1])
-        elif "accepted_tokens_per_pos" in line and "{" in line:
-            try:
-                pos = int(line.split("position=")[1].split(",")[0].strip('"'))
-                out["per_pos"][pos] = float(line.split()[-1])
-            except Exception:
-                pass
+        elif line.startswith("vllm:spec_decode_num_drafts_total"):
+            out["drafts"] = float(line.split()[-1])
+        # Anchor on _total: the sibling _created gauge carries a Unix timestamp.
+        elif line.startswith("vllm:spec_decode_num_accepted_tokens_per_pos_total"):
+            # Match the label directly. Splitting on "," assumes position= is
+            # followed by another label, but this build emits it last, so the old
+            # parse produced '0"} 40263.0' and the bare except dropped every
+            # position — leaving the curve permanently empty.
+            hit = POSITION_RE.search(line)
+            if hit:
+                out["per_pos"][int(hit.group(1))] = float(line.split()[-1])
     return out
 
 
@@ -74,12 +82,15 @@ def main() -> int:
     if d > 0:
         rate = a / d * 100
         print(f"OVERALL ACCEPTANCE = {rate:.1f}%")
-        print(f"tokens accepted per draft = {a/d:.3f} (k=5 -> max 5)")
-        # per-position acceptance curve
-        print("\nper-position acceptance (pos0..pos4):")
+        n_drafts = (m2["drafts"] or 0.0) - (m1["drafts"] or 0.0)
+        # Per-position curve over THIS window. Reporting m2 alone would print the
+        # container's lifetime totals, which no longer describe the burst above.
+        print("\nper-position acceptance (this window):")
         for pos in sorted(m2["per_pos"]):
-            v = m2["per_pos"][pos]
-            if v:
+            v = m2["per_pos"][pos] - m1["per_pos"].get(pos, 0.0)
+            if n_drafts > 0:
+                print(f"  pos{pos}: {v / n_drafts:.3f}  ({v:.0f}/{n_drafts:.0f})")
+            elif v:
                 print(f"  pos{pos}: {v:.0f} accepted")
     else:
         print("NO draft activity in window — is spec-decode on? (check MTP_NUM_TOKENS)")
