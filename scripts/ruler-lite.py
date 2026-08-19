@@ -46,19 +46,10 @@ CWE_WORDS = ["apple", "banana", "cherry", "dragon", "eagle", "forest", "garden",
              "thunder", "utopia", "violet", "willow", "xenon", "yonder"]
 
 
-# Client-side HTTP timeout, overridable with --request-timeout. The former
-# hardcoded 900 s is shorter than a single cold prefill near the 1M ceiling: at
-# the ~1.1k tok/s prefill measured on 2x DGX Spark, a 900k-token prompt needs
-# ~800 s of prefill plus padding round trips and decode, so every 900k task
-# failed as "timed out" and was scored as a FAIL — a harness limit reported as a
-# model failure.
-REQUEST_TIMEOUT = 900.0
-
-
-def request_json(url: str, body: dict, timeout: float | None = None) -> dict:
+def request_json(url: str, body: dict, timeout: float = 900) -> dict:
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout or REQUEST_TIMEOUT) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.load(resp)
 
 
@@ -67,34 +58,27 @@ def tokenize(base_url: str, model: str, text: str) -> int:
                         {"model": model, "prompt": text})["count"]
 
 
-def pad_to_length(base_url: str, model: str, text: str, target: int) -> str:
+def haystack_reps(needed_tokens: int, unit_tokens: int) -> int:
+    """How many haystack copies to append to close `needed_tokens`."""
+    unit = max(1, int(unit_tokens))
+    return max(1, int(needed_tokens) // unit + 1)
+
+
+def pad_to_length(base_url: str, model: str, text: str, target: int,
+                  tokenize_fn=None) -> str:
     """Pad with haystack noise until /tokenize reports >= target tokens.
 
-    Pads in estimated-size chunks instead of one sentence per /tokenize round
-    trip. The previous implementation appended a single sentence per iteration
-    under a fixed ``guard < 200``, which capped the achievable context at about
-    200 * len(HAYSTACK_SENTENCE) ~= 5k tokens: every requested length at or above
-    8192 was silently evaluated at that ceiling while still being reported as a
-    PASS *at the requested depth*, so this gate never exercised long context.
-
-    Raises RuntimeError rather than returning a short prompt, so failing to reach
-    the depth is visible instead of being scored as a pass.
+    Appends in bulk. A one-sentence-per-loop cap of 200 used to ceiling every
+    prompt at ~4.8k tokens (issue #81), so 32k/262k RULER-lite cells were fake.
     """
-    cur = tokenize(base_url, model, text)
-    if cur >= target:
-        return text
-    unit = tokenize(base_url, model, HAYSTACK_SENTENCE) or 1
-    for _ in range(64):                 # each pass closes most of the remaining gap
-        deficit = target - cur
-        if deficit <= 0:
-            break
-        text += (" " + HAYSTACK_SENTENCE) * max(1, deficit // unit)
-        cur = tokenize(base_url, model, text)
-    if cur < target:
-        raise RuntimeError(
-            f"pad_to_length could not reach {target} tokens (stalled at {cur}); "
-            "refusing to score a short prompt as if it were at depth"
-        )
+    tok = tokenize_fn or (lambda t: tokenize(base_url, model, t))
+    unit = tok(HAYSTACK_SENTENCE) or 1
+    n = tok(text)
+    guard = 0
+    while n < target and guard < 40:
+        text += (" " + HAYSTACK_SENTENCE) * haystack_reps(target - n, unit)
+        n = tok(text)
+        guard += 1
     return text
 
 
@@ -238,6 +222,9 @@ def run_case(base_url: str, model: str, length: int, make_task, rng: random.Rand
         prompt, golds, task = result
     padded = pad_to_length(base_url, model, prompt, length)
     actual = tokenize(base_url, model, padded)
+    if actual < int(length * 0.97):
+        raise RuntimeError(
+            f"padding fell short: {actual} tokens for a target of {length}")
     pred, wall = chat(base_url, model, padded, thinking_key=thinking_key, max_tokens=max_tokens)
     ok = score_answer(pred, golds, task)
     return {"task": task, "target": length, "actual_tokens": actual,
@@ -259,15 +246,7 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=512,
                     help="generation budget; verbose models (Qwen3.8-27B) write prose before "
                          "the answer, so 256 truncates the word list -> false FAIL. 512 covers it.")
-    ap.add_argument("--request-timeout", type=float, default=900.0,
-                    help="client HTTP timeout in seconds. A single cold prefill near the 1M "
-                         "ceiling exceeds the old hardcoded 900 s (~1.1k tok/s prefill on 2x DGX "
-                         "Spark => ~800 s for 900k tokens, before padding round trips and "
-                         "decode), which scored a harness timeout as a model FAIL. Raise for "
-                         "--lengths at or above ~500k.")
     args = ap.parse_args()
-    global REQUEST_TIMEOUT
-    REQUEST_TIMEOUT = args.request_timeout
 
     lengths = [int(x) for x in args.lengths.split(",")]
     task_map = {"sniah": task_sniah, "mkniah": task_mkniah,
