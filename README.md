@@ -48,7 +48,7 @@ working, and the same image + HF cache on both.
    ```
 
    Leave serving knobs at the defaults unless you mean to change them.
-   Meaningful on/off flags (`ABLITERATED`, thinking, vision, hotfixes) are
+   Meaningful on/off flags (thinking, vision, hotfixes) are
    listed under [.env.dspark switches](#envdspark-switches).
 
 2. **Image on both nodes**
@@ -66,9 +66,8 @@ working, and the same image + HF cache on both.
    ./prepare-dspark-model-cache.sh --official
    ```
 
-   Use `--abliterated` or `--yes` (reads `ABLITERATED` from `.env.dspark`).
-   Prepare forces HF online even if `HF_HUB_OFFLINE=1`, then you can serve
-   offline. After the cache is complete, keep `HF_HUB_OFFLINE=1` so a hub
+   Use `--yes` (reads model vars from `.env.dspark`). Prepare forces HF
+   online even if `HF_HUB_OFFLINE=1`, then you can serve offline. After the cache is complete, keep `HF_HUB_OFFLINE=1` so a hub
    retry cannot fill the worker disk.
 
 4. **Optional CPU gates** (no GPU; will not measure tok/s)
@@ -117,7 +116,7 @@ hosts or it can kill vLLM under deep-context load.
 | Knob | Default |
 | --- | --- |
 | Image | `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` |
-| Checkpoint | official 0731 @ `9e165c30e2704aec5d9d593cce3eebd58bbef1cb` (`ABLITERATED=0`) |
+| Checkpoint | official 0731 @ `9e165c30e2704aec5d9d593cce3eebd58bbef1cb` |
 | Served name | `deepseek-v4-flash-0731` |
 | Context ceiling | `MAX_MODEL_LEN=1048576` (1M) |
 | Concurrent seqs | `MAX_NUM_SEQS=6` |
@@ -159,25 +158,20 @@ cluster wiring, not product switches. Full Anemll vs Stage-C matrix:
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| **`ABLITERATED`** | `0` | **`0`** = official [`deepseek-ai/DeepSeek-V4-Flash-0731`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) @ `DSPARK_REVISION`. **`1`** = [Keys abliterated](https://huggingface.co/drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32). Start and prepare pick the HF id from this flag. |
 | `DSPARK_REVISION` | `9e165c30e2704aec5d9d593cce3eebd58bbef1cb` | Official pin. Empty = tip of `main`. |
-| `DSPARK_REVISION_ABLITERATED` | empty | Abliterated pin. Empty = tip of that repo. |
-| `DSPARK_MODEL_OFFICIAL` / `DSPARK_MODEL_ABLITERATED` | the two HF ids above | Override only if you intentionally swap the repo id. |
 | `SERVED_MODEL_NAME` | `deepseek-v4-flash-0731` | Name clients send as `model`. |
 | `HF_HUB_OFFLINE` | `1` | `1` after both caches are warm (avoids filling the worker disk). Prepare forces online for the download. |
 
-Flip `ABLITERATED` like this:
+Update the pin like this:
 
 ```bash
 # in .env.dspark
-ABLITERATED=1
+DSPARK_REVISION=<commit>
 
-./prepare-dspark-model-cache.sh --yes    # or --abliterated / --official
+./prepare-dspark-model-cache.sh --yes
 ./stop-deepseek-v4-flash-dspark.sh
 ./start-deepseek-v4-flash-dspark.sh
 ```
-
-`--official` writes `ABLITERATED=0`; `--abliterated` writes `1`.
 
 ### Thinking, API, vision
 
@@ -528,7 +522,6 @@ Full list: [`CREDITS.md`](CREDITS.md).
 
 **[drowzeys ("Keys")](https://github.com/drowzeys/)** — DSpark concurrency
 patch, ragged `query_start_loc`, `nvfp4_ds_mla` wiring.
-**[@u1tra_instinct](https://x.com/u1tra_instinct)** — abliterated weights.
 Also: [tonyd2wild](https://github.com/tonyd2wild/), Rafael Caricio, Fraser Price,
 [Anemll](https://github.com/Anemll/dspark-vllm-gx10), MiaAI-Lab packaging.
 
