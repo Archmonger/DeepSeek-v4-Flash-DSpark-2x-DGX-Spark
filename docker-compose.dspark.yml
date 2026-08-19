@@ -87,6 +87,11 @@ services:
 
       VLLM_USE_FLASHINFER_SAMPLER: "${VLLM_USE_FLASHINFER_SAMPLER:-1}"
       VLLM_USE_BREAKABLE_CUDAGRAPH: "${VLLM_USE_BREAKABLE_CUDAGRAPH:-0}"
+      # Issue #65/#87: mid-serve CuTeDSL/TileLang JIT can exceed the 300s
+      # sample_tokens RPC default and kill EngineCore (looks like an NCCL
+      # wedge on TP=2). 1800s rides out a worst-case compile; a true hang
+      # just surfaces later. Override to 300 to restore stock.
+      VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"
 
       VLLM_USE_B12X_MOE: "${VLLM_USE_B12X_MOE:-1}"
       VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM: "${VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM:-0}"
@@ -103,6 +108,9 @@ services:
       FLASHINFER_DISABLE_VERSION_CHECK: "${FLASHINFER_DISABLE_VERSION_CHECK:-1}"
       FLASHINFER_WORKSPACE_BASE: "${FLASHINFER_WORKSPACE_BASE:-/cache/huggingface/flashinfer}"
       TILELANG_CLEANUP_TEMP_FILES: "${TILELANG_CLEANUP_TEMP_FILES:-1}"
+      # Persist TileLang compiled kernels on the HF cache volume (issue #65).
+      # Default in-image path was ~/.tilelang/cache (lost on recreate).
+      TILELANG_CACHE_DIR: "${TILELANG_CACHE_DIR:-/cache/huggingface/tilelang-cache}"
       DG_JIT_USE_NVRTC: "${DG_JIT_USE_NVRTC:-0}"
       DG_JIT_NVCC_COMPILER: "${DG_JIT_NVCC_COMPILER:-/usr/local/cuda/bin/nvcc}"
       PYTORCH_CUDA_ALLOC_CONF: "${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"

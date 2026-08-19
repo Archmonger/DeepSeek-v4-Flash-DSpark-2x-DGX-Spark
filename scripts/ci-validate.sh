@@ -161,6 +161,12 @@ if grep -Fq 'DSPARK_ENABLE_ASSISTANT_FINAL_HOTFIX: "${DSPARK_ENABLE_ASSISTANT_FI
 else
   bad "compose must invoke assistant-final hotfix only when DSPARK_ENABLE_ASSISTANT_FINAL_HOTFIX=1, with || exit 1"
 fi
+if grep -q 'VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"' docker-compose.dspark.yml \
+  && grep -q 'TILELANG_CACHE_DIR: "${TILELANG_CACHE_DIR:-/cache/huggingface/tilelang-cache}"' docker-compose.dspark.yml; then
+  ok "compose JIT timeout 1800s + persistent TileLang cache (#65/#87)"
+else
+  bad "compose missing VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800 or TILELANG_CACHE_DIR"
+fi
 if grep -q 'restart: ${DSPARK_RESTART_POLICY:-unless-stopped}' docker-compose.dspark.yml; then
   ok "compose restart unless-stopped"
 else
