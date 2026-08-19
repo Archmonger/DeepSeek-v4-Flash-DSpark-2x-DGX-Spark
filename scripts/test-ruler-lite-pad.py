@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
-"""CPU tests for RULER-lite padding (issue #81). No live endpoint."""
+"""CPU tests for RULER-lite padding (issue #81) and the client HTTP timeout.
+
+No live endpoint: /tokenize and /chat/completions are stubbed at urlopen.
+"""
+import argparse
+import contextlib
 import importlib.util
+import io
+import json
 import random
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -79,6 +88,83 @@ class TestShortPadFails(unittest.TestCase):
         finally:
             rl.tokenize = orig_tok
             rl.chat = orig_chat
+
+
+class _FakeResponse(io.StringIO):
+    """Context-manager stand-in for what urlopen returns."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+class TestRequestTimeout(unittest.TestCase):
+    """The 900 s default buys ~787k tokens at the recorded 874.8 prefill tok/s,
+    so a ~900k case needs --request-timeout raised or the client hangs up
+    mid-prefill and its own limit is scored as a model FAIL."""
+
+    def _timeouts_seen(self, extra_args):
+        """Run main() end to end with the socket stubbed; collect every timeout."""
+        seen = []
+
+        def fake_urlopen(req, timeout=None):
+            seen.append(timeout)
+            if req.full_url.endswith(rl.TOK_URL_SUFFIX):
+                body = {"count": 10 ** 7}          # already past any target
+            else:
+                body = {"choices": [{"message": {"content": "unused"}}]}
+            return _FakeResponse(json.dumps(body))
+
+        orig_urlopen, orig_timeout, orig_argv = (
+            rl.urllib.request.urlopen, rl.REQUEST_TIMEOUT, sys.argv)
+        rl.urllib.request.urlopen = fake_urlopen
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                sys.argv = ["ruler-lite.py", "--lengths", "8192", "--tasks", "sniah",
+                            "--output", str(Path(tmp) / "out.json")] + extra_args
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rl.main()
+        finally:
+            rl.urllib.request.urlopen = orig_urlopen
+            rl.REQUEST_TIMEOUT = orig_timeout
+            sys.argv = orig_argv
+        return seen
+
+    def test_default_is_900_on_every_request(self):
+        seen = self._timeouts_seen([])
+        self.assertEqual(set(seen), {900.0})
+        self.assertGreaterEqual(len(seen), 2, "tokenize and chat must both be covered")
+
+    def test_flag_reaches_every_request(self):
+        self.assertEqual(set(self._timeouts_seen(["--request-timeout", "3600"])),
+                         {3600.0})
+
+
+class TestPositiveTimeout(unittest.TestCase):
+    def test_accepts_positive(self):
+        self.assertEqual(rl.positive_timeout("3600"), 3600.0)
+        self.assertEqual(rl.positive_timeout("0.5"), 0.5)
+
+    def test_rejects_non_positive_and_non_finite(self):
+        # A socket timeout trips instantly on 0/negative and OverflowErrors on
+        # inf, which would resurface as a per-case FAIL rather than a usage error.
+        for bad in ("0", "-1", "nan", "inf", "-inf"):
+            with self.subTest(bad=bad):
+                self.assertRaises(argparse.ArgumentTypeError, rl.positive_timeout, bad)
+
+    def test_flag_is_wired_to_the_validator(self):
+        orig_argv, orig_timeout = sys.argv, rl.REQUEST_TIMEOUT
+        sys.argv = ["ruler-lite.py", "--request-timeout", "0"]
+        try:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
+                rl.main()
+        finally:
+            sys.argv, rl.REQUEST_TIMEOUT = orig_argv, orig_timeout
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("--request-timeout", err.getvalue())
 
 
 if __name__ == "__main__":

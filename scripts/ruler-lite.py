@@ -14,11 +14,13 @@ Tasks (3 families beyond shallow NIAH):
 
 Usage:
   python3 ruler-lite.py [--base-url http://127.0.0.1:8888/v1] [--model deepseek-v4-flash-0731]
-      [--lengths 8192,32768,131072,262144] [--output results/ruler-lite.json]
+      [--lengths 8192,32768,131072,262144] [--request-timeout 3600]
+      [--output results/ruler-lite.json]
 Exit 0 = all tasks at all lengths pass, 1 = any failure (CI-able).
 """
 import argparse
 import json
+import math
 import random
 import re
 import string
@@ -46,10 +48,20 @@ CWE_WORDS = ["apple", "banana", "cherry", "dragon", "eagle", "forest", "garden",
              "thunder", "utopia", "violet", "willow", "xenon", "yonder"]
 
 
-def request_json(url: str, body: dict, timeout: float = 900) -> dict:
+# Client-side HTTP timeout for every /tokenize and /chat/completions call,
+# overridable with --request-timeout. It only covers the depths this script
+# defaults to. Recorded on this cluster (docs/DEEPSEEK_V4_FLASH_0731.md,
+# results/RESULTS-2026-08-14.md): an 899,994-token prompt took 1,028.85 s to
+# first token at ~874.8 prefill tok/s. At that rate 900 s buys ~787k tokens of
+# prefill, so a ~900k case hangs up mid-prefill and the harness scores its own
+# client limit as a model FAIL.
+REQUEST_TIMEOUT = 900.0
+
+
+def request_json(url: str, body: dict) -> dict:
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
         return json.load(resp)
 
 
@@ -231,7 +243,22 @@ def run_case(base_url: str, model: str, length: int, make_task, rng: random.Rand
             "ok": ok, "prediction": pred[:100], "gold": golds, "secs": round(wall, 1)}
 
 
+def positive_timeout(value: str) -> float:
+    """argparse type for --request-timeout: finite and strictly positive.
+
+    Plain `float` would accept 0, negatives, `nan` and `inf`; a socket timeout
+    trips instantly on the first three and OverflowErrors on the last, which
+    would resurface as a per-case FAIL rather than a usage error.
+    """
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError(
+            f"expected a finite number of seconds > 0, got {value!r}")
+    return seconds
+
+
 def main() -> int:
+    global REQUEST_TIMEOUT
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--base-url", default="http://127.0.0.1:8888/v1")
     ap.add_argument("--model", default="deepseek-v4-flash-0731")
@@ -246,7 +273,16 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=512,
                     help="generation budget; verbose models (Qwen3.8-27B) write prose before "
                          "the answer, so 256 truncates the word list -> false FAIL. 512 covers it.")
+    ap.add_argument("--request-timeout", type=positive_timeout,
+                    default=REQUEST_TIMEOUT, metavar="SECONDS",
+                    help="client HTTP timeout in seconds (default: %(default)s). A cold "
+                         "prefill near the 1M ceiling outruns it: a recorded 899,994-token "
+                         "prompt needed 1,028.85 s to first token at ~874.8 prefill tok/s, "
+                         "and 900 s only buys ~787k tokens, so the client hangs up "
+                         "mid-prefill and the harness scores its own limit as a model FAIL. "
+                         "Raise it for --lengths past ~790k.")
     args = ap.parse_args()
+    REQUEST_TIMEOUT = args.request_timeout
 
     lengths = [int(x) for x in args.lengths.split(",")]
     task_map = {"sniah": task_sniah, "mkniah": task_mkniah,
