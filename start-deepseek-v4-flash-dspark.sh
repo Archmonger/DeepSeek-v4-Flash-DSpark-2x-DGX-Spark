@@ -79,6 +79,12 @@ set -a
 source "$ENV_FILE"
 set +a
 
+# Experimental production-dense autotune coverage is opt-in and fail-closed.
+DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX="${DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX:-0}"
+DSPARK_DSV4_AUTOTUNE_HOTFIX="${DSPARK_DSV4_AUTOTUNE_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-autotune-prod-dense.py}"
+DSPARK_DSV4_AUTOTUNE_SUPP="${DSPARK_DSV4_AUTOTUNE_SUPP:-$SCRIPT_DIR/patches/dsv4-autotune-prod-dense-supp.json}"
+export DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX
+
 # Vision mode flag selects 0731 GPU util (and whether the VL sidecar starts).
 #   ENABLE_VL_SIDECAR=1 → vision coexist → GPU_MEMORY_UTILIZATION_VISION (default 0.80)
 #   ENABLE_VL_SIDECAR=0 → text-only     → GPU_MEMORY_UTILIZATION_TEXT   (default 0.835)
@@ -468,10 +474,10 @@ print_resolved_profile() {
   else
     echo "  GB10 shm spin-wait hotfix (#79): will apply on start (busy_loop_s 1s -> 2ms)"
   fi
-  if [ "${DSPARK_SKIP_DSV4_AUTOTUNE_DENSE_HOTFIX:-0}" = "1" ]; then
-    echo "  DSV4 autotune production-dense coverage: SKIPPED (DSPARK_SKIP_DSV4_AUTOTUNE_DENSE_HOTFIX=1)"
+  if [ "$DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX" = "1" ]; then
+    echo "  DSV4 autotune production-dense coverage: ENABLED (fail-closed; merges 24 pinned configs only when the running build fingerprint matches)"
   else
-    echo "  DSV4 autotune production-dense coverage: will apply on start (merges 24 pre-tuned dense configs into the sparse-MLA decode cache; skipped at boot if the supplement fingerprint does not match this build)"
+    echo "  DSV4 autotune production-dense coverage: disabled (stock boot-tuned cache)"
   fi
   if [ "${DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX:-0}" = "1" ]; then
     echo "  Suppress stops in <think>: SKIPPED (DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX=1)"
@@ -490,7 +496,7 @@ validate_compose() {
   echo "Validating head compose config..."
   compose_base 0 "" config --quiet
   echo "Validating worker compose config..."
-  remote_compose "NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.dspark.yml config --quiet"
+  remote_compose "NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX='$DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX' docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.dspark.yml config --quiet"
 }
 
 need_cmd docker
@@ -501,6 +507,18 @@ need_cmd curl
 if [ "$ENABLE_VLLM_GB10_PATCH" != "0" ] && [ "$ENABLE_VLLM_GB10_PATCH" != "1" ]; then
   echo "ENABLE_VLLM_GB10_PATCH must be 0 or 1." >&2
   exit 1
+fi
+
+if [ "$DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX" != "0" ] && [ "$DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX" != "1" ]; then
+  echo "DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX must be 0 or 1." >&2
+  exit 1
+fi
+
+if [ "$DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX" = "1" ]; then
+  if [ ! -f "$DSPARK_DSV4_AUTOTUNE_HOTFIX" ] || [ ! -f "$DSPARK_DSV4_AUTOTUNE_SUPP" ]; then
+    echo "Cannot start: enabled DSV4 autotune production-dense coverage needs BOTH $DSPARK_DSV4_AUTOTUNE_HOTFIX and $DSPARK_DSV4_AUTOTUNE_SUPP." >&2
+    exit 1
+  fi
 fi
 
 if [ "$ENABLE_VLLM_GB10_PATCH" = "1" ] && [ ! -d "$VLLM_GB10_PATCH_DIR" ]; then
@@ -582,20 +600,13 @@ if [ -f "$DSPARK_SPIN_WAIT_HOTFIX" ]; then
   ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
   scp "$DSPARK_SPIN_WAIT_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-gb10-spin-wait.sh"
 fi
-# DSV4 sparse-MLA autotune production-dense coverage hotfix (pair: .py + .json).
-# The patcher hooks kernel_warmup's DSv4 cache path, so both files must land.
-DSPARK_DSV4_AUTOTUNE_HOTFIX="${DSPARK_DSV4_AUTOTUNE_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-autotune-prod-dense.py}"
-DSPARK_DSV4_AUTOTUNE_SUPP="${DSPARK_DSV4_AUTOTUNE_SUPP:-$SCRIPT_DIR/patches/dsv4-autotune-prod-dense-supp.json}"
-if [ -f "$DSPARK_DSV4_AUTOTUNE_HOTFIX" ] && [ -f "$DSPARK_DSV4_AUTOTUNE_SUPP" ]; then
-  echo "Syncing DSV4 autotune prod-dense hotfix (.py + .json) to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+# DSV4 sparse-MLA autotune production-dense coverage is an opt-in experiment.
+# Do not copy or invoke the patch when disabled.
+if [ "$DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX" = "1" ]; then
+  echo "Syncing enabled DSV4 autotune prod-dense hotfix (.py + .json) to ${WORKER_HOST}:${WORKER_DIR}/patches/"
   ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
   scp "$DSPARK_DSV4_AUTOTUNE_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-autotune-prod-dense.py"
   scp "$DSPARK_DSV4_AUTOTUNE_SUPP" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/dsv4-autotune-prod-dense-supp.json"
-elif [ -f "$DSPARK_DSV4_AUTOTUNE_HOTFIX" ] || [ -f "$DSPARK_DSV4_AUTOTUNE_SUPP" ]; then
-  # Syncing one without the other yields a boot-time no-op on the worker only,
-  # i.e. silent rank-asymmetric dense coverage. Refuse the half-pair instead.
-  echo "Cannot start: DSV4 autotune prod-dense hotfix needs BOTH files; found only one of $DSPARK_DSV4_AUTOTUNE_HOTFIX / $DSPARK_DSV4_AUTOTUNE_SUPP." >&2
-  exit 1
 fi
 # DSV4 v0.27 .sh hotfixes — entrypoint applies them before exec vllm (issue #38).
 for _hf_sync in hotfix-dsv4-mtp-buffer-50312.sh hotfix-dsv4-adaptive-topk-50004.sh hotfix-dsv4-skip-topk-49486.sh hotfix-dsv4-dense-prefill-indexer-48407.sh hotfix-dsv4-skip-empty-c128-48957.sh hotfix-dsv4-flashmla-workspace-50298.sh hotfix-dsv4-grammar-advance.sh; do
@@ -666,7 +677,7 @@ fi
 validate_compose
 
 echo "Starting DSpark worker on ${WORKER_HOST}..."
-remote_compose "NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.dspark.yml up -d"
+remote_compose "NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX='$DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX' docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.dspark.yml up -d"
 
 echo "Starting DSpark head..."
 compose_base 0 "" up -d

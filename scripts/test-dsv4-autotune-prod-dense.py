@@ -28,6 +28,8 @@ ROOT = Path(__file__).resolve().parents[1]
 HOTFIX = ROOT / "patches" / "hotfix-dsv4-autotune-prod-dense.py"
 SUPPLEMENT = ROOT / "patches" / "dsv4-autotune-prod-dense-supp.json"
 VENDORED = ROOT / "recipe/overlay/vllm/model_executor/warmup/kernel_warmup.py"
+COMPOSE = ROOT / "docker-compose.dspark.yml"
+LAUNCHER = ROOT / "start-deepseek-v4-flash-dspark.sh"
 
 
 def _load_hotfix():
@@ -122,6 +124,12 @@ class AnchorPinningTest(unittest.TestCase):
             "merge must happen before broadcast_object or rank>0 gets unmerged bytes",
         )
 
+    def test_enabled_hook_refuses_a_missing_boot_cache(self):
+        patched, status = MOD.apply_text(self.src)
+        self.assertEqual(status, "applied")
+        self.assertIn("if not cache_path.exists():", patched)
+        self.assertIn("did not create", patched)
+
     def test_generic_autotune_path_untouched(self):
         patched, _ = MOD.apply_text(self.src)
         self.assertEqual(patched.count("_dv4_prod_dense_merge(tune_results, cache_path)"), 1)
@@ -211,7 +219,7 @@ class MergeBehaviourTest(unittest.TestCase):
         self.patched, status = MOD.apply_text(VENDORED.read_text())
         assert status == "applied"
         self.supp = json.loads(SUPPLEMENT.read_text())
-        (self.pkg / MOD.SUPP_BASENAME).write_text(json.dumps(self.supp))
+        (self.pkg / MOD.SUPP_BASENAME).write_bytes(SUPPLEMENT.read_bytes())
         self.cache = root / "cache" / "autotune_configs.json"
         self.cache.parent.mkdir(parents=True)
         self.addCleanup(self.tmp.cleanup)
@@ -276,37 +284,32 @@ class MergeBehaviourTest(unittest.TestCase):
         self.assertEqual(merged[clashing], ["SparseMlaDecodeV3Runner", 1234])
         self.assertNotEqual(merged[clashing], self.supp[clashing])
 
-    def test_metadata_mismatch_skips_loudly(self):
-        merge, logger = self._helper()
+    def test_metadata_mismatch_fails_closed(self):
+        merge, _ = self._helper()
         meta = copy.deepcopy(self.supp["_metadata"])
         meta["flashinfer_version"] = "0.7.0"
         raw = json.dumps(self._base(meta=meta)).encode()
         self.cache.write_bytes(raw)
 
-        out = merge(raw, self.cache)
-        self.assertEqual(out, raw, "mismatched build must not be merged")
+        with self.assertRaisesRegex(RuntimeError, "different build"):
+            merge(raw, self.cache)
         self.assertEqual(self.cache.read_bytes(), raw, "cache must be left untouched")
-        self.assertIn("WARNING", logger.levels())
-        self.assertIn("flashinfer_version", logger.text())
-        self.assertIn("different build", logger.text())
 
-    def test_gpu_mismatch_skips(self):
-        merge, logger = self._helper()
+    def test_gpu_mismatch_fails_closed(self):
+        merge, _ = self._helper()
         meta = copy.deepcopy(self.supp["_metadata"])
         meta["gpu"] = "NVIDIA H100"
         raw = json.dumps(self._base(meta=meta)).encode()
-        out = merge(raw, self.cache)
-        self.assertEqual(out, raw)
-        self.assertIn("gpu", logger.text())
+        with self.assertRaisesRegex(RuntimeError, "gpu"):
+            merge(raw, self.cache)
 
-    def test_missing_metadata_skips(self):
-        merge, logger = self._helper()
+    def test_missing_metadata_fails_closed(self):
+        merge, _ = self._helper()
         base = self._base()
         del base["_metadata"]
         raw = json.dumps(base).encode()
-        out = merge(raw, self.cache)
-        self.assertEqual(out, raw)
-        self.assertIn("_metadata", logger.text())
+        with self.assertRaisesRegex(RuntimeError, "_metadata"):
+            merge(raw, self.cache)
 
     def test_already_covered_is_a_noop(self):
         merge, logger = self._helper()
@@ -320,35 +323,39 @@ class MergeBehaviourTest(unittest.TestCase):
         self.assertIn("already present", logger.text())
         self.assertNotIn("WARNING", logger.levels())
 
-    def test_missing_supplement_skips(self):
+    def test_missing_supplement_fails_closed(self):
         (self.pkg / MOD.SUPP_BASENAME).unlink()
-        merge, logger = self._helper()
+        merge, _ = self._helper()
         raw = json.dumps(self._base()).encode()
-        out = merge(raw, self.cache)
-        self.assertEqual(out, raw)
-        self.assertIn("not found", logger.text())
+        with self.assertRaisesRegex(RuntimeError, "not found"):
+            merge(raw, self.cache)
 
-    def test_corrupt_supplement_skips(self):
+    def test_corrupt_supplement_fails_closed(self):
         (self.pkg / MOD.SUPP_BASENAME).write_text("{ not json")
-        merge, logger = self._helper()
+        merge, _ = self._helper()
         raw = json.dumps(self._base()).encode()
-        out = merge(raw, self.cache)
-        self.assertEqual(out, raw)
-        self.assertIn("WARNING", logger.levels())
+        with self.assertRaisesRegex(RuntimeError, "unreadable"):
+            merge(raw, self.cache)
 
-    def test_corrupt_boot_cache_skips(self):
-        merge, logger = self._helper()
-        out = merge(b"{ truncated", self.cache)
-        self.assertEqual(out, b"{ truncated")
-        self.assertIn("WARNING", logger.levels())
+    def test_modified_supplement_fails_digest_check(self):
+        staged = self.pkg / MOD.SUPP_BASENAME
+        staged.write_bytes(staged.read_bytes() + b"\n")
+        merge, _ = self._helper()
+        raw = json.dumps(self._base()).encode()
+        with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
+            merge(raw, self.cache)
 
-    def test_unwritable_cache_falls_back_to_unmerged(self):
-        merge, logger = self._helper()
+    def test_corrupt_boot_cache_fails_closed(self):
+        merge, _ = self._helper()
+        with self.assertRaisesRegex(RuntimeError, "unreadable"):
+            merge(b"{ truncated", self.cache)
+
+    def test_unwritable_cache_fails_closed(self):
+        merge, _ = self._helper()
         raw = json.dumps(self._base()).encode()
         missing_dir = Path(self.tmp.name) / "nope" / "autotune_configs.json"
-        out = merge(raw, missing_dir)
-        self.assertEqual(out, raw, "must not claim a merge it could not persist")
-        self.assertIn("WARNING", logger.levels())
+        with self.assertRaisesRegex(RuntimeError, "could not be persisted"):
+            merge(raw, missing_dir)
 
 
 class PatcherCliTest(unittest.TestCase):
@@ -371,6 +378,14 @@ class PatcherCliTest(unittest.TestCase):
         self.assertEqual(
             MOD.main(["--vllm-root", str(self.pkg), "--supplement", str(SUPPLEMENT), "-q"]), 0
         )
+
+    def test_reapply_refreshes_the_staged_supplement(self):
+        args = ["--vllm-root", str(self.pkg), "--supplement", str(SUPPLEMENT), "-q"]
+        self.assertEqual(MOD.main(args), 0)
+        staged = self.pkg / MOD.SUPP_BASENAME
+        staged.write_text("stale")
+        self.assertEqual(MOD.main(args), 0)
+        self.assertEqual(staged.read_bytes(), SUPPLEMENT.read_bytes())
 
     def test_check_mode_writes_nothing(self):
         target = self.pkg / "model_executor" / "warmup" / "kernel_warmup.py"
@@ -410,6 +425,55 @@ class PatcherCliTest(unittest.TestCase):
         )
         target = self.pkg / "model_executor" / "warmup" / "kernel_warmup.py"
         self.assertNotIn(MOD.MARKER, target.read_text())
+
+
+
+
+class ActivationWiringTest(unittest.TestCase):
+    """The experimental runtime change must stay opt-in and fail-closed."""
+
+    def setUp(self):
+        self.compose = COMPOSE.read_text()
+        self.launcher = LAUNCHER.read_text()
+
+    def test_compose_defaults_off(self):
+        self.assertIn(
+            'DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX: '
+            '"${DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX:-0}"',
+            self.compose,
+        )
+
+    def test_entrypoint_invocation_is_gated_and_fail_closed(self):
+        gated = (
+            'if [ "$${DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX:-0}" = "1" ]; '
+            "then python3 /opt/dspark-patches/hotfix-dsv4-autotune-prod-dense.py "
+            "|| exit 1; fi;"
+        )
+        self.assertIn(gated, self.compose)
+        self.assertEqual(
+            self.compose.count("python3 /opt/dspark-patches/hotfix-dsv4-autotune-prod-dense.py"),
+            1,
+        )
+
+    def test_launcher_rejects_invalid_enable_value(self):
+        self.assertIn(
+            "DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX must be 0 or 1.",
+            self.launcher,
+        )
+
+    def test_shell_override_reaches_both_rank_compose_commands(self):
+        forwarded = (
+            "DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX="
+            "'$DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX'"
+        )
+        self.assertEqual(self.launcher.count(forwarded), 2)
+
+    def test_launcher_sync_is_inside_enabled_branch(self):
+        gate = 'if [ "$DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX" = "1" ]; then'
+        sync = "Syncing enabled DSV4 autotune prod-dense hotfix"
+        gate_index = self.launcher.rfind(gate, 0, self.launcher.index(sync))
+        self.assertGreaterEqual(gate_index, 0)
+        self.assertLess(self.launcher.index(sync), self.launcher.index("\nfi", gate_index))
 
 
 if __name__ == "__main__":
