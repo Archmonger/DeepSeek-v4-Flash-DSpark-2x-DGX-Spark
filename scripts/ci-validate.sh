@@ -39,6 +39,7 @@ py_files+=(
   scripts/test-ruler-lite-pad.py
   scripts/ruler-lite.py
   scripts/verify-dsv4-027-equality-gate.py
+  scripts/test-dsv4-autotune-prod-dense.py
 )
 python3 -m py_compile "${py_files[@]}"
 ok "py_compile ${#py_files[@]} files"
@@ -60,6 +61,8 @@ python3 scripts/test-assistant-final-continuation.py -q
 ok "test-assistant-final-continuation"
 python3 scripts/test-ruler-lite-pad.py -q
 ok "test-ruler-lite-pad"
+python3 scripts/test-dsv4-autotune-prod-dense.py -q
+ok "test-dsv4-autotune-prod-dense"
 python3 scripts/verify-dsv4-027-equality-gate.py
 ok "verify-dsv4-027-equality-gate"
 bash scripts/verify-overlay-sources.sh
@@ -179,6 +182,8 @@ for p in \
   patches/hotfix-nvfp4-ds-mla-issue22.sh \
   patches/hotfix-gb10-spin-wait.sh \
   patches/hotfix-dsv4-suppress-stops-in-reasoning.py \
+  patches/hotfix-dsv4-autotune-prod-dense.py \
+  patches/dsv4-autotune-prod-dense-supp.json \
   patches/hotfix-dsv4-assistant-final-continuation.py
 do
   if [ -f "$p" ]; then
@@ -187,6 +192,99 @@ do
     bad "missing required $p"
   fi
 done
+
+# Every DSPARK_* the container entrypoint expands must also be injected into the
+# container, or the flag is inert and cannot be set by an operator (PR #83).
+python3 - <<'PY' || bad "compose entrypoint flag not injected into the container"
+import re
+import sys
+from pathlib import Path
+
+text = Path("docker-compose.dspark.yml").read_text()
+consumed = set(re.findall(r"\$\$\{(DSPARK_[A-Z0-9_]+)(?::-[^}]*)?\}", text))
+declared = set(re.findall(r"^\s{6}(DSPARK_[A-Z0-9_]+):\s", text, re.M))
+inert = sorted(consumed - declared)
+if inert:
+    print("  inert compose flags (consumed but never injected): " + ", ".join(inert))
+    sys.exit(1)
+print(f"  {len(consumed)} entrypoint DSPARK_* flags all injected")
+PY
+ok "compose entrypoint flags are all injected (no inert skip flags)"
+
+# The production-dense supplement is data, not code: parse it and pin its shape.
+python3 - <<'PY' || bad "production-dense autotune supplement invalid"
+import ast
+import json
+import sys
+from pathlib import Path
+
+data = json.loads(Path("patches/dsv4-autotune-prod-dense-supp.json").read_text())
+meta = data.get("_metadata")
+if not isinstance(meta, dict) or not meta:
+    print("  supplement has no _metadata fingerprint")
+    sys.exit(1)
+configs = [k for k in data if k != "_metadata"]
+tokens, dense = set(), set()
+for key in configs:
+    op, _runner, shapes, extras = ast.literal_eval(key)
+    if op != "sparse_mla_sm120_decode_dsv4":
+        print(f"  unexpected op in supplement: {op}")
+        sys.exit(1)
+    tokens.add(shapes[0][0])
+    dense.add(extras[2])
+if dense != {256, 1024, 2048, 8192}:
+    print(f"  unexpected dense budgets: {sorted(dense)}")
+    sys.exit(1)
+print(
+    f"  {len(configs)} configs, tokens {sorted(tokens)}, dense {sorted(dense)}, "
+    f"fingerprint keys {sorted(meta)}"
+)
+PY
+ok "production-dense autotune supplement parses and covers dense 256/1024/2048/8192"
+
+# The hotfix rewrites kernel_warmup.py by exact anchor. Pin the anchor against
+# the vendored copy so upstream drift fails CI instead of silently no-op'ing at
+# boot, and keep it scoped to the DSv4 function (the narrow read+broadcast block
+# also appears in the generic flashinfer_autotune()).
+python3 - <<'PY' || bad "DSv4 autotune hotfix anchor no longer pinned to vendored kernel_warmup.py"
+import importlib.util
+import sys
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location(
+    "dv4_prod_dense", "patches/hotfix-dsv4-autotune-prod-dense.py"
+)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+vendored = Path("recipe/overlay/vllm/model_executor/warmup/kernel_warmup.py").read_text()
+for label, anchor in (("call", mod.ANCHOR_OLD), ("helper", mod.HELPER_ANCHOR)):
+    hits = vendored.count(anchor)
+    if hits != 1:
+        print(f"  {label} anchor matches {hits} times in vendored kernel_warmup.py (want 1)")
+        sys.exit(1)
+patched, status = mod.apply_text(vendored)
+if status != "applied":
+    print(f"  apply_text on vendored source returned {status}")
+    sys.exit(1)
+if patched.index("_dv4_prod_dense_merge(tune_results, cache_path)") > patched.index(
+    "tune_results = world.broadcast_object(tune_results, src=0)"
+):
+    print("  merge is injected after broadcast_object; ranks would diverge")
+    sys.exit(1)
+print("  anchors unique, merge injected pre-broadcast on the DSv4 path")
+PY
+ok "DSv4 autotune hotfix anchor pinned to vendored kernel_warmup.py (pre-broadcast)"
+
+# No patch may TARGET the dead hook again: the DSv4 sparse-MLA cache is never
+# written through vllm's write_flashinfer_autotune_cache(), so patching it is a
+# silent no-op. Prose that explains why is fine; a patch anchor or file target
+# is not.
+if grep -rqE 'flashinfer_autotune_cache\.py|def write_flashinfer_autotune_cache' patches/ 2>/dev/null; then
+  bad "a patch targets vllm's write_flashinfer_autotune_cache (not on the DSv4 cache path)"
+else
+  ok "no patch targets the dead write_flashinfer_autotune_cache hook"
+fi
 
 if [ "$fail" -ne 0 ]; then
   echo "CI validate FAILED" >&2

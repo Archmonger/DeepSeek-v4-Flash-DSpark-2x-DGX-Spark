@@ -218,6 +218,7 @@ needs a generous `max_tokens` or a budget or thinking won't end. See
 | `DSPARK_SKIP_ISSUE22_HOTFIX` | `0` | `1` = skip the `nvfp4_ds_mla` long-context decode fix. Don’t, on this recipe. |
 | `DSPARK_SKIP_HOTFIX` | `0` | `1` = skip the six v0.27 perf backports only (#22 still applies). |
 | `DSPARK_SKIP_SPIN_WAIT_HOTFIX` | `0` | `1` = leave vLLM shm `busy_loop_s=1s` (issue **#79** P-core spin on TP=2). |
+| `DSPARK_SKIP_DSV4_AUTOTUNE_DENSE_HOTFIX` | `0` | `1` = leave the DSv4 sparse-MLA decode autotune cache boot-tuned only (dense 256/1024/2048/8192 then use the heuristic tactic). |
 | `DSPARK_ISSUE43_SCHED_DIAG` | `0` | `1` = one scheduler line per step in the vLLM log (mixed prefill/decode). |
 | `ENABLE_VLLM_GB10_PATCH` | `0` | `1` = experimental hybrid NVFP4 plugin (`--quantization modelopt_gb10_hybrid`). |
 

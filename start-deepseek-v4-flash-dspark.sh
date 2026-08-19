@@ -468,6 +468,11 @@ print_resolved_profile() {
   else
     echo "  GB10 shm spin-wait hotfix (#79): will apply on start (busy_loop_s 1s -> 2ms)"
   fi
+  if [ "${DSPARK_SKIP_DSV4_AUTOTUNE_DENSE_HOTFIX:-0}" = "1" ]; then
+    echo "  DSV4 autotune production-dense coverage: SKIPPED (DSPARK_SKIP_DSV4_AUTOTUNE_DENSE_HOTFIX=1)"
+  else
+    echo "  DSV4 autotune production-dense coverage: will apply on start (merges 24 pre-tuned dense configs into the sparse-MLA decode cache; skipped at boot if the supplement fingerprint does not match this build)"
+  fi
   if [ "${DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX:-0}" = "1" ]; then
     echo "  Suppress stops in <think>: SKIPPED (DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX=1)"
   elif [ "${DSPARK_SUPPRESS_STOPS_IN_REASONING:-${VLLM_SUPPRESS_STOPS_IN_REASONING:-1}}" = "0" ]; then
@@ -577,16 +582,20 @@ if [ -f "$DSPARK_SPIN_WAIT_HOTFIX" ]; then
   ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
   scp "$DSPARK_SPIN_WAIT_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-gb10-spin-wait.sh"
 fi
-# DSV4 sparse-MLA autotune production-dense coverage hotfix (pair: .sh + .json).
-DSPARK_DSV4_AUTOTUNE_HOTFIX="${DSPARK_DSV4_AUTOTUNE_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-autotune-prod-dense.sh}"
+# DSV4 sparse-MLA autotune production-dense coverage hotfix (pair: .py + .json).
+# The patcher hooks kernel_warmup's DSv4 cache path, so both files must land.
+DSPARK_DSV4_AUTOTUNE_HOTFIX="${DSPARK_DSV4_AUTOTUNE_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-autotune-prod-dense.py}"
 DSPARK_DSV4_AUTOTUNE_SUPP="${DSPARK_DSV4_AUTOTUNE_SUPP:-$SCRIPT_DIR/patches/dsv4-autotune-prod-dense-supp.json}"
-if [ -f "$DSPARK_DSV4_AUTOTUNE_HOTFIX" ]; then
-  echo "Syncing DSV4 autotune prod-dense hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+if [ -f "$DSPARK_DSV4_AUTOTUNE_HOTFIX" ] && [ -f "$DSPARK_DSV4_AUTOTUNE_SUPP" ]; then
+  echo "Syncing DSV4 autotune prod-dense hotfix (.py + .json) to ${WORKER_HOST}:${WORKER_DIR}/patches/"
   ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
-  scp "$DSPARK_DSV4_AUTOTUNE_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-autotune-prod-dense.sh"
-  if [ -f "$DSPARK_DSV4_AUTOTUNE_SUPP" ]; then
-    scp "$DSPARK_DSV4_AUTOTUNE_SUPP" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/dsv4-autotune-prod-dense-supp.json"
-  fi
+  scp "$DSPARK_DSV4_AUTOTUNE_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-autotune-prod-dense.py"
+  scp "$DSPARK_DSV4_AUTOTUNE_SUPP" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/dsv4-autotune-prod-dense-supp.json"
+elif [ -f "$DSPARK_DSV4_AUTOTUNE_HOTFIX" ] || [ -f "$DSPARK_DSV4_AUTOTUNE_SUPP" ]; then
+  # Syncing one without the other yields a boot-time no-op on the worker only,
+  # i.e. silent rank-asymmetric dense coverage. Refuse the half-pair instead.
+  echo "Cannot start: DSV4 autotune prod-dense hotfix needs BOTH files; found only one of $DSPARK_DSV4_AUTOTUNE_HOTFIX / $DSPARK_DSV4_AUTOTUNE_SUPP." >&2
+  exit 1
 fi
 # DSV4 v0.27 .sh hotfixes — entrypoint applies them before exec vllm (issue #38).
 for _hf_sync in hotfix-dsv4-mtp-buffer-50312.sh hotfix-dsv4-adaptive-topk-50004.sh hotfix-dsv4-skip-topk-49486.sh hotfix-dsv4-dense-prefill-indexer-48407.sh hotfix-dsv4-skip-empty-c128-48957.sh hotfix-dsv4-flashmla-workspace-50298.sh hotfix-dsv4-grammar-advance.sh; do
