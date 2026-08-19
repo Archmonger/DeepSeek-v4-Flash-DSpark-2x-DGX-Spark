@@ -166,6 +166,7 @@ if grep -q 'VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "${VLLM_EXECUTE_MODEL_TIMEOUT_SE
   ok "compose JIT timeout 1800s + persistent TileLang cache (#65/#87)"
 else
   bad "compose missing VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800 or TILELANG_CACHE_DIR"
+fi
 # Production-dense autotune is experimental: default OFF and fail-closed when ON.
 if grep -Fq 'DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX: "${DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX:-0}"' docker-compose.dspark.yml \
   && grep -Fq 'if [ "$${DSPARK_ENABLE_DSV4_AUTOTUNE_DENSE_HOTFIX:-0}" = "1" ]; then python3 /opt/dspark-patches/hotfix-dsv4-autotune-prod-dense.py || exit 1; fi;' docker-compose.dspark.yml; then
