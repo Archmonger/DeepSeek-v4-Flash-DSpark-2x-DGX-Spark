@@ -59,11 +59,33 @@ def tokenize(base_url: str, model: str, text: str) -> int:
 
 
 def pad_to_length(base_url: str, model: str, text: str, target: int) -> str:
-    """Pad with haystack noise until /tokenize reports >= target tokens."""
-    guard = 0
-    while tokenize(base_url, model, text) < target and guard < 200:
-        text += " " + HAYSTACK_SENTENCE
-        guard += 1
+    """Pad with haystack noise until /tokenize reports >= target tokens.
+
+    Pads in estimated-size chunks instead of one sentence per /tokenize round
+    trip. The previous implementation appended a single sentence per iteration
+    under a fixed ``guard < 200``, which capped the achievable context at about
+    200 * len(HAYSTACK_SENTENCE) ~= 5k tokens: every requested length at or above
+    8192 was silently evaluated at that ceiling while still being reported as a
+    PASS *at the requested depth*, so this gate never exercised long context.
+
+    Raises RuntimeError rather than returning a short prompt, so failing to reach
+    the depth is visible instead of being scored as a pass.
+    """
+    cur = tokenize(base_url, model, text)
+    if cur >= target:
+        return text
+    unit = tokenize(base_url, model, HAYSTACK_SENTENCE) or 1
+    for _ in range(64):                 # each pass closes most of the remaining gap
+        deficit = target - cur
+        if deficit <= 0:
+            break
+        text += (" " + HAYSTACK_SENTENCE) * max(1, deficit // unit)
+        cur = tokenize(base_url, model, text)
+    if cur < target:
+        raise RuntimeError(
+            f"pad_to_length could not reach {target} tokens (stalled at {cur}); "
+            "refusing to score a short prompt as if it were at depth"
+        )
     return text
 
 
