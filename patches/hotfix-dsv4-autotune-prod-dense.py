@@ -14,23 +14,19 @@ BACKGROUND
     produced by the real autotuner) and merges it into the boot-tuned cache.
 
 WHERE THE MERGE HOOKS, AND WHY
-    ``vllm/model_executor/warmup/kernel_warmup.py`` owns the DSv4 cache
-    end-to-end: FlashInfer's ``sparse_mla_sm120_decode_dsv4_autotune`` context
-    manager writes the file, the tuning leader reads the bytes back, they are
-    broadcast to every rank, rank>0 writes them to its own copy, and then EVERY
-    rank calls ``AutoTuner.get().load_configs(cache_path)``. vLLM's
-    ``write_flashinfer_autotune_cache()`` is NOT part of that path, so patching
-    it has no effect on DSv4 decode.
+    On the pinned Anemll 0.1.1 image,
+    ``vllm/model_executor/warmup/flashinfer_sparse_mla_warmup.py`` owns the
+    DSv4-specific cache path: the tuning leader reads the fresh bytes,
+    ``world.broadcast_object`` sends them to every rank, and then every rank
+    atomically calls ``write_flashinfer_autotune_cache`` and loads that file.
 
-    The merge is therefore injected on the leader, after it reads the freshly
-    tuned cache and BEFORE ``world.broadcast_object``:
+    The merge is injected only when ``log_label == "DSv4"``, on the leader after
+    its cache read and before the broadcast:
 
-      * the broadcast then carries merged bytes, so rank>0 writes a merged file;
-      * the leader also rewrites its own on-disk cache, because upstream never
-        does and every rank loads configs from disk;
-      * both ranks consequently load an identical config set. Merging after the
-        broadcast, or on one rank only, would leave the ranks dispatching
-        different kernel tactics.
+      * generic sparse-MLA autotune remains byte-for-byte unchanged;
+      * the broadcast carries merged bytes;
+      * the existing atomic writer persists those bytes on every rank;
+      * both ranks consequently load an identical config set.
 
 SAFETY
     * The feature is experimental and default-off. It runs only when
@@ -41,20 +37,18 @@ SAFETY
     * Enabled mode is fail-closed: missing, changed, unreadable, incompatible, or
       unwritable inputs stop boot rather than silently serving with the
       heuristic fallback.
-    * Anchors are pinned against the vendored copy of the same file at
-      ``recipe/overlay/vllm/model_executor/warmup/kernel_warmup.py`` and gated by
-      ``scripts/ci-validate.sh``, so anchor drift fails before serving.
+    * The complete target source is SHA-256 pinned against
+      ``tests/fixtures/anemll-0.1.1-flashinfer_sparse_mla_warmup.py`` and checked
+      before any write, so image drift fails before serving.
 
 REGENERATING THE SUPPLEMENT (needs the target GPU; not a CPU step)
     A new image or FlashInfer build needs a fresh supplement tuned on that build:
 
-    1. Leave the feature disabled (the default) and widen the boot sweep until it
-       physically runs the production dense budgets — extend
-       ``_DEEPSEEK_V4_DSPARK_DECODE_AUTOTUNE_SEQ_LENS`` in
-       ``vllm/model_executor/warmup/kernel_warmup.py`` so the DSv4 indexer
-       reaches dense 256/1024/2048/8192.
+    1. Leave the feature disabled (the default) and run FlashInfer's real
+       autotuner on the target build for the full token × dense cross-product
+       {1,4,8,16,32,64} × {256,1024,2048,8192}.
     2. Extract the production-dense entries from the cache that boot produced
-       (``_resolve_flashinfer_autotune_file()``, i.e.
+       (``resolve_flashinfer_autotune_file()``, i.e.
        ``$VLLM_CACHE_ROOT/flashinfer_autotune_cache/.../<hash>/autotune_configs.json``)::
 
            python3 -c 'import ast,json,sys;\
@@ -98,22 +92,14 @@ SUPP_BASENAME = "dsv4-autotune-prod-dense-supp.json"
 SUPP_SHA256 = "9ff86acaef00a2ab96e220351a1aea6e0b51b70ef7b25c9ade98f48783fcec0b"
 DEFAULT_VLLM_ROOT = Path("/usr/local/lib/python3.12/dist-packages/vllm")
 MOUNTED_PATCHES_DIR = Path("/opt/dspark-patches")
-TARGET_RELPATH = Path("model_executor/warmup/kernel_warmup.py")
+TARGET_RELPATH = Path("model_executor/warmup/flashinfer_sparse_mla_warmup.py")
+TARGET_SHA256 = "b95e6865be25c2cad3c8d7e5a7c1c88f1cdcb72ff9e7e81dfe7a618ab56faa7b"
 
-# Prerequisites the injected helper closes over in kernel_warmup.py's scope.
-PREREQS = ("logger = init_logger(", "from pathlib import Path")
+# The pinned Anemll 0.1.1 module provides logger; the helper imports everything
+# else privately so it cannot depend on incidental module imports.
+PREREQS = ("logger = init_logger(",)
 
-# Pinned vendored anchor. The narrower block
-#     tune_results: bytes | None = None ... world.broadcast_object(...)
-# appears TWICE in kernel_warmup.py (once in the DSv4 function, once in the
-# generic flashinfer_autotune()), so the anchor is scoped by the DSv4-only
-# `sparse_mla_sm120_decode_dsv4_autotune` line to stay unambiguous.
-ANCHOR_OLD = '''            with sparse_mla_sm120_decode_dsv4_autotune(cache_path=str(cache_path)):
-                run_autotune_shapes()
-        else:
-            run_autotune_shapes()
-
-    tune_results: bytes | None = None
+ANCHOR_OLD = '''    tune_results: bytes | None = None
     if is_leader and cache_path.exists():
         with open(cache_path, "rb") as f:
             tune_results = f.read()
@@ -121,52 +107,50 @@ ANCHOR_OLD = '''            with sparse_mla_sm120_decode_dsv4_autotune(cache_pat
     tune_results = world.broadcast_object(tune_results, src=0)
 '''
 
-ANCHOR_NEW = '''            with sparse_mla_sm120_decode_dsv4_autotune(cache_path=str(cache_path)):
-                run_autotune_shapes()
-        else:
-            run_autotune_shapes()
+ANCHOR_NEW = '''    tune_results: bytes | None = None
+    if is_leader and cache_path.exists():
+        with open(cache_path, "rb") as f:
+            tune_results = f.read()
 
-    tune_results: bytes | None = None
-    if is_leader:
-        if not cache_path.exists():
+    if is_leader and log_label == "DSv4":
+        if tune_results is None:
             raise RuntimeError(
                 "DSv4 production-dense autotune is enabled, but boot tuning "
                 f"did not create {cache_path}"
             )
-        with open(cache_path, "rb") as f:
-            tune_results = f.read()
         # dv4-prod-dense-merge: widen dense coverage before the broadcast so
         # every rank receives and loads the same config set.
-        tune_results = _dv4_prod_dense_merge(tune_results, cache_path)
+        tune_results = _dv4_prod_dense_merge(tune_results)
 
     tune_results = world.broadcast_object(tune_results, src=0)
 '''
 
-HELPER_ANCHOR = "def _deepseek_v4_sparse_mla_decode_autotune(\n"
+HELPER_ANCHOR = "def _run_flashinfer_sparse_mla_decode_autotune(\n"
 
 HELPER_BLOCK = '''# --- dv4-prod-dense-merge (MiaAI patches/hotfix-dsv4-autotune-prod-dense.py) ---
 _DV4_PROD_DENSE_BASENAME = "dsv4-autotune-prod-dense-supp.json"
 _DV4_PROD_DENSE_SHA256 = "9ff86acaef00a2ab96e220351a1aea6e0b51b70ef7b25c9ade98f48783fcec0b"
 
 
-def _dv4_prod_dense_supp_candidates() -> "list[Path]":
+def _dv4_prod_dense_supp_candidates():
     """Staged copy inside the vllm package first, then the read-only mount."""
+    from pathlib import Path as _Path
+
     return [
-        Path(__file__).resolve().parents[2] / _DV4_PROD_DENSE_BASENAME,
-        Path("/opt/dspark-patches") / _DV4_PROD_DENSE_BASENAME,
+        _Path(__file__).resolve().parents[2] / _DV4_PROD_DENSE_BASENAME,
+        _Path("/opt/dspark-patches") / _DV4_PROD_DENSE_BASENAME,
     ]
 
 
-def _dv4_prod_dense_merge(tune_results: bytes, cache_path: "Path") -> bytes:
-    """Merge the pinned production-dense configs into the leader's DSv4 cache.
+def _dv4_prod_dense_merge(tune_results: bytes) -> bytes:
+    """Merge the pinned production-dense configs into the DSv4 cache bytes.
 
     This helper exists only when the operator explicitly enables the hotfix.
-    Any missing, stale, incompatible, or unwritable input is therefore fatal:
-    silently serving with the heuristic fallback would invalidate the run.
+    Any missing, stale, or incompatible input is therefore fatal: silently
+    serving with the heuristic fallback would invalidate the run.
     """
     import hashlib as _hashlib
     import json as _json
-    import os as _os
 
     candidates = _dv4_prod_dense_supp_candidates()
     supp_path = next((p for p in candidates if p.is_file()), None)
@@ -228,29 +212,13 @@ def _dv4_prod_dense_merge(tune_results: bytes, cache_path: "Path") -> bytes:
     merged["_metadata"] = base_meta
     payload = _json.dumps(merged).encode()
 
-    # Upstream never rewrites the leader's own cache file, but every rank loads
-    # configs from disk, so the merged payload has to land here as well.
-    tmp_path = cache_path.with_name(cache_path.name + ".dv4tmp")
-    try:
-        with open(tmp_path, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            _os.fsync(handle.fileno())
-        _os.replace(tmp_path, cache_path)
-    except OSError as exc:
-        tmp_path.unlink(missing_ok=True)
-        raise RuntimeError(
-            "DSv4 production-dense autotune merged cache could not be persisted"
-        ) from exc
-
     logger.info(
         "Merged %d production-dense DSv4 sparse-MLA decode configs into the "
-        "autotune cache (%d boot-tuned entries kept, %d total); every rank will "
-        "load this set from %s.",
+        "autotune cache bytes (%d boot-tuned entries kept, %d total); the "
+        "existing post-broadcast cache writer will persist them on every rank.",
         len(added),
         len(base) - 1,
         len(merged) - 1,
-        cache_path,
     )
     return payload
 
@@ -359,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
 
     target = args.vllm_root / TARGET_RELPATH
     if not target.is_file():
-        print(f"[FAIL] kernel_warmup.py not found at {target}", file=sys.stderr)
+        print(f"[FAIL] target module not found at {target}", file=sys.stderr)
         return 1
 
     supp_src = args.supplement or (MOUNTED_PATCHES_DIR / SUPP_BASENAME)
@@ -379,7 +347,17 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     _log(args.quiet, f"  supplement ok: {supp_for_check} ({reason})")
 
-    src = target.read_text()
+    source_bytes = target.read_bytes()
+    src = source_bytes.decode()
+    if MARKER not in src:
+        target_digest = hashlib.sha256(source_bytes).hexdigest()
+        if target_digest != TARGET_SHA256:
+            print(
+                f"[FAIL] {target}: source digest mismatch "
+                f"(expected {TARGET_SHA256}, got {target_digest})",
+                file=sys.stderr,
+            )
+            return 1
     new_src, status = apply_text(src)
 
     if args.check:
@@ -388,7 +366,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if supp_src.is_file() and supp_src.resolve() != supp_staged.resolve():
         # Refresh this on every invocation, including container restarts where
-        # kernel_warmup.py is already patched but the mounted supplement changed.
+        # the target module is already patched but the mounted supplement changed.
         atomic_write(supp_staged, supp_src.read_bytes())
         _log(args.quiet, f"  staged supplement -> {supp_staged}")
 
@@ -400,9 +378,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(
             f"[FAIL] {target}: {status} — DSv4 production-dense autotune merge NOT "
-            "installed. The vendored anchor in "
-            "recipe/overlay/vllm/model_executor/warmup/kernel_warmup.py no longer "
-            "matches this image; re-pin the anchor before relying on dense coverage.",
+            "installed. The pinned Anemll 0.1.1 sparse-MLA warmup source no "
+            "longer matches this image; re-pin the target before relying on "
+            "dense coverage.",
             file=sys.stderr,
         )
         return 1
@@ -423,7 +401,7 @@ def main(argv: list[str] | None = None) -> int:
     if "_dv4_prod_dense_merge" not in helpers:
         print(f"[FAIL] {target}: merge helper missing after patch", file=sys.stderr)
         return 1
-    if "_dv4_prod_dense_merge(tune_results, cache_path)" not in final:
+    if "_dv4_prod_dense_merge(tune_results)" not in final:
         print(f"[FAIL] {target}: merge is never called on the DSv4 path", file=sys.stderr)
         return 1
     if not supp_staged.is_file() and not supp_src.is_file():

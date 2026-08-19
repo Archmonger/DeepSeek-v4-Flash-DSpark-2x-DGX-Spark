@@ -3,21 +3,22 @@
 
 Covers three things the review of PR #83 found unproven:
 
-1. the patcher hooks the DSv4 sparse-MLA decode path that actually owns the
-   cache, and its anchor is pinned to the vendored kernel_warmup.py;
+1. the patcher hooks the DSv4 sparse-MLA decode path in the pinned Anemll 0.1.1
+   image, and its complete target source is hash-pinned;
 2. the injected merge helper behaves correctly, including refusing to load a
    supplement tuned for a different build;
-3. both ranks end up loading an identical config set.
+3. both ranks receive an identical merged config payload.
 
-The helper closes over `logger` and `Path` from kernel_warmup's module scope, so
-it is exercised by extracting the injected region and exec'ing it against stubs.
-That keeps the test free of torch / vllm / flashinfer imports.
+The helper imports its private dependencies inside the injected block. It is
+exercised by extracting that block and exec'ing it against a logger stub, so the
+test stays free of torch / vllm / flashinfer imports.
 """
 
 from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 import importlib.util
 import json
 import tempfile
@@ -27,7 +28,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 HOTFIX = ROOT / "patches" / "hotfix-dsv4-autotune-prod-dense.py"
 SUPPLEMENT = ROOT / "patches" / "dsv4-autotune-prod-dense-supp.json"
-VENDORED = ROOT / "recipe/overlay/vllm/model_executor/warmup/kernel_warmup.py"
+VENDORED = ROOT / "tests" / "fixtures" / "anemll-0.1.1-flashinfer_sparse_mla_warmup.py"
 COMPOSE = ROOT / "docker-compose.dspark.yml"
 LAUNCHER = ROOT / "start-deepseek-v4-flash-dspark.sh"
 
@@ -76,7 +77,7 @@ def _extract_helper(patched_src: str, fake_module_file: Path):
 
 
 class AnchorPinningTest(unittest.TestCase):
-    """The pinned anchor must match the vendored kernel_warmup.py exactly."""
+    """The patch target must match the pinned Anemll 0.1.1 source exactly."""
 
     def setUp(self):
         self.src = VENDORED.read_text()
@@ -85,29 +86,21 @@ class AnchorPinningTest(unittest.TestCase):
         self.assertEqual(
             self.src.count(MOD.ANCHOR_OLD),
             1,
-            "pinned DSv4 call anchor must appear exactly once in the vendored file",
+            "pinned cache-flow anchor must appear exactly once in the target file",
         )
 
     def test_helper_anchor_present_and_unique(self):
         self.assertEqual(self.src.count(MOD.HELPER_ANCHOR), 1)
 
-    def test_anchor_is_scoped_to_the_dsv4_function(self):
-        # The narrow read+broadcast block is NOT unique: the generic
-        # flashinfer_autotune() carries a byte-identical copy. Patching that one
-        # would tune the wrong cache, so the anchor must stay DSv4-scoped.
-        narrow = (
-            "    tune_results: bytes | None = None\n"
-            "    if is_leader and cache_path.exists():\n"
-            '        with open(cache_path, "rb") as f:\n'
-            "            tune_results = f.read()\n"
-            "\n"
-            "    tune_results = world.broadcast_object(tune_results, src=0)\n"
+    def test_complete_target_source_digest_is_pinned(self):
+        self.assertEqual(
+            hashlib.sha256(VENDORED.read_bytes()).hexdigest(),
+            MOD.TARGET_SHA256,
         )
-        self.assertGreater(self.src.count(narrow), 1, "narrow block should be ambiguous")
-        idx = self.src.index(MOD.ANCHOR_OLD)
-        dsv4 = self.src.rfind("def _deepseek_v4_sparse_mla_decode_autotune", 0, idx)
-        generic = self.src.rfind("def flashinfer_autotune", 0, idx)
-        self.assertGreater(dsv4, generic, "anchor must sit inside the DSv4 function")
+        self.assertEqual(
+            MOD.TARGET_RELPATH.as_posix(),
+            "model_executor/warmup/flashinfer_sparse_mla_warmup.py",
+        )
 
     def test_prereqs_present_in_vendored_file(self):
         for prereq in MOD.PREREQS:
@@ -116,7 +109,7 @@ class AnchorPinningTest(unittest.TestCase):
     def test_merge_lands_before_the_broadcast(self):
         patched, status = MOD.apply_text(self.src)
         self.assertEqual(status, "applied")
-        call = patched.index("_dv4_prod_dense_merge(tune_results, cache_path)")
+        call = patched.index("_dv4_prod_dense_merge(tune_results)")
         bcast = patched.index("tune_results = world.broadcast_object(tune_results, src=0)")
         self.assertLess(
             call,
@@ -124,19 +117,26 @@ class AnchorPinningTest(unittest.TestCase):
             "merge must happen before broadcast_object or rank>0 gets unmerged bytes",
         )
 
+    def test_existing_writer_persists_after_the_broadcast(self):
+        patched, _ = MOD.apply_text(self.src)
+        bcast = patched.index("tune_results = world.broadcast_object(tune_results, src=0)")
+        writer = patched.index("write_flashinfer_autotune_cache(cache_path, tune_results)")
+        self.assertLess(bcast, writer)
+
     def test_enabled_hook_refuses_a_missing_boot_cache(self):
         patched, status = MOD.apply_text(self.src)
         self.assertEqual(status, "applied")
-        self.assertIn("if not cache_path.exists():", patched)
+        self.assertIn("if tune_results is None:", patched)
         self.assertIn("did not create", patched)
 
-    def test_generic_autotune_path_untouched(self):
+    def test_merge_is_gated_to_the_dsv4_label(self):
         patched, _ = MOD.apply_text(self.src)
-        self.assertEqual(patched.count("_dv4_prod_dense_merge(tune_results, cache_path)"), 1)
-        # The generic function must still be byte-identical.
-        def generic(text: str) -> str:
-            return text[text.index("def flashinfer_autotune(runner"):]
-        self.assertEqual(generic(patched), generic(self.src))
+        self.assertEqual(patched.count("_dv4_prod_dense_merge(tune_results)"), 1)
+        self.assertIn('if is_leader and log_label == "DSv4":', patched)
+        self.assertEqual(
+            patched.count('if is_leader and log_label == "DSv4":'),
+            1,
+        )
 
 
 class ApplyTextTest(unittest.TestCase):
@@ -154,14 +154,14 @@ class ApplyTextTest(unittest.TestCase):
         tree = ast.parse(out)
         names = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
         self.assertIn("_dv4_prod_dense_merge", names)
-        self.assertIn("_deepseek_v4_sparse_mla_decode_autotune", names)
+        self.assertIn("_run_flashinfer_sparse_mla_decode_autotune", names)
 
     def test_idempotent(self):
         once, _ = MOD.apply_text(self.src)
         twice, status = MOD.apply_text(once)
         self.assertEqual(status, "already")
         self.assertEqual(once, twice)
-        self.assertEqual(once.count("_dv4_prod_dense_merge(tune_results, cache_path)"), 1)
+        self.assertEqual(once.count("_dv4_prod_dense_merge(tune_results)"), 1)
 
     def test_anchor_missing_is_reported_not_guessed(self):
         broken = self.src.replace(
@@ -214,14 +214,12 @@ class MergeBehaviourTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.pkg = root / "vllm"
-        (self.pkg / "model_executor" / "warmup").mkdir(parents=True)
-        self.module_file = self.pkg / "model_executor" / "warmup" / "kernel_warmup.py"
+        self.module_file = self.pkg / MOD.TARGET_RELPATH
+        self.module_file.parent.mkdir(parents=True)
         self.patched, status = MOD.apply_text(VENDORED.read_text())
         assert status == "applied"
         self.supp = json.loads(SUPPLEMENT.read_text())
         (self.pkg / MOD.SUPP_BASENAME).write_bytes(SUPPLEMENT.read_bytes())
-        self.cache = root / "cache" / "autotune_configs.json"
-        self.cache.parent.mkdir(parents=True)
         self.addCleanup(self.tmp.cleanup)
 
     def _helper(self):
@@ -240,47 +238,43 @@ class MergeBehaviourTest(unittest.TestCase):
             base.update(extra)
         return base
 
-    def test_happy_path_merges_and_persists(self):
+    def test_happy_path_merges_payload(self):
         merge, logger = self._helper()
         base = self._base()
         raw = json.dumps(base).encode()
-        self.cache.write_bytes(raw)
 
-        out = merge(raw, self.cache)
-        merged = json.loads(out)
+        merged = json.loads(merge(raw))
 
         self.assertEqual(len([k for k in merged if k != "_metadata"]), 25)
         for key in (k for k in self.supp if k != "_metadata"):
             self.assertIn(key, merged)
         self.assertEqual(merged["_metadata"], base["_metadata"])
-        # Leader's own on-disk cache must also be merged: every rank loads
-        # configs from disk, and upstream never rewrites the leader's file.
-        self.assertEqual(json.loads(self.cache.read_bytes()), merged)
         self.assertNotIn("WARNING", logger.levels(), logger.text())
 
-    def test_both_ranks_load_identical_configs(self):
-        """Leader merge -> broadcast bytes -> rank>0 write -> same config set."""
+    def test_both_ranks_receive_identical_configs(self):
+        """Leader merge -> broadcast bytes -> existing writer on every rank."""
         merge, _ = self._helper()
         raw = json.dumps(self._base()).encode()
-        self.cache.write_bytes(raw)
+        broadcast_payload = merge(raw)
 
-        broadcast_payload = merge(raw, self.cache)          # leader, pre-broadcast
-        leader_on_disk = self.cache.read_bytes()            # what the leader loads
+        rank_paths = [
+            Path(self.tmp.name) / rank / "autotune_configs.json"
+            for rank in ("rank0", "rank1")
+        ]
+        for path in rank_paths:
+            path.parent.mkdir(parents=True)
+            path.write_bytes(broadcast_payload)
 
-        rank1_cache = Path(self.tmp.name) / "rank1" / "autotune_configs.json"
-        rank1_cache.parent.mkdir(parents=True)
-        rank1_cache.write_bytes(broadcast_payload)          # upstream rank>0 write
-
-        self.assertEqual(json.loads(leader_on_disk), json.loads(rank1_cache.read_bytes()))
+        self.assertEqual(rank_paths[0].read_bytes(), rank_paths[1].read_bytes())
+        self.assertEqual(json.loads(rank_paths[0].read_bytes()), json.loads(broadcast_payload))
 
     def test_boot_tuned_entry_wins_collision(self):
         merge, _ = self._helper()
         clashing = sorted(k for k in self.supp if k != "_metadata")[0]
         base = self._base(extra={clashing: ["SparseMlaDecodeV3Runner", 1234]})
         raw = json.dumps(base).encode()
-        self.cache.write_bytes(raw)
 
-        merged = json.loads(merge(raw, self.cache))
+        merged = json.loads(merge(raw))
         self.assertEqual(merged[clashing], ["SparseMlaDecodeV3Runner", 1234])
         self.assertNotEqual(merged[clashing], self.supp[clashing])
 
@@ -289,11 +283,9 @@ class MergeBehaviourTest(unittest.TestCase):
         meta = copy.deepcopy(self.supp["_metadata"])
         meta["flashinfer_version"] = "0.7.0"
         raw = json.dumps(self._base(meta=meta)).encode()
-        self.cache.write_bytes(raw)
 
         with self.assertRaisesRegex(RuntimeError, "different build"):
-            merge(raw, self.cache)
-        self.assertEqual(self.cache.read_bytes(), raw, "cache must be left untouched")
+            merge(raw)
 
     def test_gpu_mismatch_fails_closed(self):
         merge, _ = self._helper()
@@ -301,7 +293,7 @@ class MergeBehaviourTest(unittest.TestCase):
         meta["gpu"] = "NVIDIA H100"
         raw = json.dumps(self._base(meta=meta)).encode()
         with self.assertRaisesRegex(RuntimeError, "gpu"):
-            merge(raw, self.cache)
+            merge(raw)
 
     def test_missing_metadata_fails_closed(self):
         merge, _ = self._helper()
@@ -309,16 +301,15 @@ class MergeBehaviourTest(unittest.TestCase):
         del base["_metadata"]
         raw = json.dumps(base).encode()
         with self.assertRaisesRegex(RuntimeError, "_metadata"):
-            merge(raw, self.cache)
+            merge(raw)
 
     def test_already_covered_is_a_noop(self):
         merge, logger = self._helper()
         base = self._base()
         base.update({k: v for k, v in self.supp.items() if k != "_metadata"})
         raw = json.dumps(base).encode()
-        self.cache.write_bytes(raw)
 
-        out = merge(raw, self.cache)
+        out = merge(raw)
         self.assertEqual(out, raw)
         self.assertIn("already present", logger.text())
         self.assertNotIn("WARNING", logger.levels())
@@ -328,14 +319,14 @@ class MergeBehaviourTest(unittest.TestCase):
         merge, _ = self._helper()
         raw = json.dumps(self._base()).encode()
         with self.assertRaisesRegex(RuntimeError, "not found"):
-            merge(raw, self.cache)
+            merge(raw)
 
     def test_corrupt_supplement_fails_closed(self):
         (self.pkg / MOD.SUPP_BASENAME).write_text("{ not json")
         merge, _ = self._helper()
         raw = json.dumps(self._base()).encode()
         with self.assertRaisesRegex(RuntimeError, "unreadable"):
-            merge(raw, self.cache)
+            merge(raw)
 
     def test_modified_supplement_fails_digest_check(self):
         staged = self.pkg / MOD.SUPP_BASENAME
@@ -343,19 +334,13 @@ class MergeBehaviourTest(unittest.TestCase):
         merge, _ = self._helper()
         raw = json.dumps(self._base()).encode()
         with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
-            merge(raw, self.cache)
+            merge(raw)
 
     def test_corrupt_boot_cache_fails_closed(self):
         merge, _ = self._helper()
         with self.assertRaisesRegex(RuntimeError, "unreadable"):
-            merge(b"{ truncated", self.cache)
+            merge(b"{ truncated")
 
-    def test_unwritable_cache_fails_closed(self):
-        merge, _ = self._helper()
-        raw = json.dumps(self._base()).encode()
-        missing_dir = Path(self.tmp.name) / "nope" / "autotune_configs.json"
-        with self.assertRaisesRegex(RuntimeError, "could not be persisted"):
-            merge(raw, missing_dir)
 
 
 class PatcherCliTest(unittest.TestCase):
@@ -363,10 +348,9 @@ class PatcherCliTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.pkg = root / "vllm"
-        (self.pkg / "model_executor" / "warmup").mkdir(parents=True)
-        (self.pkg / "model_executor" / "warmup" / "kernel_warmup.py").write_text(
-            VENDORED.read_text()
-        )
+        target = self.pkg / MOD.TARGET_RELPATH
+        target.parent.mkdir(parents=True)
+        target.write_bytes(VENDORED.read_bytes())
         self.addCleanup(self.tmp.cleanup)
 
     def test_apply_then_reapply(self):
@@ -388,7 +372,7 @@ class PatcherCliTest(unittest.TestCase):
         self.assertEqual(staged.read_bytes(), SUPPLEMENT.read_bytes())
 
     def test_check_mode_writes_nothing(self):
-        target = self.pkg / "model_executor" / "warmup" / "kernel_warmup.py"
+        target = self.pkg / MOD.TARGET_RELPATH
         before = target.read_text()
         rc = MOD.main(
             ["--vllm-root", str(self.pkg), "--supplement", str(SUPPLEMENT), "--check", "-q"]
@@ -404,7 +388,7 @@ class PatcherCliTest(unittest.TestCase):
         )
 
     def test_anchor_drift_fails_loudly(self):
-        target = self.pkg / "model_executor" / "warmup" / "kernel_warmup.py"
+        target = self.pkg / MOD.TARGET_RELPATH
         target.write_text(
             target.read_text().replace(
                 "            tune_results = f.read()\n",
@@ -423,10 +407,8 @@ class PatcherCliTest(unittest.TestCase):
         self.assertEqual(
             MOD.main(["--vllm-root", str(self.pkg), "--supplement", str(bad), "-q"]), 1
         )
-        target = self.pkg / "model_executor" / "warmup" / "kernel_warmup.py"
+        target = self.pkg / MOD.TARGET_RELPATH
         self.assertNotIn(MOD.MARKER, target.read_text())
-
-
 
 
 class ActivationWiringTest(unittest.TestCase):

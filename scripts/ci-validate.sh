@@ -256,11 +256,10 @@ print(
 PY
 ok "production-dense autotune supplement parses and covers dense 256/1024/2048/8192"
 
-# The hotfix rewrites kernel_warmup.py by exact anchor. Pin the anchor against
-# the vendored copy so upstream drift fails CI instead of silently no-op'ing at
-# boot, and keep it scoped to the DSv4 function (the narrow read+broadcast block
-# also appears in the generic flashinfer_autotune()).
-python3 - <<'PY' || bad "DSv4 autotune hotfix anchor no longer pinned to vendored kernel_warmup.py"
+# Pin the exact module shipped by the default Anemll 0.1.1 image. The merge must
+# stay DSv4-only, before broadcast, with the existing atomic writer afterward.
+python3 - <<'PY' || bad "DSv4 autotune hotfix target or ordering drifted"
+import hashlib
 import importlib.util
 import sys
 from pathlib import Path
@@ -271,34 +270,34 @@ spec = importlib.util.spec_from_file_location(
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 
-vendored = Path("recipe/overlay/vllm/model_executor/warmup/kernel_warmup.py").read_text()
+fixture_path = Path("tests/fixtures/anemll-0.1.1-flashinfer_sparse_mla_warmup.py")
+source_bytes = fixture_path.read_bytes()
+if hashlib.sha256(source_bytes).hexdigest() != mod.TARGET_SHA256:
+    print("  pinned Anemll target source digest mismatch")
+    sys.exit(1)
+source = source_bytes.decode()
 for label, anchor in (("call", mod.ANCHOR_OLD), ("helper", mod.HELPER_ANCHOR)):
-    hits = vendored.count(anchor)
+    hits = source.count(anchor)
     if hits != 1:
-        print(f"  {label} anchor matches {hits} times in vendored kernel_warmup.py (want 1)")
+        print(f"  {label} anchor matches {hits} times in pinned target (want 1)")
         sys.exit(1)
-patched, status = mod.apply_text(vendored)
+patched, status = mod.apply_text(source)
 if status != "applied":
-    print(f"  apply_text on vendored source returned {status}")
+    print(f"  apply_text on pinned target returned {status}")
     sys.exit(1)
-if patched.index("_dv4_prod_dense_merge(tune_results, cache_path)") > patched.index(
-    "tune_results = world.broadcast_object(tune_results, src=0)"
-):
-    print("  merge is injected after broadcast_object; ranks would diverge")
+merge = patched.index("_dv4_prod_dense_merge(tune_results)")
+broadcast = patched.index("tune_results = world.broadcast_object(tune_results, src=0)")
+writer = patched.index("write_flashinfer_autotune_cache(cache_path, tune_results)")
+if not (merge < broadcast < writer):
+    print("  required ordering is merge < broadcast < atomic writer")
     sys.exit(1)
-print("  anchors unique, merge injected pre-broadcast on the DSv4 path")
+if patched.count('if is_leader and log_label == "DSv4":') != 1:
+    print("  merge is not gated exactly once to the DSv4 label")
+    sys.exit(1)
+print("  target digest and anchors pinned; DSv4 merge < broadcast < writer")
 PY
-ok "DSv4 autotune hotfix anchor pinned to vendored kernel_warmup.py (pre-broadcast)"
+ok "DSv4 autotune target pinned to Anemll 0.1.1 with correct ordering"
 
-# No patch may TARGET the dead hook again: the DSv4 sparse-MLA cache is never
-# written through vllm's write_flashinfer_autotune_cache(), so patching it is a
-# silent no-op. Prose that explains why is fine; a patch anchor or file target
-# is not.
-if grep -rqE 'flashinfer_autotune_cache\.py|def write_flashinfer_autotune_cache' patches/ 2>/dev/null; then
-  bad "a patch targets vllm's write_flashinfer_autotune_cache (not on the DSv4 cache path)"
-else
-  ok "no patch targets the dead write_flashinfer_autotune_cache hook"
-fi
 
 if [ "$fail" -ne 0 ]; then
   echo "CI validate FAILED" >&2
