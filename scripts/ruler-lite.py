@@ -46,10 +46,19 @@ CWE_WORDS = ["apple", "banana", "cherry", "dragon", "eagle", "forest", "garden",
              "thunder", "utopia", "violet", "willow", "xenon", "yonder"]
 
 
-def request_json(url: str, body: dict, timeout: float = 900) -> dict:
+# Client-side HTTP timeout, overridable with --request-timeout. The former
+# hardcoded 900 s is shorter than a single cold prefill near the 1M ceiling: at
+# the ~1.1k tok/s prefill measured on 2x DGX Spark, a 900k-token prompt needs
+# ~800 s of prefill plus padding round trips and decode, so every 900k task
+# failed as "timed out" and was scored as a FAIL — a harness limit reported as a
+# model failure.
+REQUEST_TIMEOUT = 900.0
+
+
+def request_json(url: str, body: dict, timeout: float | None = None) -> dict:
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout or REQUEST_TIMEOUT) as resp:
         return json.load(resp)
 
 
@@ -250,7 +259,15 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=512,
                     help="generation budget; verbose models (Qwen3.8-27B) write prose before "
                          "the answer, so 256 truncates the word list -> false FAIL. 512 covers it.")
+    ap.add_argument("--request-timeout", type=float, default=900.0,
+                    help="client HTTP timeout in seconds. A single cold prefill near the 1M "
+                         "ceiling exceeds the old hardcoded 900 s (~1.1k tok/s prefill on 2x DGX "
+                         "Spark => ~800 s for 900k tokens, before padding round trips and "
+                         "decode), which scored a harness timeout as a model FAIL. Raise for "
+                         "--lengths at or above ~500k.")
     args = ap.parse_args()
+    global REQUEST_TIMEOUT
+    REQUEST_TIMEOUT = args.request_timeout
 
     lengths = [int(x) for x in args.lengths.split(",")]
     task_map = {"sniah": task_sniah, "mkniah": task_mkniah,
