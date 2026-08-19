@@ -2,6 +2,8 @@
 
 ### Changed
 
+- **Ride out mid-serve TileLang/CuTeDSL JIT instead of killing EngineCore ([Issue #65](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/65), [Issue #87](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/87))**: compose now injects `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800` (stock 300) and `TILELANG_CACHE_DIR=/cache/huggingface/tilelang-cache` on the HF volume. Does not retune NCCL; a true TP hang still needs a paired `./stop && ./start`. Takes effect on the next container recreate.
+
 - **#27 hotfix: allow 2 overlapping chunked prefills via `DSPARK_MAX_INFLIGHT_PREFILLS` (default 2).** Anemll `0.1.1` still rejects `--max-num-partial-prefills` (issue #45). The shipped #27 gate therefore read `SchedulerConfig.max_num_partial_prefills` (always 1) and serialized every long prefill — 32K×c4 decode sat on the ~8 tok/s floor. The hotfix now honors `DSPARK_MAX_INFLIGHT_PREFILLS` (clamped 1–3) from compose. Live A/B on this 2× Spark stack (`thinking=false`, `LONG_PREFILL_TOKEN_THRESHOLD=1024`, #43 floor on): 32K×c4 per-stream decode **8.2 → 24.6 tok/s**; 256×c6 aggregate unchanged (~175); 12 min 32K×c2 soak 21/21 pass; preemptions 0. Set `1` to restore the old serial gate. Does not implement real Concurrent Partial Prefill.
 
 ### Fixed
