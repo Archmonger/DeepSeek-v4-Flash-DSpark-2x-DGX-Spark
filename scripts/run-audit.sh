@@ -10,13 +10,19 @@
 #
 # Usage: bash scripts/run-audit.sh [--base-url http://127.0.0.1:8888/v1] [--model deepseek-v4-flash-0731]
 #        [--lengths 8192,32768,131072,262144] [--tool-lengths 32768,131072] [--garble-lengths 2048,32768,131072]
+#        [--request-timeout SECONDS]
 # Exit 0 = all phases pass, 1 = any failure.
+#
+# --request-timeout raises the RULER-lite client HTTP timeout (phase 3). Its
+# 900 s default cannot finish a prefill past ~790k tokens on this cluster, so
+# pair it with any --lengths value near the 1M ceiling. Unset = script default.
 set -u
 BASE_URL="${BASE_URL:-http://127.0.0.1:8888/v1}"
 MODEL="${MODEL:-deepseek-v4-flash-0731}"
 LENGTHS="${LENGTHS:-8192,32768,131072,262144}"
 TOOL_LENGTHS="${TOOL_LENGTHS:-32768,131072}"
 GARBLE_LENGTHS="${GARBLE_LENGTHS:-2048,32768,131072}"
+REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --base-url) BASE_URL="$2"; shift 2 ;;
@@ -24,6 +30,7 @@ while [[ $# -gt 0 ]]; do
     --lengths) LENGTHS="$2"; shift 2 ;;
     --tool-lengths) TOOL_LENGTHS="$2"; shift 2 ;;
     --garble-lengths) GARBLE_LENGTHS="$2"; shift 2 ;;
+    --request-timeout) REQUEST_TIMEOUT="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -50,8 +57,12 @@ run_phase "1 throughput" "$REPORT_DIR/throughput.log" python3 "$SCRIPT_DIR/bench
 run_phase "2 spec-acceptance" "$REPORT_DIR/acceptance.log" python3 "$SCRIPT_DIR/spec-acceptance.py" --base-url "$BASE_URL" \
   --model "$MODEL" --trials 5 --bench-script "$SCRIPT_DIR/bench-miaai.py"
 
+RULER_TIMEOUT_ARG=()
+if [ -n "$REQUEST_TIMEOUT" ]; then
+  RULER_TIMEOUT_ARG=(--request-timeout "$REQUEST_TIMEOUT")
+fi
 run_phase "3 ruler-lite quality" "$REPORT_DIR/ruler.log" python3 "$SCRIPT_DIR/ruler-lite.py" --base-url "$BASE_URL" \
-  --model "$MODEL" --lengths "$LENGTHS" --output "$REPORT_DIR/ruler-lite.json"
+  --model "$MODEL" --lengths "$LENGTHS" "${RULER_TIMEOUT_ARG[@]}" --output "$REPORT_DIR/ruler-lite.json"
 
 run_phase "4 tool battery" "$REPORT_DIR/tool.log" python3 "$SCRIPT_DIR/tool-battery.py" "$BASE_URL/chat/completions" "$MODEL"
 
