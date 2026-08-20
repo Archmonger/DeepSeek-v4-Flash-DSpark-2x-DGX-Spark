@@ -39,6 +39,7 @@ py_files+=(
   scripts/spec-acceptance.py
   scripts/test-spec-acceptance.py
   scripts/test-ruler-lite-pad.py
+  scripts/test-env-normalisation.py
   scripts/ruler-lite.py
   scripts/verify-dsv4-027-equality-gate.py
 )
@@ -64,6 +65,8 @@ python3 scripts/test-spec-acceptance.py -q
 ok "test-spec-acceptance"
 python3 scripts/test-ruler-lite-pad.py -q
 ok "test-ruler-lite-pad"
+python3 scripts/test-env-normalisation.py -q
+ok "test-env-normalisation"
 python3 tests/test_issue27_inflight_cap.py -q
 ok "test_issue27_inflight_cap"
 python3 scripts/verify-dsv4-027-equality-gate.py

@@ -74,10 +74,23 @@ if [ ! -f "$COMPOSE_FILE" ]; then
   exit 1
 fi
 
+# An editor (or a paste through Windows tooling) can leave a UTF-8 BOM or CRLF
+# line endings in the env file. Because it is sourced, both are executed: a BOM
+# makes line 1 a bogus command, and a trailing \r either aborts at the first
+# blank line or rides along inside values such as WORKER_HOST, failing far from
+# the real cause. Normalise a copy so the operator's file is never rewritten.
+# The copy inherits the secrets, so it is created 0600 and removed on every
+# exit path (including sed/source failure and signals) before anything else runs.
+_dspark_env_clean="$(mktemp)"
+trap 'rm -f "$_dspark_env_clean"' EXIT HUP INT TERM
+chmod 600 "$_dspark_env_clean"
+sed $'1s/^\xEF\xBB\xBF//; s/\r$//' "$ENV_FILE" > "$_dspark_env_clean"
 set -a
 # shellcheck disable=SC1090
-source "$ENV_FILE"
+source "$_dspark_env_clean"
 set +a
+rm -f "$_dspark_env_clean"
+trap - EXIT HUP INT TERM
 
 # Vision mode flag selects 0731 GPU util (and whether the VL sidecar starts).
 #   ENABLE_VL_SIDECAR=1 → vision coexist → GPU_MEMORY_UTILIZATION_VISION (default 0.80)
@@ -425,7 +438,7 @@ print_resolved_profile() {
   echo "  model: ${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-DSpark}"
   echo "  served model: ${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"
   echo "  max model len: ${MAX_MODEL_LEN:-1000000}"
-  echo "  max num seqs: ${MAX_NUM_SEQS:-12}"
+  echo "  max num seqs: ${MAX_NUM_SEQS:-6}"
   echo "  max batched tokens: ${MAX_NUM_BATCHED_TOKENS:-8192}"
   echo "  gpu memory utilization: ${GPU_MEMORY_UTILIZATION:-0.80} (text default ${GPU_MEMORY_UTILIZATION_TEXT:-0.835} / vision default ${GPU_MEMORY_UTILIZATION_VISION:-0.80})"
   echo "  mtp speculative tokens: ${MTP_NUM_TOKENS:-5} (dspark_block_size min is 5)"
@@ -559,7 +572,16 @@ print_resolved_profile
 echo "Syncing DSpark deployment files to ${WORKER_HOST}:${WORKER_DIR}"
 ssh "$WORKER_HOST" "mkdir -p $REMOTE_WORKER_DIR"
 scp "$COMPOSE_FILE" "${WORKER_HOST}:${REMOTE_COMPOSE_FILE}"
-scp "$ENV_FILE" "${WORKER_HOST}:${REMOTE_ENV_FILE}"
+# The env file carries HF_TOKEN. Send the same normalised bytes the head just
+# sourced, so the worker's compose --env-file does not see a BOM/CRLF the head
+# was shielded from. umask 077 keeps a freshly created file unreadable from the
+# start; the explicit chmod then enforces 0600 on a destination that already
+# exists, where umask does not apply. REMOTE_ENV_FILE is already %q-escaped
+# (see above), so it is used unquoted like the other remote paths. No
+# `|| true`: if 0600 cannot be enforced, set -e aborts rather than continuing
+# with an exposed credential.
+sed $'1s/^\xEF\xBB\xBF//; s/\r$//' "$ENV_FILE" \
+  | ssh "$WORKER_HOST" "umask 077; cat > $REMOTE_ENV_FILE && chmod 600 $REMOTE_ENV_FILE"
 SIDECAR_COMPOSE_FILE="${SIDECAR_COMPOSE_FILE:-$SCRIPT_DIR/docker-compose.vl-sidecar.yml}"
 if [ -f "$SIDECAR_COMPOSE_FILE" ]; then
   scp "$SIDECAR_COMPOSE_FILE" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/docker-compose.vl-sidecar.yml"
