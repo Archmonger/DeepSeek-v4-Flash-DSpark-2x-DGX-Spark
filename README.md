@@ -465,7 +465,7 @@ This is the **Stage C padded NVFP4** path (584-byte sparse-MLA envelope via
 Optional GB10 hybrid plugin: `ENABLE_VLLM_GB10_PATCH=1 ./start-…`
 (`--quantization modelopt_gb10_hybrid`). Default off.
 
-CI on every push ([`.github/workflows/validate.yml`](.github/workflows/validate.yml))
+CI on every pull request and push to `main` ([`.github/workflows/validate.yml`](.github/workflows/validate.yml))
 is **CPU-only** (`scripts/ci-validate.sh`). Live tok/s still needs the 2× Spark pair.
 
 ### Strict Responses API verification
