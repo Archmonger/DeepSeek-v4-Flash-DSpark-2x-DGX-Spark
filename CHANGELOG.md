@@ -21,6 +21,8 @@
 
 - **`spec-acceptance.py` no longer crashes on serves without spec-decode ([Issue #92](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/92), reported by [@wbaguley](https://github.com/wbaguley))**: it formatted missing `drafted`/`accepted` counters before its no-spec guard, so `run-audit.sh` reported FAIL on a valid non-speculative serve. The guard now exits 0 before formatting either counter or starting the benchmark burst. The same report's parser/window items were already handled by [PR #91](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/pull/91) and are not re-claimed here.
 
+- **`NCCL_IB_GID_AUTO=1` FATALed on any list form of `NCCL_IB_HCA`**: `resolve_rocev2_gid_index()` in `start-deepseek-v4-flash-dspark.sh` used the raw `NCCL_IB_HCA` value as a sysfs directory name, so NCCL's exact-match multi-HCA syntax (`NCCL_IB_HCA==devA,devB` — the form `NCCL_IB_MERGE_NICS` requires on a dual-link RoCE pair) produced `/sys/class/infiniband/=devA,devB/ports/1/gids/*`, matched nothing, and the launcher exited before starting either rank. The value is now expanded into sysfs device names first (leading `=` stripped, comma list split, `:port` suffix dropped, `^…` exclusion falling back to scanning every local HCA), and every listed device is scanned. If listed devices resolve to different indexes the launcher warns and uses the first, since `NCCL_IB_GID_INDEX` is a single global value. Single-device configs behave exactly as before. Gated by `scripts/test-nccl-ib-hca-gid-resolve.sh` (device expansion plus the launcher's own lookup script run against a fake sysfs tree).
+
 ## 2026-08-19
 
 ### Changed

@@ -245,26 +245,62 @@ iface_ipv4() {
   fi
 }
 
-# Resolve RoCEv2 GID index for HCA whose GID embeds match_ip.
-# $1=ssh target (empty=local)  $2=HCA  $3=IPv4 to match
+# NCCL_IB_HCA is not a bare sysfs device name. NCCL accepts a comma-separated
+# list, an optional ":port" suffix, a leading "=" for exact matching
+# (e.g. "=rocep1s0f1,roceP2p1s0f1", the form NCCL_IB_MERGE_NICS needs) and a
+# leading "^" for exclusion. sysfs only knows bare device names, so reduce the
+# spec to the devices whose GIDs we should scan. An exclusion spec ("^…") names
+# what NOT to use and yields an empty list; the caller then scans every local
+# HCA, which is what NCCL itself would fall back to.
+# $1=NCCL_IB_HCA value -> space-separated device names on stdout
+nccl_ib_hca_devices() {
+  local spec="${1:-}" tok out=""
+  case "$spec" in
+    =^*|^*) return 0 ;;
+    =*) spec="${spec#=}" ;;
+  esac
+  local IFS=,
+  for tok in $spec; do
+    tok="${tok%%:*}"
+    [ -n "$tok" ] || continue
+    out="$out${out:+ }$tok"
+  done
+  printf '%s' "$out"
+}
+
+# Resolve RoCEv2 GID index for the HCA(s) in an NCCL_IB_HCA spec whose GID
+# embeds match_ip.
+# $1=ssh target (empty=local)  $2=NCCL_IB_HCA spec  $3=IPv4 to match
 resolve_rocev2_gid_index() {
-  local ssh_target="$1" hca="$2" match_ip="$3"
-  local hex remote
+  local ssh_target="$1" hca_spec="$2" match_ip="$3"
+  local hex devs remote
   hex="$(ipv4_to_gid_suffix "$match_ip")" || return 1
+  devs="$(nccl_ib_hca_devices "$hca_spec")"
   remote=$(
     cat <<EOF
-hca=$(printf '%q' "$hca")
+devs=$(printf '%q' "$devs")
 hex=$(printf '%q' "$hex")
-for g in /sys/class/infiniband/\$hca/ports/1/gids/*; do
-  [ -e "\$g" ] || continue
-  i=\${g##*/}
-  t=\$(cat /sys/class/infiniband/\$hca/ports/1/gid_attrs/types/\$i 2>/dev/null || true)
-  [ "\$t" = "RoCE v2" ] || continue
-  case \$(cat "\$g" 2>/dev/null) in
-    *ffff:\${hex}) echo "\$i"; exit 0 ;;
-  esac
+[ -n "\$devs" ] || devs=\$(ls /sys/class/infiniband 2>/dev/null || true)
+found=""
+for hca in \$devs; do
+  for g in /sys/class/infiniband/\$hca/ports/1/gids/*; do
+    [ -e "\$g" ] || continue
+    i=\${g##*/}
+    t=\$(cat /sys/class/infiniband/\$hca/ports/1/gid_attrs/types/\$i 2>/dev/null || true)
+    [ "\$t" = "RoCE v2" ] || continue
+    case \$(cat "\$g" 2>/dev/null) in
+      *ffff:\${hex}) found="\$found \$i"; break ;;
+    esac
+  done
 done
-exit 1
+set -- \$found
+[ \$# -gt 0 ] || exit 1
+if [ "\$(printf '%s\n' "\$@" | sort -u | wc -l)" -gt 1 ]; then
+  echo "WARN: devices in NCCL_IB_HCA resolve to different RoCEv2 GID indexes (\$found)." >&2
+  echo "WARN: NCCL_IB_GID_INDEX is a single global value - using \$1. Pin NCCL_IB_GID_AUTO=0 if that is wrong." >&2
+fi
+echo "\$1"
+exit 0
 EOF
   )
   if [ -z "$ssh_target" ]; then
@@ -301,7 +337,7 @@ pick_gid_match_ip() {
 }
 
 resolve_nccl_gid_indexes() {
-  local head_match worker_match resolved_head resolved_worker
+  local head_match worker_match resolved_head resolved_worker head_devs worker_devs
 
   if [ "$NCCL_IB_GID_AUTO" = "0" ]; then
     NCCL_IB_GID_INDEX="${ENV_NCCL_IB_GID_INDEX:-}"
@@ -323,15 +359,17 @@ resolve_nccl_gid_indexes() {
     exit 1
   }
 
-  echo "Resolving RoCEv2 GID indexes from sysfs (head if=$NCCL_SOCKET_IFNAME ip=$head_match hca=$NCCL_IB_HCA; worker if=$WORKER_NCCL_SOCKET_IFNAME ip=$worker_match hca=$WORKER_NCCL_IB_HCA)..."
+  head_devs="$(nccl_ib_hca_devices "$NCCL_IB_HCA")"
+  worker_devs="$(nccl_ib_hca_devices "$WORKER_NCCL_IB_HCA")"
+  echo "Resolving RoCEv2 GID indexes from sysfs (head if=$NCCL_SOCKET_IFNAME ip=$head_match hca=${head_devs:-<all local HCAs>}; worker if=$WORKER_NCCL_SOCKET_IFNAME ip=$worker_match hca=${worker_devs:-<all local HCAs>})..."
   resolved_head="$(resolve_rocev2_gid_index "" "$NCCL_IB_HCA" "$head_match")" || {
-    echo "FATAL: could not resolve head RoCEv2 GID index for $NCCL_IB_HCA / $head_match." >&2
-    echo "Check: ibstat | grep -A3 $NCCL_IB_HCA ; show_gids | grep $NCCL_IB_HCA" >&2
+    echo "FATAL: could not resolve head RoCEv2 GID index for ${head_devs:-<all local HCAs>} / $head_match (NCCL_IB_HCA=$NCCL_IB_HCA)." >&2
+    echo "Check: ibstat ; show_gids   # devices above must exist under /sys/class/infiniband" >&2
     exit 1
   }
   resolved_worker="$(resolve_rocev2_gid_index "$WORKER_HOST" "$WORKER_NCCL_IB_HCA" "$worker_match")" || {
-    echo "FATAL: could not resolve worker RoCEv2 GID index for $WORKER_NCCL_IB_HCA / $worker_match." >&2
-    echo "Check on worker: show_gids | grep $WORKER_NCCL_IB_HCA" >&2
+    echo "FATAL: could not resolve worker RoCEv2 GID index for ${worker_devs:-<all local HCAs>} / $worker_match (WORKER_NCCL_IB_HCA=$WORKER_NCCL_IB_HCA)." >&2
+    echo "Check on worker: ibstat ; show_gids" >&2
     exit 1
   }
 
