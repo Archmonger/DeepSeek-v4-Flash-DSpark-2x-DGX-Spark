@@ -164,10 +164,34 @@ if [[ "$URL_HOST" == *:* && "$URL_HOST" != \[*\] ]]; then
 fi
 API_URL="${API_URL:-http://$URL_HOST:$VLLM_PORT/v1/models}"
 CHAT_URL="${CHAT_URL:-http://$URL_HOST:$VLLM_PORT/v1/chat/completions}"
+# DSPARK_API_KEYS auth (begin)
 AUTH_HEADER_ARGS=()
+_dspark_keys_set=0
+case "${DSPARK_API_KEYS:-}" in
+  *[![:space:]]*) _dspark_keys_set=1 ;;
+esac
+if [ -n "${VLLM_API_KEY:-}" ] && [ "$_dspark_keys_set" = "1" ]; then
+  # The server entrypoint refuses this combination too (exit 2); fail the same
+  # way here so a probe never guesses which variable the server honoured.
+  echo "error: VLLM_API_KEY and DSPARK_API_KEYS are both set; set exactly one of them" >&2
+  exit 2
+fi
 if [ -n "${VLLM_API_KEY:-}" ]; then
   AUTH_HEADER_ARGS=(-H "Authorization: Bearer $VLLM_API_KEY")
+elif [ "$_dspark_keys_set" = "1" ]; then
+  _dspark_keys=()
+  read -r -a _dspark_keys <<< "${DSPARK_API_KEYS}"
+  for _dspark_key in "${_dspark_keys[@]}"; do
+    case "$_dspark_key" in
+      -*) echo "error: DSPARK_API_KEYS token starts with '-': $_dspark_key" >&2; exit 2 ;;
+    esac
+  done
+  # Multi-key auth via --api-key: probe with the first parsed key. Without this
+  # the health poll never sees a 200 against a keyed server and waits out its
+  # full timeout on a cluster that is actually serving.
+  AUTH_HEADER_ARGS=(-H "Authorization: Bearer ${_dspark_keys[0]}")
 fi
+# DSPARK_API_KEYS auth (end)
 
 : "${WORKER_HOST:?WORKER_HOST must be set in $ENV_FILE}"
 : "${MASTER_ADDR:?MASTER_ADDR must be set in $ENV_FILE}"
