@@ -19,6 +19,7 @@ for f in \
   smoke-deepseek-v4-flash-dspark.sh \
   scripts/ci-validate.sh \
   scripts/verify-overlay-sources.sh \
+  scripts/test-nccl-fabric-passthrough.sh \
   patches/*.sh
 do
   [ -e "$f" ] || continue
@@ -70,6 +71,8 @@ python3 scripts/verify-dsv4-027-equality-gate.py
 ok "verify-dsv4-027-equality-gate"
 bash scripts/verify-overlay-sources.sh
 ok "verify-overlay-sources"
+bash scripts/test-nccl-fabric-passthrough.sh -q
+ok "test-nccl-fabric-passthrough"
 
 echo "== recipe guards (do not re-ship known regressions) =="
 
@@ -169,17 +172,6 @@ if grep -q 'VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "${VLLM_EXECUTE_MODEL_TIMEOUT_SE
   ok "compose JIT timeout 1800s + persistent TileLang cache (#65/#87)"
 else
   bad "compose missing VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800 or TILELANG_CACHE_DIR"
-fi
-# Fabric-tuning passthrough must stay "unset by default" (empty fallback), so a
-# stock deployment keeps NCCL's own defaults.
-nccl_passthrough_missing=""
-for k in NCCL_IB_MERGE_NICS NCCL_NET_GDR_LEVEL NCCL_NET_GDR_READ NCCL_DMABUF_ENABLE; do
-  grep -Fq "$k: \"\${$k:-}\"" docker-compose.dspark.yml || nccl_passthrough_missing="$nccl_passthrough_missing $k"
-done
-if [ -z "$nccl_passthrough_missing" ]; then
-  ok "compose passes NCCL fabric-tuning knobs through, unset by default"
-else
-  bad "compose must declare these NCCL knobs with an empty (unset) fallback:$nccl_passthrough_missing"
 fi
 if grep -q 'restart: ${DSPARK_RESTART_POLICY:-unless-stopped}' docker-compose.dspark.yml; then
   ok "compose restart unless-stopped"

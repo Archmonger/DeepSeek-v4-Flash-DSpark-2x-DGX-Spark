@@ -129,16 +129,13 @@ services:
       NCCL_IGNORE_CPU_AFFINITY: "${NCCL_IGNORE_CPU_AFFINITY:-1}"
       NCCL_DEBUG: "${NCCL_DEBUG:-WARN}"
       NCCL_NVLS_ENABLE: "${NCCL_NVLS_ENABLE:-0}"
-      # Fabric-tuning passthrough. The empty fallback means "unset" — compose
-      # injects an empty string and NCCL falls back to its own built-in default,
-      # so a stock deployment behaves exactly as before. Set them in
-      # .env.dspark to experiment without editing this file.
-      # NCCL_IB_MERGE_NICS=1 is what makes the dual direct RoCE links between
-      # the two Sparks act as one logical device (needs the multi-HCA exact
-      # form: NCCL_IB_HCA==devA,devB).
-      # Rollback note: compose and .env must be reverted together — restoring
-      # only .env leaves these keys declared but empty (still "unset"), while
-      # restoring only compose drops a value that is still set in .env.
+      # NCCL fabric passthrough. A compose map cannot conditionally omit a
+      # key, so an unconfigured knob arrives as a defined-but-empty variable;
+      # the entrypoint unsets empty ones again before exec. That matters
+      # because NCCL loads config-file values (/etc/nccl.conf, NCCL_CONF_FILE)
+      # with overwrite=0 — a defined-empty variable would silently mask them.
+      # Configured values pass through unchanged. See docs/ENVS.md for what
+      # each knob actually controls.
       NCCL_IB_MERGE_NICS: "${NCCL_IB_MERGE_NICS:-}"
       NCCL_NET_GDR_LEVEL: "${NCCL_NET_GDR_LEVEL:-}"
       NCCL_NET_GDR_READ: "${NCCL_NET_GDR_READ:-}"
@@ -179,6 +176,10 @@ services:
         export CUDA_PATH="$${CUDA_PATH:-$${CUDA_HOME}}";
         export CUDAToolkit_ROOT="$${CUDAToolkit_ROOT:-$${CUDA_HOME}}";
         export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$${LD_LIBRARY_PATH:-}";
+        if [ -z "$${NCCL_IB_MERGE_NICS:-}" ]; then unset NCCL_IB_MERGE_NICS; fi;
+        if [ -z "$${NCCL_NET_GDR_LEVEL:-}" ]; then unset NCCL_NET_GDR_LEVEL; fi;
+        if [ -z "$${NCCL_NET_GDR_READ:-}" ]; then unset NCCL_NET_GDR_READ; fi;
+        if [ -z "$${NCCL_DMABUF_ENABLE:-}" ]; then unset NCCL_DMABUF_ENABLE; fi;
         ENCODING_SOURCE="$${DSPARK_ENCODING_FILE:-}";
         if [ -z "$${ENCODING_SOURCE}" ]; then
           MODEL_HUB_DIR=$$(printf '%s' "$${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}" | sed 's|/|--|g');
