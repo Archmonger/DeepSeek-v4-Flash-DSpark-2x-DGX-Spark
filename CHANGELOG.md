@@ -1,5 +1,9 @@
 ## 2026-08-20
 
+### Added
+
+- **NCCL fabric-tuning passthrough: `NCCL_IB_MERGE_NICS`, `NCCL_NET_GDR_LEVEL`, `NCCL_NET_GDR_READ`, `NCCL_DMABUF_ENABLE`**: compose now forwards these four from `.env.dspark`, all defaulting to *unset* (`${VAR:-}`), so NCCL's built-in defaults still apply and a stock deployment is byte-for-byte unchanged. Rollback must revert `docker-compose.dspark.yml` and `.env.dspark` together — the compose fallback is "unset", not a literal. Measured on a 2× DGX Spark GB10 pair with two direct RoCE links (TP=2, driver `580.173.02`, Anemll `0.1.1`, official `DeepSeek-V4-Flash-0731`): `NCCL_IB_HCA==<dev0>,<dev1>` + `NCCL_IB_MERGE_NICS=1` (with `NCCL_IB_GID_AUTO=0` and a manually pinned `NCCL_IB_GID_INDEX` on both ranks) puts 64 channels across both ports with symmetric per-port RDMA traffic; 32K-token TTFT 13.85 s → 13.16 s (−5%), 8K TTFT −3–4%, decode throughput flat, KV pool −1.5% from the extra NCCL buffers. The GDR trio was inert on that driver (`CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED=0` in-container), but the passthrough lets others test it without editing compose.
+
 ### Changed
 
 - **Issue #66: GPU `thinking_token_budget` hotfix is now opt-in (`DSPARK_ENABLE_ISSUE31_GPU_HOTFIX`, default `0` = stock V2)**. Compose still mounts `patches/hotfix-dsv4-issue31-v2-thinking-budget-gpu.py` and start still syncs it to the worker, but the entrypoint only runs it when the flag is exactly `1` (fail-closed). Fresh clones omit `thinking_token_budget`; leaving the patch on by default reproduced the omit-field decode cliff. Start smoke omits the field unless the flag is on. Set `1` and recreate containers if a client needs the budget field.

@@ -68,6 +68,10 @@ PY
 | `TILELANG_CACHE_DIR` | **Not** `VLLM_*`. Compose default `/cache/huggingface/tilelang-cache` (HF volume). Issue #65: in-image `~/.tilelang/cache` dies on container recreate. |
 | `TORCH_CUDA_ARCH_LIST` / `FLASHINFER_CUDA_ARCH_LIST` | Build/JIT arch lists |
 | `NCCL_*` / `TP_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` | Fabric |
+| `NCCL_IB_MERGE_NICS` | Fabric-tuning passthrough, compose default **unset** (empty ⇒ NCCL built-in default). `1` presents several RoCE ports as one logical NIC; requires the multi-HCA exact form `NCCL_IB_HCA==devA,devB`, which currently needs `NCCL_IB_GID_AUTO=0` + a pinned `NCCL_IB_GID_INDEX`. |
+| `NCCL_NET_GDR_LEVEL` | Fabric-tuning passthrough, compose default **unset**. GPUDirect RDMA topology threshold (e.g. `SYS`). |
+| `NCCL_NET_GDR_READ` | Fabric-tuning passthrough, compose default **unset**. GPUDirect RDMA reads. |
+| `NCCL_DMABUF_ENABLE` | Fabric-tuning passthrough, compose default **unset**. Inert on GB10 driver `580.173.02`, which reports `CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED=0` in-container (NCCL stays host-staged: `via NET/IB/x`, no `/GDRDMA`). |
 | `HF_*` / `TRANSFORMERS_OFFLINE` | Hub cache behavior |
 | `MTP_NUM_TOKENS` | Consumed by compose command line (not a vLLM env registry key) |
 | `DSPARK_SUPPRESS_STOPS_IN_REASONING` | `1` (default): after the detokenizer hotfix, client `stop` stays dormant until `</think>`. `0` restores stock matching. Also accepts Tony's `VLLM_SUPPRESS_STOPS_IN_REASONING` via compose interpolation (not added as a compose `VLLM_*` key, so Anemll does not warn). |
