@@ -63,6 +63,9 @@ def main() -> int:
     args = ap.parse_args()
 
     m1 = get_metrics(args.base_url)
+    if m1["drafted"] is None or m1["accepted"] is None:
+        print("NO draft counters in /metrics — is spec-decode on? (check MTP_NUM_TOKENS)")
+        return 0
     print(f"before: drafted={m1['drafted']:.0f} accepted={m1['accepted']:.0f}", file=sys.stderr)
 
     cmd = [sys.executable, args.bench_script, "--base-url", args.base_url,
@@ -71,7 +74,7 @@ def main() -> int:
     subprocess.run(cmd, capture_output=True)
 
     m2 = get_metrics(args.base_url)
-    if m1["drafted"] is None or m2["drafted"] is None:
+    if m2["drafted"] is None or m2["accepted"] is None:
         print("NO draft counters in /metrics — is spec-decode on? (check MTP_NUM_TOKENS)")
         return 0
     d = m2["drafted"] - (m1["drafted"] or 0)

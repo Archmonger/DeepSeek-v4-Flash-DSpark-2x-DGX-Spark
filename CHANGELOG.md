@@ -4,6 +4,8 @@
 
 - **Hub timeouts abort large-shard downloads in `prepare-dspark-model-cache.sh`**: both `docker run` blocks (`run_download` and `verify_cache`) now pass `HF_HUB_DOWNLOAD_TIMEOUT` (default `120`) and `HF_HUB_ETAG_TIMEOUT` (default `30`). `huggingface_hub` defaults both to 10s, which is short enough that a slow or proxied link kills a multi-GB shard mid-transfer rather than riding it out. Override in `.env.dspark`.
 
+- **`spec-acceptance.py` no longer crashes on serves without spec-decode ([Issue #92](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/92), reported by [@wbaguley](https://github.com/wbaguley))**: it formatted missing `drafted`/`accepted` counters before its no-spec guard, so `run-audit.sh` reported FAIL on a valid non-speculative serve. The guard now exits 0 before formatting either counter or starting the benchmark burst. The same report's parser/window items were already handled by [PR #91](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/pull/91) and are not re-claimed here.
+
 ## 2026-08-19
 
 ### Changed
