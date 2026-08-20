@@ -32,6 +32,12 @@ stop_warn() {
   echo "WARN: $*" >&2
   STOP_FAILURES=$((STOP_FAILURES + 1))
 }
+
+# After docker rm -f, compose down often has nothing left and prints
+# "No resource found to remove for project …" — noise, not a failure.
+filter_compose_empty_project() {
+  grep -v 'No resource found to remove for project' || true
+}
 if ssh -o BatchMode=yes -o ConnectTimeout=10 "$WORKER_HOST" "true" >/dev/null 2>&1; then
   WORKER_REACHABLE=1
 else
@@ -87,7 +93,8 @@ stop_vl_sidecar_head() {
   echo "Stopping VL vision sidecar on head (project ${project})..."
   # NODE_RANK required for compose file interpolation; value unused for down.
   COMPOSE_DISABLE_ENV_FILE=1 NODE_RANK=0 \
-    docker compose -p "$project" --env-file "$ENV_FILE" -f "$SIDECAR_COMPOSE_FILE" down || true
+    docker compose -p "$project" --env-file "$ENV_FILE" -f "$SIDECAR_COMPOSE_FILE" down 2>&1 \
+    | filter_compose_empty_project || true
   # Belt-and-suspenders: name filter in case compose project label drifted.
   docker ps -aq --filter "name=${project}-vl-sidecar" | xargs -r docker rm -f >/dev/null 2>&1 || true
 }
@@ -120,7 +127,8 @@ stop_vl_sidecar_worker() {
         COMPOSE_DISABLE_ENV_FILE=1 NODE_RANK=1 HEADLESS=1 \
         HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' \
         docker compose -p '$project' --env-file .env.dspark \
-          -f docker-compose.vl-sidecar.yml down || true
+          -f docker-compose.vl-sidecar.yml down 2>&1 \
+          | grep -v 'No resource found to remove for project' || true
     fi
     ids=\$(docker ps -aq --filter 'name=${project}-vl-sidecar' 2>/dev/null || true)
     if [ -n \"\$ids\" ]; then docker rm -f \$ids >/dev/null 2>&1 || true; fi
@@ -134,7 +142,8 @@ stop_main_head() {
     # rm -f first: compose down can still wait on stop_grace_period.
     docker ps -aq --filter "name=${project}-vllm-dspark" | xargs -r docker rm -f >/dev/null 2>&1 || true
     COMPOSE_DISABLE_ENV_FILE=1 NODE_RANK=0 \
-      docker compose -p "$project" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" down --remove-orphans -t 1 || true
+      docker compose -p "$project" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" down --remove-orphans -t 1 2>&1 \
+      | filter_compose_empty_project || true
   else
     echo "No DSpark 0731 head resources for project ${project}; skipping."
   fi
@@ -160,7 +169,8 @@ stop_main_worker() {
         COMPOSE_DISABLE_ENV_FILE=1 HF_CACHE='$WORKER_HF_CACHE' \
         VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' NODE_RANK=1 HEADLESS=1 \
         docker compose -p '$project' --env-file .env.dspark \
-          -f docker-compose.dspark.yml down --remove-orphans -t 1 || true
+          -f docker-compose.dspark.yml down --remove-orphans -t 1 2>&1 \
+          | grep -v 'No resource found to remove for project' || true
     else
       echo 'No DSpark 0731 worker resources for project $project on $WORKER_HOST; skipping.'
     fi
