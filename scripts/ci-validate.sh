@@ -142,11 +142,13 @@ if grep -q 'hotfix-dsv4-suppress-stops-in-reasoning.py' docker-compose.dspark.ym
 else
   bad "compose missing suppress-stops-in-reasoning"
 fi
-if grep -q 'hotfix-dsv4-issue31-v2-thinking-budget-gpu.py' docker-compose.dspark.yml \
-  && grep -q 'python3 /opt/hotfix-dsv4-issue31-v2-thinking-budget-gpu.py' docker-compose.dspark.yml; then
-  ok "compose applies GPU-resident V2 thinking budget"
+# Issue #66: GPU V2 thinking budget default OFF (stock sampler);
+# ON must be an exactly-1 gate with a fail-closed invocation.
+if grep -Fq 'DSPARK_ENABLE_ISSUE31_GPU_HOTFIX: "${DSPARK_ENABLE_ISSUE31_GPU_HOTFIX:-0}"' docker-compose.dspark.yml \
+  && grep -Fq 'if [ "$${DSPARK_ENABLE_ISSUE31_GPU_HOTFIX:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-issue31-v2-thinking-budget-gpu.py || exit 1; fi;' docker-compose.dspark.yml; then
+  ok "compose gates issue31 GPU thinking-budget hotfix behind =1, fail-closed"
 else
-  bad "compose missing GPU-resident V2 thinking budget"
+  bad "compose must invoke issue31 GPU hotfix only when DSPARK_ENABLE_ISSUE31_GPU_HOTFIX=1, with || exit 1"
 fi
 if grep -q 'hotfix-dsv4-issue55-tool-truncation.py' docker-compose.dspark.yml \
   && grep -q 'python3 /opt/hotfix-dsv4-issue55-tool-truncation.py' docker-compose.dspark.yml; then

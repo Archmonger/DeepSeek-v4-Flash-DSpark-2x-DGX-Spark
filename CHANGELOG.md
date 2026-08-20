@@ -1,5 +1,9 @@
 ## 2026-08-20
 
+### Changed
+
+- **Issue #66: GPU `thinking_token_budget` hotfix is now opt-in (`DSPARK_ENABLE_ISSUE31_GPU_HOTFIX`, default `0` = stock V2)**. Compose still mounts `patches/hotfix-dsv4-issue31-v2-thinking-budget-gpu.py` and start still syncs it to the worker, but the entrypoint only runs it when the flag is exactly `1` (fail-closed). Fresh clones omit `thinking_token_budget`; leaving the patch on by default reproduced the omit-field decode cliff. Start smoke omits the field unless the flag is on. Set `1` and recreate containers if a client needs the budget field.
+
 ### Fixed
 
 - **Hub timeouts abort large-shard downloads in `prepare-dspark-model-cache.sh`**: both `docker run` blocks (`run_download` and `verify_cache`) now pass `HF_HUB_DOWNLOAD_TIMEOUT` (default `120`) and `HF_HUB_ETAG_TIMEOUT` (default `30`). `huggingface_hub` defaults both to 10s, which is short enough that a slow or proxied link kills a multi-GB shard mid-transfer rather than riding it out. Override in `.env.dspark`.

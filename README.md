@@ -184,9 +184,10 @@ DSPARK_REVISION=<commit>
 | `PREPARE_VL_SIDECAR_MODEL` | `0` | `1` = prepare also downloads VL weights. |
 | `INSTALL_VISION_MCP` | on when VL is on | `0` = sidecar only, skip harness MCP install. |
 
-An explicit `thinking_token_budget` is supported (opt-in per request). Omit
-the field to keep the stock V2 sampler fast path; `DEFAULT_THINKING=max` still
-needs a generous `max_tokens` or a budget or thinking won't end. See
+An explicit `thinking_token_budget` is **off unless you set
+`DSPARK_ENABLE_ISSUE31_GPU_HOTFIX=1`** (then opt-in per request). Default
+stock V2 rejects the field (HTTP 400). `DEFAULT_THINKING=max` still needs a
+generous `max_tokens` or that budget hotfix, or thinking won't end. See
 [Thinking-token budgets](#thinking-token-budgets).
 
 ### Serve shape (not on/off, but the knobs that change the lane)
@@ -213,6 +214,7 @@ needs a generous `max_tokens` or a budget or thinking won't end. See
 | `DSPARK_SKIP_HOTFIX` | `0` | `1` = skip the six v0.27 perf backports only (#22 still applies). |
 | `DSPARK_SKIP_SPIN_WAIT_HOTFIX` | `0` | `1` = leave vLLM shm `busy_loop_s=1s` (issue **#79** P-core spin on TP=2). |
 | `DSPARK_ISSUE43_SCHED_DIAG` | `0` | `1` = one scheduler line per step in the vLLM log (mixed prefill/decode). |
+| `DSPARK_ENABLE_ISSUE31_GPU_HOTFIX` | `0` | `1` = apply GPU `thinking_token_budget` at boot (fail-closed). Default stock V2; omit-field clients do not need this ([Issue #66](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/66)). |
 | `ENABLE_VLLM_GB10_PATCH` | `0` | `1` = experimental hybrid NVFP4 plugin (`--quantization modelopt_gb10_hybrid`). |
 
 Issue **#21 / #26 / #27 / #43** Python hotfixes always run at container start
@@ -264,10 +266,11 @@ Capture: [docs/benchmarks.png](docs/benchmarks.png).
 ## Thinking and `max_tokens`
 
 > [!IMPORTANT]
-> The replacement #31 implementation is opt-in per request and keeps its
-> counters, request mapping, boundary enforcement, and accepted-token
-> observation on the GPU. It does not scan or copy the prefix to Python on
-> decode steps, and it does not add a budget when the field is omitted.
+> The #31 GPU budget patch is **opt-in at boot** (`DSPARK_ENABLE_ISSUE31_GPU_HOTFIX=1`)
+> and then opt-in per request. Default is stock V2: do not send
+> `thinking_token_budget`. When enabled, counters stay on the GPU; omitting the
+> field does not inject a server-side default. Leave the flag at `0` unless a
+> client actually sends the field ([Issue #66](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/66)).
 
 `max_tokens` counts **think + answer** (reasoning + visible response + tool
 markup). With `DEFAULT_THINKING=max`, a harness cap of 256/512/800 often
@@ -276,10 +279,10 @@ whole budget — `max` ships a checkpoint-level directive ("do not stop reasonin
 until … no error remains undiscovered") and produced **~50,000 reasoning chars
 (~12.5k tokens) on a moderate prompt** in live measurement. So "size `max_tokens`
 accordingly" means **tens of thousands of tokens**, not a small bump. Raise
-`max_tokens`, set thinking `low` / `off`, or — the supported path — send an
-explicit `thinking_token_budget` (see
-[Thinking-token budgets](#thinking-token-budgets)) so reasoning is hard-capped
-and the rest of `max_tokens` is left for the visible answer.
+`max_tokens`, set thinking `low` / `off`, or — with
+`DSPARK_ENABLE_ISSUE31_GPU_HOTFIX=1` — send an explicit `thinking_token_budget`
+(see [Thinking-token budgets](#thinking-token-budgets)) so reasoning is
+hard-capped and the rest of `max_tokens` is left for the visible answer.
 
 Client `stop` strings used to fire inside `<think>`. The recipe applies
 `patches/hotfix-dsv4-suppress-stops-in-reasoning.py` so they wait for
@@ -304,9 +307,10 @@ single `</think>` at the boundary, leaving the rest of `max_tokens` available
 for the visible answer or tool call. A budget of `0` disables reasoning for
 that request. Natural `</think>` remains untouched.
 
-Send the field explicitly when a hard cap is required. Omitting it retains the
-unmodified V2 sampler fast path and `DEFAULT_THINKING` behavior. Keep
-`max_tokens` comfortably above the thinking budget so the answer has room.
+The field is HTTP 400 on stock V2. Set `DSPARK_ENABLE_ISSUE31_GPU_HOTFIX=1` and
+recreate the containers, then send it when a hard cap is required. Omitting it
+keeps `DEFAULT_THINKING` behavior. Keep `max_tokens` comfortably above the
+thinking budget so the answer has room.
 
 ```json
 {
@@ -323,9 +327,9 @@ means think ate the cap.
 
 ### Enabling the budget from a client
 
-`thinking_token_budget` is **opt-in per request** — the server injects no
-default when the field is omitted. To turn it on, send it from whatever client
-you use:
+`thinking_token_budget` needs the boot flag **and** the request field — the
+server injects no default when the field is omitted. To turn it on, set
+`DSPARK_ENABLE_ISSUE31_GPU_HOTFIX=1`, recreate, then send it from the client:
 
 **curl / any OpenAI-compatible client** — add `thinking_token_budget` to the
 request body. `0` disables reasoning for that one call; `N>0` caps reasoning at
