@@ -59,8 +59,9 @@ class WindowReportingTest(unittest.TestCase):
         original_metrics = sa.get_metrics
         original_run = sa.subprocess.run
         original_argv = sys.argv
+        self.bench_calls = []
         sa.get_metrics = lambda _url: next(snapshots)
-        sa.subprocess.run = lambda *_a, **_k: None
+        sa.subprocess.run = lambda *_a, **_k: self.bench_calls.append(_a)
         sys.argv = ["spec-acceptance.py", "--trials", "2"]
         try:
             output = io.StringIO()
@@ -92,6 +93,21 @@ class WindowReportingTest(unittest.TestCase):
         )
         self.assertIn("pos0: 3 accepted", output)
         self.assertNotIn("pos0: 0.", output)
+
+    def test_spec_decode_off_reports_without_running_benchmark(self):
+        absent = {"drafted": None, "accepted": None, "drafts": None, "per_pos": {}}
+        output = self.run_main(absent, absent)
+        self.assertIn("NO draft counters", output)
+        self.assertEqual(self.bench_calls, [])
+
+    def test_counters_vanishing_after_burst_reports_instead_of_crashing(self):
+        output = self.run_main(
+            {"drafted": 500.0, "accepted": 300.0, "drafts": 100.0,
+             "per_pos": {0: 90.0}},
+            {"drafted": None, "accepted": None, "drafts": None, "per_pos": {}},
+        )
+        self.assertIn("NO draft counters", output)
+        self.assertEqual(len(self.bench_calls), 1)
 
 
 if __name__ == "__main__":
