@@ -1,5 +1,9 @@
 ## 2026-08-20
 
+### Added
+
+- **`DRAFT_SAMPLE_METHOD` (default `probabilistic`, no behavior change)**: the compose entrypoint hardcoded `"draft_sample_method":"probabilistic"` inside `--speculative-config`, so A/B-ing the official model-card pairing (`num_speculative_tokens=7` + `greedy`, [issue #84](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/84)) meant editing `docker-compose.dspark.yml` and keeping that edit alive across pulls — `MTP_NUM_TOKENS` was already an env, its partner was not. The value now comes from `.env.dspark` with the old literal as the default; vLLM still rejects an invalid value at engine init.
+
 ### Changed
 
 - **Issue #66: GPU `thinking_token_budget` hotfix is now opt-in (`DSPARK_ENABLE_ISSUE31_GPU_HOTFIX`, default `0` = stock V2)**. Compose still mounts `patches/hotfix-dsv4-issue31-v2-thinking-budget-gpu.py` and start still syncs it to the worker, but the entrypoint only runs it when the flag is exactly `1` (fail-closed). Fresh clones omit `thinking_token_budget`; leaving the patch on by default reproduced the omit-field decode cliff. Start smoke omits the field unless the flag is on. Set `1` and recreate containers if a client needs the budget field.
