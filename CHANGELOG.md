@@ -1,3 +1,9 @@
+## 2026-08-20
+
+### Fixed
+
+- **Hub timeouts abort large-shard downloads in `prepare-dspark-model-cache.sh`**: both `docker run` blocks (`run_download` and `verify_cache`) now pass `HF_HUB_DOWNLOAD_TIMEOUT` (default `120`) and `HF_HUB_ETAG_TIMEOUT` (default `30`). `huggingface_hub` defaults both to 10s, which is short enough that a slow or proxied link kills a multi-GB shard mid-transfer rather than riding it out. Override in `.env.dspark`.
+
 ## 2026-08-19
 
 ### Changed
