@@ -129,6 +129,18 @@ services:
       NCCL_IGNORE_CPU_AFFINITY: "${NCCL_IGNORE_CPU_AFFINITY:-1}"
       NCCL_DEBUG: "${NCCL_DEBUG:-WARN}"
       NCCL_NVLS_ENABLE: "${NCCL_NVLS_ENABLE:-0}"
+      # NCCL fabric passthrough. A compose map cannot conditionally omit a
+      # key, so an unconfigured knob arrives as a defined-but-empty variable;
+      # the entrypoint unsets empty ones again before exec. That matters
+      # because NCCL loads config-file values (/etc/nccl.conf, NCCL_CONF_FILE)
+      # with overwrite=0 — a defined-empty variable would silently mask them.
+      # Configured non-empty values pass through unchanged; an empty value is
+      # normalized to absent, so it cannot be used to force an empty setting.
+      # See docs/ENVS.md for what each knob actually controls.
+      NCCL_IB_MERGE_NICS: "${NCCL_IB_MERGE_NICS:-}"
+      NCCL_NET_GDR_LEVEL: "${NCCL_NET_GDR_LEVEL:-}"
+      NCCL_NET_GDR_READ: "${NCCL_NET_GDR_READ:-}"
+      NCCL_DMABUF_ENABLE: "${NCCL_DMABUF_ENABLE:-}"
 
       NODE_RANK: "${NODE_RANK}"
       HEADLESS: "${HEADLESS:-}"
@@ -172,6 +184,10 @@ services:
         export CUDA_PATH="$${CUDA_PATH:-$${CUDA_HOME}}";
         export CUDAToolkit_ROOT="$${CUDAToolkit_ROOT:-$${CUDA_HOME}}";
         export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$${LD_LIBRARY_PATH:-}";
+        if [ -z "$${NCCL_IB_MERGE_NICS:-}" ]; then unset NCCL_IB_MERGE_NICS; fi;
+        if [ -z "$${NCCL_NET_GDR_LEVEL:-}" ]; then unset NCCL_NET_GDR_LEVEL; fi;
+        if [ -z "$${NCCL_NET_GDR_READ:-}" ]; then unset NCCL_NET_GDR_READ; fi;
+        if [ -z "$${NCCL_DMABUF_ENABLE:-}" ]; then unset NCCL_DMABUF_ENABLE; fi;
         ENCODING_SOURCE="$${DSPARK_ENCODING_FILE:-}";
         if [ -z "$${ENCODING_SOURCE}" ]; then
           MODEL_HUB_DIR=$$(printf '%s' "$${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}" | sed 's|/|--|g');

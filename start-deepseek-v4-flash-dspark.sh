@@ -74,10 +74,24 @@ if [ ! -f "$COMPOSE_FILE" ]; then
   exit 1
 fi
 
+# Source one private, normalized snapshot and reuse it for every Compose/worker
+# consumer. The operator's file remains byte-identical.
+_dspark_env_clean=
+_cleanup_dspark_env() {
+  [ -z "$_dspark_env_clean" ] || rm -f -- "$_dspark_env_clean"
+}
+trap _cleanup_dspark_env EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+_dspark_env_clean="$(mktemp)"
+chmod 600 "$_dspark_env_clean"
+sed $'1s/^\xEF\xBB\xBF//; s/\r$//' "$ENV_FILE" > "$_dspark_env_clean"
 set -a
 # shellcheck disable=SC1090
-source "$ENV_FILE"
+source "$_dspark_env_clean"
 set +a
+COMPOSE_ENV_FILE="$_dspark_env_clean"
 
 # Vision mode flag selects 0731 GPU util (and whether the VL sidecar starts).
 #   ENABLE_VL_SIDECAR=1 → vision coexist → GPU_MEMORY_UTILIZATION_VISION (default 0.80)
@@ -364,7 +378,7 @@ compose_base() {
     GB10_HYBRID_NVFP4_M_THRESHOLD="${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}" \
     NODE_RANK="$1" \
     HEADLESS="$2" \
-    docker compose -p "$PROJECT_NAME" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "${@:3}"
+    docker compose -p "$PROJECT_NAME" --env-file "$COMPOSE_ENV_FILE" -f "$COMPOSE_FILE" "${@:3}"
 }
 
 remote_compose() {
@@ -425,7 +439,7 @@ print_resolved_profile() {
   echo "  model: ${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-DSpark}"
   echo "  served model: ${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"
   echo "  max model len: ${MAX_MODEL_LEN:-1000000}"
-  echo "  max num seqs: ${MAX_NUM_SEQS:-12}"
+  echo "  max num seqs: ${MAX_NUM_SEQS:-6}"
   echo "  max batched tokens: ${MAX_NUM_BATCHED_TOKENS:-8192}"
   echo "  gpu memory utilization: ${GPU_MEMORY_UTILIZATION:-0.80} (text default ${GPU_MEMORY_UTILIZATION_TEXT:-0.835} / vision default ${GPU_MEMORY_UTILIZATION_VISION:-0.80})"
   echo "  mtp speculative tokens: ${MTP_NUM_TOKENS:-5} (dspark_block_size min is 5)"
@@ -559,7 +573,23 @@ print_resolved_profile
 echo "Syncing DSpark deployment files to ${WORKER_HOST}:${WORKER_DIR}"
 ssh "$WORKER_HOST" "mkdir -p $REMOTE_WORKER_DIR"
 scp "$COMPOSE_FILE" "${WORKER_HOST}:${REMOTE_COMPOSE_FILE}"
-scp "$ENV_FILE" "${WORKER_HOST}:${REMOTE_ENV_FILE}"
+# Stream into a private sibling, then atomically replace the worker env file.
+ssh "$WORKER_HOST" "
+  set -euo pipefail
+  _env_final=$REMOTE_ENV_FILE
+  _env_tmp=\"\${_env_final}.tmp.\$\$\"
+  _cleanup_remote_env() { [ -z \"\$_env_tmp\" ] || rm -f -- \"\$_env_tmp\"; }
+  trap _cleanup_remote_env EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  umask 077
+  cat > \"\$_env_tmp\"
+  chmod 600 \"\$_env_tmp\"
+  mv -f -- \"\$_env_tmp\" \"\$_env_final\"
+  _env_tmp=
+  trap - EXIT HUP INT TERM
+" < "$COMPOSE_ENV_FILE"
 SIDECAR_COMPOSE_FILE="${SIDECAR_COMPOSE_FILE:-$SCRIPT_DIR/docker-compose.vl-sidecar.yml}"
 if [ -f "$SIDECAR_COMPOSE_FILE" ]; then
   scp "$SIDECAR_COMPOSE_FILE" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/docker-compose.vl-sidecar.yml"
@@ -686,7 +716,7 @@ for _ in $(seq 1 "$WAIT_ATTEMPTS"); do
       echo "  VL head (API rank)..."
       env -u NODE_RANK -u HEADLESS COMPOSE_DISABLE_ENV_FILE=1 \
         NODE_RANK=0 \
-        docker compose -p "$PROJECT_NAME" --env-file "$ENV_FILE" -f "$SIDECAR_COMPOSE_FILE" up -d
+        docker compose -p "$PROJECT_NAME" --env-file "$COMPOSE_ENV_FILE" -f "$SIDECAR_COMPOSE_FILE" up -d
       SIDECAR_MODELS_URL="http://127.0.0.1:${VL_SIDECAR_PORT:-8889}/v1/models"
       SIDECAR_READY=0
       for _sidecar_i in $(seq 1 "${VL_SIDECAR_WAIT_ATTEMPTS:-90}"); do
@@ -711,7 +741,7 @@ for _ in $(seq 1 "$WAIT_ATTEMPTS"); do
       else
         echo "WARN: VL sidecar not ready at $SIDECAR_MODELS_URL — skipping vision MCP install." >&2
         echo "  Recent VL head logs:" >&2
-        COMPOSE_DISABLE_ENV_FILE=1 docker compose -p "$PROJECT_NAME" --env-file "$ENV_FILE" -f "$SIDECAR_COMPOSE_FILE" logs --tail=80 >&2 || true
+        COMPOSE_DISABLE_ENV_FILE=1 docker compose -p "$PROJECT_NAME" --env-file "$COMPOSE_ENV_FILE" -f "$SIDECAR_COMPOSE_FILE" logs --tail=80 >&2 || true
         echo "  Recent VL worker logs:" >&2
         remote_compose "docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.vl-sidecar.yml logs --tail=80" >&2 || true
       fi
