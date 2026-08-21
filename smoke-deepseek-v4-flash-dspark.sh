@@ -24,18 +24,24 @@ CHAT_URL="${CHAT_URL:-http://${_dspark_host}:${VLLM_PORT:-8888}/v1/chat/completi
 MODEL="${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"
 # DSPARK_API_KEYS auth (begin)
 AUTH_HEADER_ARGS=()
+case "${DSPARK_API_KEYS:-}" in
+  *[$'\r\n\v\f']*)
+    echo "error: DSPARK_API_KEYS must be a single-line space-separated list" >&2
+    exit 2
+    ;;
+  *\\*)
+    echo "error: DSPARK_API_KEYS must not contain backslashes" >&2
+    exit 2
+    ;;
+esac
 _dspark_keys_set=0
 case "${DSPARK_API_KEYS:-}" in
-  *[![:space:]]*) _dspark_keys_set=1 ;;
+  *[!$' \t']*) _dspark_keys_set=1 ;;
 esac
 if [ -n "${VLLM_API_KEY:-}" ] && [ "$_dspark_keys_set" = "1" ]; then
   # The server entrypoint refuses this combination too (exit 2); fail the same
   # way here so a probe never guesses which variable the server honoured.
   echo "error: VLLM_API_KEY and DSPARK_API_KEYS are both set; set exactly one of them" >&2
-  exit 2
-fi
-if [ "$_dspark_keys_set" = "1" ] && [ "${DSPARK_API_KEYS}" != "$(printf '%s' "${DSPARK_API_KEYS}" | tr -d '\n' | tr -d '\r')" ]; then
-  echo "error: DSPARK_API_KEYS must be a single-line space-separated list" >&2
   exit 2
 fi
 if [ -n "${VLLM_API_KEY:-}" ]; then
@@ -45,7 +51,7 @@ elif [ "$_dspark_keys_set" = "1" ]; then
   read -r -a _dspark_keys <<< "${DSPARK_API_KEYS}"
   for _dspark_key in "${_dspark_keys[@]}"; do
     case "$_dspark_key" in
-      -*) echo "error: DSPARK_API_KEYS token starts with '-': $_dspark_key" >&2; exit 2 ;;
+      -*) echo "error: DSPARK_API_KEYS contains a token beginning with '-'" >&2; exit 2 ;;
     esac
   done
   # Multi-key auth via --api-key: probe with the first parsed key. Without this

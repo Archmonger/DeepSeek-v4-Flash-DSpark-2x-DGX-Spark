@@ -13,11 +13,11 @@ observable behavior rather than source text:
   per-key loop would silently leave only the last key valid;
 - literal glob characters survive as literal argv/header tokens (no pathname
   expansion, no word-splitting inside an element);
-- a token starting with `-` is rejected with exit 2 in all four contexts;
-- a newline, carriage return, or dash placed after a newline in the value is
-  rejected with exit 2 and the single-line message, in all four contexts (the
-  single-line guard runs before tokenization, so a `\n-bad` value reports the
-  single-line failure, not the dash-token failure);
+- CR/LF/VT/FF and backslashes are rejected before empty/conflict
+  classification in all four contexts; a token starting with `-` is rejected
+  with exit 2 and a fixed diagnostic that never echoes the token bytes;
+- controls placed before a dash still report the single-line failure, proving
+  validation precedence is identical in the entrypoint and all three probes;
 - VLLM_API_KEY and DSPARK_API_KEYS both meaningful => exit 2 naming BOTH
   variables, in the compose entrypoint and in all three probe scripts. The
   server must never silently choose one (vLLM's CLI would win) and the probes
@@ -29,12 +29,13 @@ observable behavior rather than source text:
 
 A ComposedHandoff layer additionally drives the REAL `docker compose
 --env-file <stub> config --format json` render of docker-compose.dspark.yml
-when the docker CLI is available and can render on the host, extracts the auth
-block and exec tail from the rendered `command[2]`, runs them under the
+when Docker Compose is available, extracts the auth block, fail-closed
+redaction gate, and exec tail from rendered `command[2]`, runs them under the
 rendered `environment`, and requires exactly one `--api-key` flag. It includes
 two negative controls — the compose DSPARK_API_KEYS passthrough line removed,
 and `$$` regressed to `$` in the entrypoint block — that must FAIL the chain.
-Hosts without a working docker CLI skip the whole layer (never red).
+Hosts without Docker Compose skip the layer; once the CLI is available,
+render and JSON failures are loud test failures.
 
 run_bash is hermetic: the base env excludes VLLM_API_KEY and DSPARK_API_KEYS
 (and any variable whose name contains "API_KEY"), so a hostile parent carrying
@@ -42,8 +43,9 @@ either/both variables cannot change any outcome; a case opts a variable in
 first. The docker invocation is scrubbed the same way, and the handoff env is
 the rendered compose `environment` alone.
 
-The committed-key scan covers the compose file, .env.dspark.example, the three
-probes, docs/ENVS.md, CHANGELOG.md, and this test file itself.
+The committed-key scan covers every PR-changed text artifact: compose, env
+example, probes/launcher, docs, changelog, CI wiring, redaction patch, both
+auth test modules, and the env-normalization harness.
 
 No GPU, no serve, stdlib only.
 """
@@ -64,6 +66,11 @@ ENV_EXAMPLE = ROOT / ".env.dspark.example"
 ENVS_DOC = ROOT / "docs" / "ENVS.md"
 CHANGELOG = ROOT / "CHANGELOG.md"
 SELF = Path(__file__)
+REDACTION_PATCH = ROOT / "patches" / "hotfix-vllm-redact-api-key-log.sh"
+CI_VALIDATE = ROOT / "scripts" / "ci-validate.sh"
+REDACTION_TEST = ROOT / "scripts" / "test-redact-api-key-log.py"
+ENV_NORMALISATION_TEST = ROOT / "scripts" / "test-env-normalisation.py"
+SOURCE = START.read_text(encoding="utf-8")
 PROBES = (
     ROOT / "start-deepseek-v4-flash-dspark.sh",
     ROOT / "smoke-deepseek-v4-flash-dspark.sh",
@@ -79,12 +86,30 @@ BOTH_SET_MSG = (
     "set exactly one of them"
 )
 SINGLE_LINE_MSG = "error: DSPARK_API_KEYS must be a single-line space-separated list"
-DASH_REJECT_PREFIX = "error: DSPARK_API_KEYS token starts with '-'"
+BACKSLASH_MSG = "error: DSPARK_API_KEYS must not contain backslashes"
+DASH_REJECT_MSG = "error: DSPARK_API_KEYS contains a token beginning with '-'"
+AMBIENT_GUARD_MSG = (
+    "error: DSPARK_API_KEYS is set in the environment but does not match "
+    ".env.dspark; set it only in .env.dspark"
+)
+PREFLIGHT_MSG = (
+    "error: API keys are configured but "
+    "patches/hotfix-vllm-redact-api-key-log.sh is missing; keyed starts "
+    "require the startup-log redaction hotfix"
+)
 
 # Compose `$$` escapes stay `$$` in the rendered `command[2]` text; the regexes
 # below tolerate both `$` and `$$` so one extractor serves source and render.
-_AUTH_START = re.compile(r'_dspark_keys_set=0;[ \t]*case "\$+\{DSPARK_API_KEYS:-\}" in')
+_AUTH_START = re.compile(
+    r'API_KEY_ARGS=\(\);[ \t]*case "\$+\{DSPARK_API_KEYS:-\}" in'
+)
 _AUTH_END = re.compile(r'API_KEY_ARGS=\(--api-key "\$+\{_dspark_keys\[@\]\}"\); fi;')
+_REDACTION_GATE = re.compile(
+    r'if \[ "\$+\{_dspark_keys_set\}" = "1" \] \|\| '
+    r'\[ -n "\$+\{VLLM_API_KEY:-\}" \]; then '
+    r'bash /opt/dspark-patches/hotfix-vllm-redact-api-key-log\.sh \|\| exit 1; '
+    r'bash /opt/dspark-patches/hotfix-vllm-redact-api-key-log\.sh --status \|\| exit 1; fi;'
+)
 
 DOCKER = shutil.which("docker")
 
@@ -158,6 +183,37 @@ def probe_auth_block(path: Path) -> str:
     return text[begin:end]
 
 
+def launcher_slice(start: str, end: str) -> str:
+    """Return an exact launcher chunk bounded by stable marker text."""
+    begin = SOURCE.index(start)
+    return SOURCE[begin:SOURCE.index(end, begin)]
+
+
+LAUNCHER_ENV_BLOCK = launcher_slice("_dspark_env_clean=", "# Vision mode flag")
+PREFLIGHT_BLOCK = launcher_slice(
+    "# DSPARK redaction pre-flight (begin)",
+    "# DSPARK redaction pre-flight (end)",
+)
+
+
+def entrypoint_redaction_gate(text: str = None) -> str:
+    """Extract the exact fail-closed redaction gate from source or render."""
+    if text is None:
+        text = COMPOSE.read_text(encoding="utf-8")
+    match = _REDACTION_GATE.search(text)
+    if not match:
+        raise AssertionError("entrypoint redaction gate not found")
+    return match.group(0)
+
+
+def middle_segment(text: str) -> str:
+    """Entrypoint text skipped by the auth-block + exec-tail harness."""
+    block = find_auth_block(text)
+    start = text.index(block) + len(block)
+    end = text.index("exec /usr/local/bin/vllm serve", start)
+    return text[start:end]
+
+
 # --------------------------------------------------------------------------
 # Shell helpers.
 # --------------------------------------------------------------------------
@@ -179,6 +235,22 @@ def base_env(ambient=None):
     env.setdefault("PATH", "/usr/bin:/bin")
     env.setdefault("HOME", "/")
     return env
+
+
+def compose_cli_available(docker_path, ambient=None):
+    """True only when `docker compose version` succeeds under a scrubbed env."""
+    if not docker_path:
+        return False
+    proc = subprocess.run(
+        [docker_path, "compose", "version"],
+        capture_output=True,
+        text=True,
+        env=base_env(ambient),
+    )
+    return proc.returncode == 0
+
+
+COMPOSE_CLI_OK = compose_cli_available(DOCKER)
 
 
 def run_bash(body: str, env_kwargs, cwd=None, ambient=None):
@@ -231,6 +303,84 @@ def _decode_block_tail(block: str, tail: str):
     return block, tail
 
 
+def run_launcher_env(env_text: str, ambient_marker=None):
+    """Execute the launcher's real normalized-snapshot block."""
+    with tempfile.TemporaryDirectory() as td:
+        env_file = Path(td, ".env.dspark")
+        env_file.write_text(env_text, encoding="utf-8")
+        env = base_env()
+        env["ENV_FILE"] = str(env_file)
+        env["TMPDIR"] = td
+        if ambient_marker is not None:
+            env["DSPARK_API_KEYS"] = ambient_marker
+        body = (
+            "set -euo pipefail\n" + LAUNCHER_ENV_BLOCK
+            + "printf 'EFFECTIVE=<%s>\n' \"${DSPARK_API_KEYS:-}\"\n"
+        )
+        return subprocess.run(
+            ["bash", "-c", body], capture_output=True, text=True, env=env
+        )
+
+
+def run_preflight(keys_set: str, vllm_key=None, patch_present=False):
+    """Execute the launcher-only redaction preflight marker block."""
+    with tempfile.TemporaryDirectory() as td:
+        script_dir = Path(td)
+        patch_dir = script_dir / "patches"
+        patch_dir.mkdir()
+        if patch_present:
+            (patch_dir / "hotfix-vllm-redact-api-key-log.sh").write_text("")
+        env = {
+            "TEST_SCRIPT_DIR": str(script_dir),
+            "TEST_KEYS_SET": keys_set,
+            "VLLM_API_KEY": vllm_key,
+        }
+        body = (
+            "set -euo pipefail\n"
+            "SCRIPT_DIR=\"$TEST_SCRIPT_DIR\"\n"
+            "_dspark_keys_set=\"$TEST_KEYS_SET\"\n"
+            + PREFLIGHT_BLOCK
+            + "printf 'FELL-THROUGH\n'\n"
+        )
+        return run_bash(body, env)
+
+
+def run_redaction_gate(env_kwargs, *, patch_present=False,
+                       apply_rc=0, status_rc=0):
+    """Run the real auth block + redaction gate + vLLM argv dumper."""
+    with tempfile.TemporaryDirectory() as td:
+        patch_dir = Path(td, "patches")
+        patch_dir.mkdir()
+        log = Path(td, "calls.log")
+        if patch_present:
+            stub = patch_dir / "hotfix-vllm-redact-api-key-log.sh"
+            stub.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [ \"${1:-}\" = --status ]; then\n"
+                "  printf '%s\\n' --status >>\"$PATCH_LOG\"\n"
+                "  exit \"${STATUS_RC:-0}\"\n"
+                "fi\n"
+                "printf '%s\\n' apply >>\"$PATCH_LOG\"\n"
+                "exit \"${APPLY_RC:-0}\"\n",
+                encoding="utf-8",
+            )
+        block, tail = _decode_block_tail(
+            entrypoint_auth_block(), entrypoint_exec_tail()
+        )
+        gate = entrypoint_redaction_gate().replace(
+            "/opt/dspark-patches", str(patch_dir)
+        ).replace("$$", "$")
+        env = dict(env_kwargs)
+        env.update({
+            "PATCH_LOG": str(log),
+            "APPLY_RC": str(apply_rc),
+            "STATUS_RC": str(status_rc),
+        })
+        result = run_bash(block + "\n" + gate + "\n" + tail, env)
+        calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+        return result, calls
+
+
 def argv_of(env_kwargs, cwd=None, ambient=None, block=None, tail=None):
     """Run the real block + exec tail and return the argv handed to vllm serve."""
     if block is None:
@@ -247,7 +397,7 @@ def argv_of(env_kwargs, cwd=None, ambient=None, block=None, tail=None):
 
 _SINGLE_DOLLAR = re.compile(
     r'(?<!\$)\$\{(DSPARK_API_KEYS|VLLM_API_KEY|_dspark_keys_set'
-    r'|_dspark_keys\[@\]|_dspark_keys|_dspark_key)\}'
+    r'|_dspark_keys\[@\]|_dspark_keys|_dspark_key)(:-[^}]*)?\}'
 )
 
 
@@ -296,12 +446,12 @@ class EntrypointArgv(unittest.TestCase):
         elems = r.stdout.splitlines()
         self.assertEqual(elems[1:], ["<--api-key>", "<k1>", "<k2*>"])
 
-    def test_dash_leading_token_rejected_with_token_named(self):
+    def test_dash_leading_token_rejected_without_echoing_token(self):
         for value in ("-bad", "k1 -bad", "k1  -bad  k3"):
             r = run_entrypoint({"DSPARK_API_KEYS": value})
             self.assertEqual(r.returncode, 2, value)
-            self.assertIn(DASH_REJECT_PREFIX, r.stderr, value)
-            self.assertIn("-bad", r.stderr, value)
+            self.assertIn(DASH_REJECT_MSG, r.stderr, value)
+            self.assertNotIn("-bad", r.stderr + r.stdout, value)
 
     def test_newline_cr_dash_after_newline_exit2_single_line_msg(self):
         # ask #4: newline/CR anywhere in the value, and a dash placed after one,
@@ -311,7 +461,7 @@ class EntrypointArgv(unittest.TestCase):
             self.assertEqual(r.returncode, 2, (value, r.stderr))
             self.assertIn(SINGLE_LINE_MSG, r.stderr, (value, r.stderr))
             if value.endswith("-bad"):
-                self.assertNotIn(DASH_REJECT_PREFIX, r.stderr, (value, r.stderr))
+                self.assertNotIn(DASH_REJECT_MSG, r.stderr, (value, r.stderr))
 
     def test_both_vars_named_and_exit_2(self):
         r = run_entrypoint({"VLLM_API_KEY": "vk", "DSPARK_API_KEYS": "k1 k2"})
@@ -335,6 +485,214 @@ class EntrypointArgv(unittest.TestCase):
     def test_full_argv_no_api_key_when_unset(self):
         argv = argv_of({})
         self.assertNotIn("--api-key", argv)
+
+
+class ControlCharacters(unittest.TestCase):
+    """The entrypoint and all probes retain one fail-closed value grammar."""
+
+    @staticmethod
+    def outcomes(env):
+        yield "entrypoint", run_entrypoint(env)
+        for probe in PROBES:
+            yield probe.name, run_probe(probe, env)
+
+    def test_controls_rejected_before_classification_in_all_contexts(self):
+        values = (
+            "\n", "\r", "\r\n", " \r ", "\t\n\t",
+            "\v", "\f", "k1\vk2", "k1\nk2", "k1\n-bad",
+        )
+        for value in values:
+            for context, result in self.outcomes({"DSPARK_API_KEYS": value}):
+                with self.subTest(context=context, value=repr(value)):
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(SINGLE_LINE_MSG, result.stderr)
+                    self.assertNotIn(DASH_REJECT_MSG, result.stderr)
+
+    def test_control_rejection_precedes_both_set_check(self):
+        env = {"VLLM_API_KEY": "vk", "DSPARK_API_KEYS": "\n"}
+        for context, result in self.outcomes(env):
+            with self.subTest(context=context):
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(SINGLE_LINE_MSG, result.stderr)
+                self.assertNotIn(BOTH_SET_MSG, result.stderr)
+
+    def test_backslashes_rejected_in_all_contexts(self):
+        for value in ("a\\tb", "k1\\\\k2"):
+            for context, result in self.outcomes({"DSPARK_API_KEYS": value}):
+                with self.subTest(context=context, value=value):
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(BACKSLASH_MSG, result.stderr)
+
+    def test_unset_empty_and_space_tab_only_remain_keyless(self):
+        for env in ({}, {"DSPARK_API_KEYS": ""},
+                    {"DSPARK_API_KEYS": "   \t "}):
+            for context, result in self.outcomes(env):
+                with self.subTest(context=context, env=env):
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue(result.stdout.startswith("COUNT=0"), result.stdout)
+
+    def test_non_ascii_whitespace_is_not_treated_as_empty(self):
+        value = "\u2003"
+        for context, result in self.outcomes({"DSPARK_API_KEYS": value}):
+            with self.subTest(context=context):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(result.stdout.startswith("COUNT=2"), result.stdout)
+
+    def test_every_rejection_diagnostic_is_secret_free(self):
+        cases = (
+            (
+                {"DSPARK_API_KEYS": "zz-sentinel-control\nrest"},
+                SINGLE_LINE_MSG,
+                ("zz-sentinel-control",),
+            ),
+            (
+                {"DSPARK_API_KEYS": "zz-sentinel-backslash\\rest"},
+                BACKSLASH_MSG,
+                ("zz-sentinel-backslash",),
+            ),
+            (
+                {"DSPARK_API_KEYS": "-zz-sentinel-dash"},
+                DASH_REJECT_MSG,
+                ("zz-sentinel-dash",),
+            ),
+            (
+                {
+                    "VLLM_API_KEY": "zz-sentinel-vllm",
+                    "DSPARK_API_KEYS": "zz-sentinel-dspark",
+                },
+                BOTH_SET_MSG,
+                ("zz-sentinel-vllm", "zz-sentinel-dspark"),
+            ),
+        )
+        for env, message, sentinels in cases:
+            for context, result in self.outcomes(env):
+                with self.subTest(context=context, message=message):
+                    output = result.stdout + result.stderr
+                    self.assertEqual(result.returncode, 2, output)
+                    self.assertIn(message, result.stderr)
+                    for sentinel in sentinels:
+                        self.assertNotIn(sentinel, output)
+
+
+class AmbientGuard(unittest.TestCase):
+    """The normalized .env snapshot is the sole DSPARK_API_KEYS carrier."""
+
+    def test_ambient_only_and_mismatch_are_rejected_secret_free(self):
+        cases = (
+            ("WORKER_HOST=worker\n", "zz-sentinel-ambient-only"),
+            (
+                'DSPARK_API_KEYS="file-value"\n',
+                "zz-sentinel-ambient-mismatch",
+            ),
+        )
+        for env_text, ambient in cases:
+            result = run_launcher_env(env_text, ambient)
+            with self.subTest(ambient=ambient):
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(AMBIENT_GUARD_MSG, result.stderr)
+                self.assertNotIn(ambient, result.stdout + result.stderr)
+
+    def test_equal_ambient_file_only_and_no_key_paths_pass(self):
+        value = "file-one file-two"
+        equal = run_launcher_env(
+            f'DSPARK_API_KEYS="{value}"\n', ambient_marker=value
+        )
+        self.assertEqual(equal.returncode, 0, equal.stderr)
+        self.assertIn(f"EFFECTIVE=<{value}>", equal.stdout)
+
+        file_only = run_launcher_env(f'DSPARK_API_KEYS="{value}"\n')
+        self.assertEqual(file_only.returncode, 0, file_only.stderr)
+        self.assertIn(f"EFFECTIVE=<{value}>", file_only.stdout)
+
+        no_key = run_launcher_env("WORKER_HOST=worker\n")
+        self.assertEqual(no_key.returncode, 0, no_key.stderr)
+        self.assertIn("EFFECTIVE=<>", no_key.stdout)
+
+    def test_keyed_preflight_requires_local_patch_for_either_variable(self):
+        for keys_set, vllm_key in (("1", None), ("0", "legacy-key")):
+            missing = run_preflight(keys_set, vllm_key, patch_present=False)
+            with self.subTest(keys_set=keys_set, vllm_key=vllm_key):
+                self.assertEqual(missing.returncode, 1, missing.stderr)
+                self.assertIn(PREFLIGHT_MSG, missing.stderr)
+                self.assertNotIn("FELL-THROUGH", missing.stdout)
+
+                present = run_preflight(keys_set, vllm_key, patch_present=True)
+                self.assertEqual(present.returncode, 0, present.stderr)
+                self.assertIn("FELL-THROUGH", present.stdout)
+
+    def test_keyless_preflight_does_not_require_patch(self):
+        result = run_preflight("0", None, patch_present=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("FELL-THROUGH", result.stdout)
+
+
+class RedactionGate(unittest.TestCase):
+    """Keyed entrypoints cannot reach exec unless apply and status succeed."""
+
+    @staticmethod
+    def dumped_argv(result):
+        return [line[2:-1] for line in result.stdout.splitlines()
+                if line.startswith("A[") and line.endswith("]")]
+
+    def test_keyed_missing_patch_never_reaches_exec_for_either_key_variable(self):
+        for env in (
+            {"DSPARK_API_KEYS": "key-one key-two"},
+            {"VLLM_API_KEY": "legacy-key"},
+        ):
+            result, calls = run_redaction_gate(env, patch_present=False)
+            with self.subTest(env=env):
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(self.dumped_argv(result), [])
+                self.assertEqual(calls, [])
+
+    def test_apply_or_status_failure_never_reaches_exec(self):
+        cases = ((1, 0, ["apply"]), (0, 1, ["apply", "--status"]))
+        for apply_rc, status_rc, expected_calls in cases:
+            result, calls = run_redaction_gate(
+                {"DSPARK_API_KEYS": "key-one key-two"},
+                patch_present=True,
+                apply_rc=apply_rc,
+                status_rc=status_rc,
+            )
+            with self.subTest(apply_rc=apply_rc, status_rc=status_rc):
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(self.dumped_argv(result), [])
+                self.assertEqual(calls, expected_calls)
+
+    def test_success_reaches_exec_once_even_when_performance_hotfixes_skip(self):
+        for skip in (None, "1"):
+            env = {"DSPARK_API_KEYS": "key-one key-two"}
+            if skip is not None:
+                env["DSPARK_SKIP_HOTFIX"] = skip
+            result, calls = run_redaction_gate(env, patch_present=True)
+            with self.subTest(skip=skip):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                argv = self.dumped_argv(result)
+                self.assertEqual(argv.count("--api-key"), 1, argv)
+                index = argv.index("--api-key")
+                self.assertEqual(argv[index + 1:index + 3], ["key-one", "key-two"])
+                self.assertEqual(calls, ["apply", "--status"])
+
+    def test_keyless_missing_patch_reaches_exec_without_invocation(self):
+        result, calls = run_redaction_gate({}, patch_present=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = self.dumped_argv(result)
+        self.assertTrue(argv, result.stdout)
+        self.assertNotIn("--api-key", argv)
+        self.assertEqual(calls, [])
+
+    def test_gate_shape_is_unskippable_and_outside_optional_loop(self):
+        gate = entrypoint_redaction_gate()
+        self.assertNotIn("DSPARK_SKIP_HOTFIX", gate)
+        self.assertNotIn("-f ", gate)
+        self.assertNotIn("|| true", gate)
+        self.assertIn("hotfix-vllm-redact-api-key-log.sh || exit 1", gate)
+        self.assertIn("hotfix-vllm-redact-api-key-log.sh --status || exit 1", gate)
+        loop = next(
+            line for line in COMPOSE.read_text(encoding="utf-8").splitlines()
+            if "for _hf in " in line
+        )
+        self.assertNotIn("hotfix-vllm-redact-api-key-log.sh", loop)
 
 
 class EntrypointInterpolation(unittest.TestCase):
@@ -404,8 +762,8 @@ class ProbeAuth(unittest.TestCase):
         for path in PROBES:
             r = run_probe(path, {"DSPARK_API_KEYS": "k1 -bad"})
             self.assertEqual(r.returncode, 2, path.name)
-            self.assertIn(DASH_REJECT_PREFIX, r.stderr, path.name)
-            self.assertIn("-bad", r.stderr, path.name)
+            self.assertIn(DASH_REJECT_MSG, r.stderr, path.name)
+            self.assertNotIn("-bad", r.stderr + r.stdout, path.name)
 
     def test_probes_newline_cr_dash_after_newline_exit2(self):
         # ask #4 in the probe contexts: exit 2 + single-line message, and the
@@ -416,7 +774,7 @@ class ProbeAuth(unittest.TestCase):
                 self.assertEqual(r.returncode, 2, (path.name, value))
                 self.assertIn(SINGLE_LINE_MSG, r.stderr, (path.name, value))
                 if value.endswith("-bad"):
-                    self.assertNotIn(DASH_REJECT_PREFIX, r.stderr,
+                    self.assertNotIn(DASH_REJECT_MSG, r.stderr,
                                      (path.name, value))
 
     def test_probes_exit_2_naming_both_vars(self):
@@ -439,16 +797,18 @@ class ProbeAuth(unittest.TestCase):
 # --------------------------------------------------------------------------
 
 
-def render_compose(compose_text: str, env_text: str, ambient=None):
-    """Render compose_text through the real docker CLI with env_text as --env-file.
+def render_compose(compose_text: str, env_text: str, ambient=None,
+                   docker_path=DOCKER, cli_ok=None):
+    """Render through Docker Compose, skipping only when its CLI is absent.
 
-    Runs `docker compose --env-file <stub.env> -f <temp compose> config
-    --format json` in a temp dir with a key-scrubbed env (so a hostile parent
-    can never leak keys into the render). Returns the parsed JSON object, or
-    None when docker is unavailable / the render or JSON parse fails — the
-    handoff layer then skips cleanly.
+    CLI availability is probed once for normal calls. Once available, any
+    nonzero config result or invalid JSON raises AssertionError with stderr;
+    central handoff coverage must never silently turn green on render failure.
     """
-    if not DOCKER:
+    if cli_ok is None:
+        cli_ok = (COMPOSE_CLI_OK if docker_path == DOCKER
+                  else compose_cli_available(docker_path, ambient))
+    if not cli_ok:
         return None
     with tempfile.TemporaryDirectory() as td:
         compose_copy = Path(td, "docker-compose.dspark.yml")
@@ -456,17 +816,21 @@ def render_compose(compose_text: str, env_text: str, ambient=None):
         compose_copy.write_text(compose_text, encoding="utf-8")
         stub_env.write_text(env_text, encoding="utf-8")
         proc = subprocess.run(
-            [DOCKER, "compose", "--env-file", str(stub_env), "-f",
+            [docker_path, "compose", "--env-file", str(stub_env), "-f",
              str(compose_copy), "config", "--format", "json"],
             capture_output=True, text=True, env=base_env(ambient), cwd=td,
         )
     if proc.returncode != 0:
-        return None
+        raise AssertionError(
+            f"docker compose config failed ({proc.returncode}):\n{proc.stderr}"
+        )
     try:
         return json.loads(proc.stdout)
-    except ValueError:
-        return None
-
+    except ValueError as exc:
+        raise AssertionError(
+            f"docker compose config returned invalid JSON: {exc}\n"
+            f"stderr:\n{proc.stderr}"
+        ) from exc
 
 def rendered_env(render) -> dict:
     return render["services"]["vllm-dspark"]["environment"]
@@ -514,11 +878,34 @@ def handoff_argv(block: str, tail: str, env: dict):
             if ln.startswith("A[") and ln.endswith("]")]
 
 
+class ComposeRendering(unittest.TestCase):
+    """Docker Compose absence skips; an available-but-broken CLI fails loud."""
+
+    def test_absent_cli_returns_none(self):
+        self.assertIsNone(
+            render_compose("services: {}\n", "", docker_path=None, cli_ok=False)
+        )
+
+    def test_config_failure_raises_with_stderr(self):
+        with tempfile.TemporaryDirectory() as td:
+            docker = Path(td, "docker")
+            docker.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [ \"${1:-} ${2:-}\" = \"compose version\" ]; then exit 0; fi\n"
+                "echo compose-render-sentinel >&2\n"
+                "exit 41\n",
+                encoding="utf-8",
+            )
+            docker.chmod(0o755)
+            with self.assertRaisesRegex(AssertionError, "compose-render-sentinel"):
+                render_compose("services: {}\n", "", docker_path=str(docker))
+
+
 class ComposedHandoff(unittest.TestCase):
     """Drive the REAL `docker compose config` render plus the REAL auth code.
 
-    Skips cleanly when the docker CLI is missing or cannot render the compose
-    file on the host — ci-validate.sh runners without docker must stay green.
+    Skips only when Docker Compose is absent. Once its version probe succeeds,
+    every source/variant render and JSON decode is required to succeed.
     """
 
     HOSTILE = {"VLLM_API_KEY": "ambient-vk", "DSPARK_API_KEYS": "ambient-k1 ambient-k2"}
@@ -544,7 +931,11 @@ class ComposedHandoff(unittest.TestCase):
 
     def setUp(self):
         if self.render is None:
-            self.skipTest("docker compose cannot render on this host")
+            self.skipTest("Docker Compose is unavailable")
+
+    def test_rendered_command_contains_fail_closed_redaction_gate(self):
+        gate = entrypoint_redaction_gate(self.command2)
+        self.assertIn("hotfix-vllm-redact-api-key-log.sh --status || exit 1", gate)
 
     def test_handoff_env_reaches_container(self):
         # The stub keys are what compose hands the container.
@@ -571,8 +962,6 @@ class ComposedHandoff(unittest.TestCase):
         variant = "\n".join(lines) + "\n"
         self.assertNotEqual(variant, source, "passthrough drop produced no edit")
         dropped = render_compose(variant, self.STUB_ENV)
-        if dropped is None:
-            self.skipTest("variant compose render failed on this host")
         dropped_env = env_from_render(dropped)
         # The stub still set the key; compose just never passed it through.
         self.assertNotIn("DSPARK_API_KEYS", dropped_env)
@@ -592,8 +981,6 @@ class ComposedHandoff(unittest.TestCase):
                         "interpolation gate missed `$` in the compose block")
         # Rendered: compose inlines the stub keys; the shell `$` ref is gone.
         inline = render_compose(variant, self.STUB_ENV)
-        if inline is None:
-            self.skipTest("variant compose render failed on this host")
         seek = "${DSPARK_API_KEYS"
         self.assertIn(seek, self.command2,
                       "happy-path block lost its env ref (render changed?)")
@@ -615,6 +1002,32 @@ class ComposedHandoff(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# The handoff harness may splice auth directly to exec only if state is stable.
+# --------------------------------------------------------------------------
+
+
+class MiddleSegmentGuard(unittest.TestCase):
+    """No skipped middle statement may reassign auth state or argv."""
+
+    def assert_no_auth_reassignment(self, segment):
+        self.assertIsNone(re.search(r"API_KEY_ARGS\s*=", segment), segment)
+        self.assertIsNone(re.search(r"_dspark_keys_set\s*=", segment), segment)
+
+    def test_compose_source_middle_does_not_reassign(self):
+        source = COMPOSE.read_text(encoding="utf-8")
+        self.assert_no_auth_reassignment(middle_segment(source))
+
+    def test_rendered_command_middle_does_not_reassign(self):
+        render = render_compose(
+            COMPOSE.read_text(encoding="utf-8"), ComposedHandoff.STUB_ENV
+        )
+        if render is None:
+            self.skipTest("Docker Compose is unavailable")
+        command = rendered_command(render)[2]
+        self.assert_no_auth_reassignment(middle_segment(command))
+
+
+# --------------------------------------------------------------------------
 # Ambient-parent env: hostile parent variants change nothing.
 # --------------------------------------------------------------------------
 
@@ -631,6 +1044,7 @@ class AmbientParent(unittest.TestCase):
             {"DSPARK_API_KEYS": "k1 k2"},
             {"DSPARK_API_KEYS": "-bad"},
             {"DSPARK_API_KEYS": "k1\nk2"},
+            {"DSPARK_API_KEYS": "\v"},
             {"VLLM_API_KEY": "vk"},
             {"VLLM_API_KEY": "vk", "DSPARK_API_KEYS": "k1"},
         )
@@ -649,6 +1063,7 @@ class AmbientParent(unittest.TestCase):
             {"DSPARK_API_KEYS": "k1 k2"},
             {"DSPARK_API_KEYS": "-bad"},
             {"DSPARK_API_KEYS": "k1\nk2"},
+            {"DSPARK_API_KEYS": "\v"},
             {"VLLM_API_KEY": "vk"},
             {"VLLM_API_KEY": "vk", "DSPARK_API_KEYS": "k1"},
         )
@@ -723,28 +1138,73 @@ class WorkerSync(unittest.TestCase):
 
 
 class Documented(unittest.TestCase):
-    def test_env_example_documents_contract(self):
+    ROUTE_SCOPE = (
+        "Every route outside the guarded prefixes `/v1`, `/v2`, `/inference` "
+        "is keyless."
+    )
+    ROUTE_DETAIL = (
+        "On the pinned runtime that includes `POST /invocations` and `POST "
+        "/generative_scoring` (both run inference unauthenticated) and the "
+        "`/tokenize` / `/detokenize` utility routes, besides `/health`, "
+        "`/metrics`, `/version`, `/ping`; a keyed deployment still needs "
+        "network-level access control on the server port."
+    )
+
+    @staticmethod
+    def normalized_prose(path):
+        parts = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("#"):
+                line = line[1:].strip()
+            parts.append(line)
+        return " ".join(" ".join(parts).split())
+
+    def assert_documented_contract(self, path):
+        text = path.read_text(encoding="utf-8")
+        prose = self.normalized_prose(path)
+        for required in (
+            "/generative_scoring", "/invocations", "/tokenize",
+            "/detokenize", "network-level access control",
+            "fails the container before exec",
+        ):
+            self.assertIn(required, text, (path.name, required))
+        self.assertIn(self.ROUTE_SCOPE, prose, path.name)
+        self.assertIn(self.ROUTE_DETAIL, prose, path.name)
+
+    def test_env_example_documents_exact_contract(self):
         text = ENV_EXAMPLE.read_text(encoding="utf-8")
         self.assertIn("DSPARK_API_KEYS", text)
-        self.assertIn("VLLM_API_KEY", text)          # single-key path coexists
-        self.assertIn("exit 2", text)                # both-set failure documented
-        self.assertIn("/invocations", text)          # verified unguarded on 0.1.1
-        self.assertIn("hotfix-vllm-redact-api-key-log.sh", text)  # ask #2 docs
+        self.assertIn("VLLM_API_KEY", text)
+        self.assertIn("exit 2", text)
+        self.assertIn("hotfix-vllm-redact-api-key-log.sh", text)
+        self.assert_documented_contract(ENV_EXAMPLE)
 
-    def test_envs_doc_documents_contract(self):
+    def test_envs_doc_documents_exact_contract(self):
         text = ENVS_DOC.read_text(encoding="utf-8")
         self.assertIn("`DSPARK_API_KEYS`", text)
         self.assertIn("`VLLM_API_KEY`", text)
-        self.assertIn("hotfix-vllm-redact-api-key-log.sh", text)  # ask #2 row
+        self.assertIn("hotfix-vllm-redact-api-key-log.sh", text)
+        self.assert_documented_contract(ENVS_DOC)
 
-    def test_no_key_material_committed(self):
-        allow = ("sk-dspark-alice", "sk-dspark-bob", "sk-single-key")
-        for path in (COMPOSE, ENV_EXAMPLE, *PROBES, ENVS_DOC, CHANGELOG, SELF):
-            text = path.read_text(encoding="utf-8")
-            for match in re.findall(r"sk-[A-Za-z0-9_-]{6,}", text):
-                self.assertIn(match, allow,
-                              f"possible real key in {path.name}: {match}")
-
+    def test_no_key_material_committed_in_any_changed_text_artifact(self):
+        allow = (
+            "sk-dspark-alice", "sk-dspark-bob", "sk-single-key",
+            "sk-probe-a", "sk-probe-b",
+        )
+        paths = (
+            COMPOSE, ENV_EXAMPLE, *PROBES, ENVS_DOC, CHANGELOG, SELF,
+            REDACTION_PATCH, CI_VALIDATE, REDACTION_TEST,
+            ENV_NORMALISATION_TEST,
+        )
+        for changed_path in paths:
+            changed_text = changed_path.read_text(encoding="utf-8")
+            for match in re.findall(r"sk-[A-Za-z0-9_-]{6,}", changed_text):
+                self.assertIn(
+                    match,
+                    allow,
+                    f"possible real key in {changed_path.name}: {match}",
+                )
 
 if __name__ == "__main__":
     unittest.main()

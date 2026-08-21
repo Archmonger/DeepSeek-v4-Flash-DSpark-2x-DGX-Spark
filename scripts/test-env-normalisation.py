@@ -35,7 +35,15 @@ ENV_FILE={shlex.quote(str(env_file))}
 printf 'WORKER_HOST=%q\nVLLM_PORT=%q\n' "${{WORKER_HOST:-<unset>}}" "${{VLLM_PORT:-<unset>}}"
 {extra}
 """
-    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    env = dict(os.environ)
+    env.pop("DSPARK_API_KEYS", None)
+    env.pop("VLLM_API_KEY", None)
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
     result.operator_bytes = env_file.read_bytes()  # type: ignore[attr-defined]
     result.leftovers = sorted(path.name for path in tmpdir.iterdir())  # type: ignore[attr-defined]
     shutil.rmtree(workdir)

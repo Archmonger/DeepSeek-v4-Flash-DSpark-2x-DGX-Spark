@@ -36,7 +36,9 @@
 #   bash hotfix-vllm-redact-api-key-log.sh --status # report (inside container)
 #   bash hotfix-vllm-redact-api-key-log.sh --before | --after  (host-side; doc only)
 #
-# Idempotent — re-running skips the already-applied hunk.
+# --status exits nonzero unless every applied-state check passes. Keyed starts
+# require this patch and verify it fail-closed, with no DSPARK_SKIP_HOTFIX
+# bypass. Re-running skips only a fully applied hunk; partial states fail.
 set -euo pipefail
 
 VLLM_ROOT="${VLLM_ROOT:-/usr/local/lib/python3.12/dist-packages/vllm}"
@@ -56,9 +58,12 @@ from pathlib import Path
 root = Path(sys.argv[1])
 api_utils = root / "entrypoints" / "serve" / "utils" / "api_utils.py"
 text = api_utils.read_text()
+failed = []
 
 def chk(label, cond):
     print(f"{label:44} :", "APPLIED" if cond else "NOT APPLIED")
+    if not cond:
+        failed.append(label)
 
 chk("redact set defined", "_DSPARK_REDACT_LOG_ARGS" in text)
 chk("log path calls redactor",
@@ -95,6 +100,7 @@ if start != -1 and end > start:
 chk("redaction verified behaviourally", redacts)
 chk("non-secret args untouched", keeps_others)
 chk("live args list not mutated", no_mutate)
+raise SystemExit(1 if failed else 0)
 PY
   exit 0
 }
@@ -126,6 +132,8 @@ root = Path("$VLLM_ROOT")
 applied = 0
 skipped = 0
 errors = []
+RAW_ANCHOR = '''    non_default_args = get_non_default_args(args)
+    logger.info("non-default args: %s", non_default_args)'''
 
 def patch(path: str, old: str, new: str, label: str, expect: int = 1) -> None:
     global applied, skipped
@@ -135,6 +143,9 @@ def patch(path: str, old: str, new: str, label: str, expect: int = 1) -> None:
         return
     text = p.read_text()
     if new in text:
+        if RAW_ANCHOR in text:
+            errors.append("partial patch: replacement present but raw logger still defined")
+            return
         print(f"  [skip] {label} (already applied)")
         skipped += 1
         return
