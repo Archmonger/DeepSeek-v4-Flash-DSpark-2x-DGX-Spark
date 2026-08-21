@@ -2,13 +2,16 @@
 # CPU-only behavioral gates for the NCCL_IB_HCA -> RoCEv2 GID index resolver
 # used by start-deepseek-v4-flash-dspark.sh's NCCL_IB_GID_AUTO=1 path.
 #
-# The resolver mirrors NCCL's selector semantics (net_ib.cc) on the node that
-# owns the sysfs tree: optional leading "^" (exclude), then optional "="
-# (exact match instead of prefix match), comma-separated name[:port] tokens
-# with atoi() port parsing, omitted port = every port of the device. Every
-# selected member must validate against the preferred match IP or an IPv4 on
-# its own netdev; a member with no usable RoCEv2 GID fails closed (exit 1),
-# and members that need different numeric indexes fail closed (exit 3),
+# The resolver mirrors NCCL's selector semantics (parseStringList in
+# src/misc/utils.cc) on the node that owns the sysfs tree: optional leading "^"
+# (exclude), then optional "=" (exact match instead of prefix match), then
+# comma-separated name[:port[:rail[:plane]]] tokens. An absent *or empty* port
+# field means any port; a non-empty one is atoi() (base 10, stops at the first
+# non-digit). Every selected member must validate against the preferred match IP
+# or an IPv4 on its own netdev; a member with no usable RoCEv2 GID fails closed
+# (exit 1). Members are reconciled by intersecting their sets of usable indexes
+# — a member can have several, so an arbitrary per-member pick would report a
+# false disagreement — and only an empty intersection fails closed (exit 3),
 # because NCCL_IB_GID_INDEX is one global value per rank.
 #
 # The suite extracts the launcher's own functions and runs the launcher's own
@@ -122,12 +125,12 @@ expect_rc "selector matching nothing fails closed" 1 "$h" "$hfx" '=devGone' '10.
 expect_rc "shared-IP selection with an unvalidatable member fails closed (empty selector = all ports)" 1 "$h" "$hfx" '' '10.0.22.1'
 expect_rc "intra-node index disagreement fails closed (exit 3)" 3 "$h" "$hfx" '=devA,devE' '10.0.22.1'
 
-# disagreement diagnostic names the members
+# disagreement diagnostic names the members and their usable sets
 rc=0
 err="$(resolve "$h" "$hfx" '=devA,devE' '10.0.22.1' 2>&1 >/dev/null)" || rc=$?
-if [ "$rc" -eq 3 ] && printf '%s' "$err" | grep -q 'different RoCEv2 GID indexes' \
+if [ "$rc" -eq 3 ] && printf '%s' "$err" | grep -q 'share no common RoCEv2 GID index' \
   && printf '%s' "$err" | grep -q 'devA:1=3' && printf '%s' "$err" | grep -q 'devE:1=6'; then
-  ok "disagreement diagnostic lists each member's index"
+  ok "disagreement diagnostic lists each member's usable set"
 else
   bad "disagreement diagnostic wrong (rc=$rc): $err"
 fi
@@ -151,6 +154,66 @@ expect_idx "distinct per-HCA addresses both validate via own netdev" 2 "$w" "$wf
 expect_idx "match-ip member + own-addr member agree" 2 "$w" "$wfx" '=devM:1,devN:1' '10.0.25.1'
 expect_idx "port exclusion (^dev:port honors the port)" 2 "$w" "$wfx" '^devN:2' '10.0.99.99'
 expect_rc "non-numeric port token matches no port" 1 "$w" "$wfx" 'devM:abc' '10.0.99.99'
+
+# --- NCCL port-field grammar ---
+# parseStringList splits name[:port[:rail[:plane]]]; an absent or empty port
+# field is -1 (any port), a non-empty one is atoi() (base 10, stops at the first
+# non-digit). Ports 1/8/10 exist here so leading-zero forms are distinguishable:
+# "08" must be 8 (not a bad octal literal) and "010" must be 10 (not octal 8).
+# 10.0.32.1 -> ...0a00:2001 ; 10.0.32.8 -> ...0a00:2008 ; 10.0.32.16 -> ...0a00:2010
+pg="$tmp/portgrammar"
+pgfx="$tmp/pg.fixture"
+mk_gid "$pg" devP 1 4 '::ffff:0a00:2001' 'RoCE v2' enp1
+mk_gid "$pg" devP 8 7 '::ffff:0a00:2008' 'RoCE v2' enp8
+mk_gid "$pg" devP 10 8 '::ffff:0a00:2010' 'RoCE v2' enp10
+printf '%s\n' 'enp1 10.0.32.1' 'enp8 10.0.32.8' 'enp10 10.0.32.16' >"$pgfx"
+
+expect_idx "explicit port 1 (baseline for the grammar cases)" 4 "$pg" "$pgfx" 'devP:1' '10.0.99.99'
+expect_idx "leading-zero port :08 is decimal 8, not a bad octal literal" 7 "$pg" "$pgfx" 'devP:08' '10.0.99.99'
+expect_idx "leading-zero port :010 is decimal 10, not octal 8" 8 "$pg" "$pgfx" 'devP:010' '10.0.99.99'
+expect_idx "signed port :+8 parses as 8" 7 "$pg" "$pgfx" 'devP:+8' '10.0.99.99'
+expect_idx "atoi stops at the first non-digit (:8abc -> 8)" 7 "$pg" "$pgfx" 'devP:8abc' '10.0.99.99'
+expect_idx "atoi skips leading blanks (: 8 -> 8)" 7 "$pg" "$pgfx" 'devP: 8' '10.0.99.99'
+expect_idx "rail/plane fields are parsed off, port still wins (:8:2:0)" 7 "$pg" "$pgfx" 'devP:8:2:0' '10.0.99.99'
+expect_rc "non-numeric port is atoi 0 and matches no real port" 1 "$pg" "$pgfx" 'devP:abc' '10.0.99.99'
+# Empty port field == absent == any port. All three ports here need different
+# indexes, so wildcard selection is observable as exit 3 (a port-0 reading would
+# instead match nothing and exit 1).
+expect_rc "explicit empty port field is a wildcard, not port 0" 3 "$pg" "$pgfx" 'devP:' '10.0.99.99'
+expect_rc "empty port field before a rail field is also a wildcard" 3 "$pg" "$pgfx" 'devP::2' '10.0.99.99'
+expect_idx "omitted port on a single-port match still resolves" 4 "$pg" "$pgfx" 'devP:1:0' '10.0.99.99'
+
+# --- per-member index sets are intersected, not compared pairwise ---
+# Each member has two usable RoCEv2 indexes and they overlap on 5. Taking one
+# arbitrary winner per member picks 1 for devX and 3 for devY (lowest scanned
+# first) and reports a false disagreement; intersecting the sets finds 5.
+# 10.0.40.1 -> ...0a00:2801 ; 10.0.40.9 -> ...0a00:2809
+# 10.0.41.1 -> ...0a00:2901 ; 10.0.41.9 -> ...0a00:2909 ; 10.0.42.1 -> ...0a00:2a01
+x="$tmp/multi"
+xfx="$tmp/multi.fixture"
+mk_gid "$x" devX 1 1 '::ffff:0a00:2801' 'RoCE v2' enx1
+mk_gid "$x" devX 1 5 '::ffff:0a00:2809' 'RoCE v2' enx1
+mk_gid "$x" devY 1 3 '::ffff:0a00:2901' 'RoCE v2' eny1
+mk_gid "$x" devY 1 5 '::ffff:0a00:2909' 'RoCE v2' eny1
+mk_gid "$x" devZ 1 2 '::ffff:0a00:2a01' 'RoCE v2' enz1
+printf '%s\n' 'enx1 10.0.40.1' 'enx1 10.0.40.9' 'eny1 10.0.41.1' 'eny1 10.0.41.9' 'enz1 10.0.42.1' >"$xfx"
+
+expect_idx "members with overlapping index sets resolve to the common index" 5 "$x" "$xfx" '=devX:1,devY:1' '10.0.99.99'
+expect_idx "single member still takes its lowest usable index" 1 "$x" "$xfx" '=devX:1' '10.0.99.99'
+expect_rc "genuinely disjoint index sets still fail closed (exit 3)" 3 "$x" "$xfx" '=devX:1,devZ:1' '10.0.99.99'
+
+# The empty-intersection diagnostic must show each member's whole usable set,
+# not one arbitrary pick, so the operator can see why no pin can work.
+rc=0
+err="$(resolve "$x" "$xfx" '=devX:1,devZ:1' '10.0.99.99' 2>&1 >/dev/null)" || rc=$?
+if [ "$rc" -eq 3 ] && printf '%s' "$err" | grep -q 'devX:1=1,5' && printf '%s' "$err" | grep -q 'devZ:1=2'; then
+  ok "empty-intersection diagnostic lists each member's full usable set"
+else
+  bad "usable-set diagnostic wrong (rc=$rc): $err"
+fi
+
+# A match-IP hit inside the intersection is preferred over a lower own-addr one.
+expect_idx "match-ip index inside the intersection wins over a lower own-addr index" 5 "$x" "$xfx" '=devX:1,devY:1' '10.0.40.9'
 
 # --- independent head/worker layouts in one run (ssh transport path) ---
 expect_idx "head layout resolves independently" 3 "$h" "$hfx" '=devA,devB' '10.0.22.1'

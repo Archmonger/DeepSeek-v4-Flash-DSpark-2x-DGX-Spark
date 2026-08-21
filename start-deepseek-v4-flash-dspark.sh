@@ -245,18 +245,28 @@ iface_ipv4() {
   fi
 }
 
-# NCCL_IB_HCA is not a bare sysfs device name. NCCL (net_ib.cc) accepts an
-# optional leading "^" (exclude), then an optional "=" (exact name match
-# instead of prefix match), then a comma-separated list of name[:port] tokens;
-# the port is atoi() of what follows the first ":" (non-numeric -> 0, which
-# matches no real port), empty names are dropped, and an empty token list
-# matches every device/port. The resolver below mirrors those semantics on the
-# node that owns the sysfs tree, validates every selected member against its
-# own local address (one shared match IP must not silently drop a member that
-# uses another link address), and fails closed - exit 1 when a selected member
-# has no usable RoCEv2 GID, exit 3 when members need different numeric GID
-# indexes (NCCL_IB_GID_INDEX is one global value per rank; no single pin can
-# satisfy a disagreeing selection).
+# NCCL_IB_HCA is not a bare sysfs device name. NCCL (parseStringList in
+# src/misc/utils.cc) accepts an optional leading "^" (exclude), then an optional
+# "=" (exact name match instead of prefix match), then a comma-separated list of
+# name[:port[:rail[:plane]]] tokens. Empty names are dropped and an empty token
+# list matches every device/port. A port field that is absent *or empty* means
+# -1, i.e. any port - "devA" and "devA:" select the same thing. A non-empty port
+# field is atoi(): optional blanks and sign, then leading decimal digits,
+# stopping at the first non-digit. So ":08" is port 8 (atoi is base 10, never
+# octal) and ":abc" is 0, which matches no real port. Only the port field takes
+# part in matching here; rail/plane are parsed off and ignored.
+#
+# The resolver below mirrors those semantics on the node that owns the sysfs
+# tree, validates every selected member against its own local address (one
+# shared match IP must not silently drop a member that uses another link
+# address), and fails closed - exit 1 when a selected member has no usable
+# RoCEv2 GID, exit 3 when the selected members share no usable index.
+#
+# Members are reconciled by intersecting each member's *set* of usable RoCEv2
+# GID indexes. A member often has more than one usable index, so picking a
+# single winner per member and comparing those would report a disagreement even
+# when a common global index exists. NCCL_IB_GID_INDEX is one value per rank, so
+# only a genuinely empty intersection is fatal.
 #
 # Body is a quoted heredoc (nothing expands here); resolve_rocev2_gid_index
 # prepends the inputs as printf %q assignments, so selector tokens are
@@ -281,8 +291,19 @@ for tok in "$@"; do
   port=-1
   case "$tok" in *:*)
     p=${tok#*:}
-    digits=$(printf '%s' "$p" | sed -n 's/^[[:space:]]*\([+-]\{0,1\}[0-9][0-9]*\).*/\1/p')
-    if [ -n "$digits" ]; then port=$((digits + 0)); else port=0; fi
+    p=${p%%:*}
+    # Absent or empty port field means "any port"; only a non-empty field is
+    # atoi()'d. Force base 10 so "08"/"010" parse the way atoi() reads them
+    # instead of becoming a bad (or wrong) octal literal.
+    if [ -n "$p" ]; then
+      digits=$(printf '%s' "$p" | sed -n 's/^[[:space:]]*\([+-]\{0,1\}[0-9][0-9]*\).*/\1/p')
+      case "$digits" in
+        '') port=0 ;;
+        -*) port=$(( 0 - 10#${digits#-} )) ;;
+        +*) port=$(( 10#${digits#+} )) ;;
+        *)  port=$(( 10#$digits )) ;;
+      esac
+    fi
   ;; esac
   [ -n "$name" ] || continue
   ntok=$((ntok + 1))
@@ -335,55 +356,96 @@ if [ -z "$selected" ]; then
 fi
 
 fail_members=""
-idx_list=""
-detail=""
+mem_n=0
+have_common=0
+common=""
 for pair in $selected; do
   dev=${pair%%:*}
   port=${pair##*:}
   pdir="$sysroot/$dev/ports/$port"
-  best=""
-  best_src=""
+  mem_n=$((mem_n + 1))
+  eval "mem_pair_$mem_n=\$pair"
+  # Collect every usable index for this member, not just the first one.
+  usable=""
   for g in $(ls "$pdir/gids" 2>/dev/null); do
     t=$(cat "$pdir/gid_attrs/types/$g" 2>/dev/null || true)
     [ "$t" = "RoCE v2" ] || continue
     gid=$(cat "$pdir/gids/$g" 2>/dev/null || true)
-    case "$gid" in *ffff:"$hex")
-      best=$g
-      best_src="match-ip $match_ip"
-      break
-    ;; esac
-    if [ -z "$best" ]; then
+    src=""
+    case "$gid" in *ffff:"$hex") src="match-ip $match_ip" ;; esac
+    if [ -z "$src" ]; then
       nd=$(cat "$pdir/gid_attrs/ndevs/$g" 2>/dev/null || true)
-      [ -n "$nd" ] || continue
-      for oip in $(ip -4 -o addr show dev "$nd" 2>/dev/null | awk '{print $4}' | cut -d/ -f1); do
-        oh=$(ipv4_hex "$oip") || continue
-        case "$gid" in *ffff:"$oh")
-          best=$g
-          best_src="own-addr $oip on $nd"
-        ;; esac
-        [ -n "$best" ] && break
-      done
+      if [ -n "$nd" ]; then
+        for oip in $(ip -4 -o addr show dev "$nd" 2>/dev/null | awk '{print $4}' | cut -d/ -f1); do
+          oh=$(ipv4_hex "$oip") || continue
+          case "$gid" in *ffff:"$oh") src="own-addr $oip on $nd"; break ;; esac
+        done
+      fi
     fi
+    [ -n "$src" ] || continue
+    usable="$usable $g"
+    eval "src_${mem_n}_$g=\$src"
   done
-  if [ -z "$best" ]; then
+  eval "mem_usable_$mem_n=\$usable"
+  if [ -z "$usable" ]; then
     fail_members="$fail_members $dev:$port"
     continue
   fi
-  echo "  member $dev:$port -> RoCEv2 gid index $best (via $best_src)" >&2
-  idx_list="$idx_list $best"
-  detail="$detail $dev:$port=$best"
+  if [ "$have_common" = 0 ]; then
+    common=$usable
+    have_common=1
+  else
+    newcommon=""
+    for a in $common; do
+      for b in $usable; do
+        if [ "$a" = "$b" ]; then newcommon="$newcommon $a"; break; fi
+      done
+    done
+    common=$newcommon
+  fi
 done
 if [ -n "$fail_members" ]; then
   echo "FATAL: no usable RoCEv2 GID on selected member(s):$fail_members (no GID matches $match_ip or an IPv4 on the member's own netdev)" >&2
   exit 1
 fi
-uniq_n=$(printf '%s\n' $idx_list | sort -u | wc -l)
-if [ "$uniq_n" -gt 1 ]; then
-  echo "FATAL: selected members need different RoCEv2 GID indexes:$detail" >&2
+if [ -z "$common" ]; then
+  detail=""
+  i=1
+  while [ "$i" -le "$mem_n" ]; do
+    eval "pair=\$mem_pair_$i"
+    eval "u=\$mem_usable_$i"
+    csv=""
+    for x in $u; do csv="$csv,$x"; done
+    detail="$detail $pair=${csv#,}"
+    i=$((i + 1))
+  done
+  echo "FATAL: selected members share no common RoCEv2 GID index:$detail" >&2
   exit 3
 fi
-set -- $idx_list
-echo "$1"
+# Deterministic pick from the intersection: lowest index, preferring one that
+# at least one member reached through the preferred match IP.
+chosen=""
+fallback=""
+for g in $(printf '%s\n' $common | sort -n); do
+  [ -n "$fallback" ] || fallback=$g
+  i=1
+  while [ "$i" -le "$mem_n" ]; do
+    eval "s=\${src_${i}_$g:-}"
+    case "$s" in "match-ip "*) chosen=$g ;; esac
+    [ -n "$chosen" ] && break
+    i=$((i + 1))
+  done
+  [ -n "$chosen" ] && break
+done
+[ -n "$chosen" ] || chosen=$fallback
+i=1
+while [ "$i" -le "$mem_n" ]; do
+  eval "pair=\$mem_pair_$i"
+  eval "s=\${src_${i}_$chosen:-}"
+  echo "  member $pair -> RoCEv2 gid index $chosen (via $s)" >&2
+  i=$((i + 1))
+done
+echo "$chosen"
 exit 0
 RESOLVER
 )"
@@ -460,7 +522,7 @@ resolve_nccl_gid_indexes() {
   resolved_head="$(resolve_rocev2_gid_index "" "$NCCL_IB_HCA" "$head_match")" || {
     rc=$?
     if [ "$rc" -eq 3 ]; then
-      echo "FATAL: HCA/ports selected by NCCL_IB_HCA=$NCCL_IB_HCA on the head need different RoCEv2 GID indexes (see member list above)." >&2
+      echo "FATAL: HCA/ports selected by NCCL_IB_HCA=$NCCL_IB_HCA on the head share no common RoCEv2 GID index (see the per-member usable sets above)." >&2
       echo "NCCL_IB_GID_INDEX is one global value per rank, so no single pin can satisfy that selection - narrow NCCL_IB_HCA to members that share an index." >&2
     else
       echo "FATAL: could not resolve head RoCEv2 GID index (NCCL_IB_HCA=$NCCL_IB_HCA, match $head_match)." >&2
@@ -471,7 +533,7 @@ resolve_nccl_gid_indexes() {
   resolved_worker="$(resolve_rocev2_gid_index "$WORKER_HOST" "$WORKER_NCCL_IB_HCA" "$worker_match")" || {
     rc=$?
     if [ "$rc" -eq 3 ]; then
-      echo "FATAL: HCA/ports selected by WORKER_NCCL_IB_HCA=$WORKER_NCCL_IB_HCA on the worker need different RoCEv2 GID indexes (see member list above)." >&2
+      echo "FATAL: HCA/ports selected by WORKER_NCCL_IB_HCA=$WORKER_NCCL_IB_HCA on the worker share no common RoCEv2 GID index (see the per-member usable sets above)." >&2
       echo "NCCL_IB_GID_INDEX is one global value per rank, so no single pin can satisfy that selection - narrow WORKER_NCCL_IB_HCA to members that share an index." >&2
     else
       echo "FATAL: could not resolve worker RoCEv2 GID index (WORKER_NCCL_IB_HCA=$WORKER_NCCL_IB_HCA, match $worker_match)." >&2
