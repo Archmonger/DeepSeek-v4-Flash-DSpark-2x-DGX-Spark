@@ -6,6 +6,10 @@
 
 ## 2026-08-20
 
+### Added
+
+- **NCCL fabric passthrough: `NCCL_IB_MERGE_NICS`, `NCCL_NET_GDR_LEVEL`, `NCCL_NET_GDR_READ`, `NCCL_DMABUF_ENABLE`**: compose forwards these four from `.env.dspark`. Unconfigured knobs stay truly absent in the serving process — compose necessarily defines each key, and the entrypoint unsets empty definitions before exec, so NCCL's built-in defaults and config-file values (`/etc/nccl.conf`, `NCCL_CONF_FILE`, loaded with `overwrite=0` and therefore maskable by a defined-empty variable) still apply; configured non-empty values pass through unchanged on head and worker, and an empty value is normalized to absent rather than forwarded as an empty setting (`scripts/test-nccl-fabric-passthrough.sh` covers both directions). Passthrough only, no tuning claim: `NCCL_IB_MERGE_NICS` defaults to `1` inside NCCL and only *permits* merging compatible dual-port NICs (`0` disables it; `NCCL_NET_MERGE_LEVEL`/`NCCL_NET_FORCE_MERGE` participate in the topology decision); the GDR knobs are upstream overrides with no demonstrated effect on the submitting contributor's GB10 stack (contributor-reported observation, that stack only: driver `580.173.02` reported `CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED=0` in-container and transport stayed `via NET/IB/x`, no `/GDRDMA` — not a claim about GDR availability in general). Multi-HCA `NCCL_IB_HCA` selector handling in the launcher is [PR #95](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/pull/95)'s scope.
+
 ### Changed
 
 - **Issue #66: GPU `thinking_token_budget` hotfix is now opt-in (`DSPARK_ENABLE_ISSUE31_GPU_HOTFIX`, default `0` = stock V2)**. Compose still mounts `patches/hotfix-dsv4-issue31-v2-thinking-budget-gpu.py` and start still syncs it to the worker, but the entrypoint only runs it when the flag is exactly `1` (fail-closed). Fresh clones omit `thinking_token_budget`; leaving the patch on by default reproduced the omit-field decode cliff. Start smoke omits the field unless the flag is on. Set `1` and recreate containers if a client needs the budget field.

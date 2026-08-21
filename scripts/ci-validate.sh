@@ -19,6 +19,7 @@ for f in \
   smoke-deepseek-v4-flash-dspark.sh \
   scripts/ci-validate.sh \
   scripts/verify-overlay-sources.sh \
+  scripts/test-nccl-fabric-passthrough.sh \
   patches/*.sh
 do
   [ -e "$f" ] || continue
@@ -73,6 +74,8 @@ python3 scripts/verify-dsv4-027-equality-gate.py
 ok "verify-dsv4-027-equality-gate"
 bash scripts/verify-overlay-sources.sh
 ok "verify-overlay-sources"
+bash scripts/test-nccl-fabric-passthrough.sh -q
+ok "test-nccl-fabric-passthrough"
 
 echo "== recipe guards (do not re-ship known regressions) =="
 
