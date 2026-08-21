@@ -148,6 +148,13 @@ services:
       MASTER_PORT: "${MASTER_PORT:-25000}"
       # Checkpoint dspark_block_size is 5; k<5 truncates draft blocks (silent on 0.25.2 image).
       MTP_NUM_TOKENS: "${MTP_NUM_TOKENS:-5}"
+      # DSpark draft sampling. Default "probabilistic" = the value this compose
+      # hardcoded before; the official model cards ship "greedy" with k=7
+      # (issue #84). Consumed by the --speculative-config line below, not a
+      # vLLM env registry key. The entrypoint rejects anything but
+      # probabilistic/greedy before building --speculative-config, so the raw
+      # value never reaches the JSON.
+      DRAFT_SAMPLE_METHOD: "${DRAFT_SAMPLE_METHOD:-probabilistic}"
       DEFAULT_THINKING: "${DEFAULT_THINKING:-low}"
       DSPARK_SKIP_HOTFIX: "${DSPARK_SKIP_HOTFIX:-0}"
       DSPARK_SKIP_ISSUE22_HOTFIX: "${DSPARK_SKIP_ISSUE22_HOTFIX:-0}"
@@ -206,7 +213,11 @@ services:
           export VLLM_PLUGINS="$${VLLM_PLUGINS:-gb10_hybrid_nvfp4}";
           VLLM_QUANTIZATION_ARGS="--quantization modelopt_gb10_hybrid";
         fi;
-        SPECULATIVE_CONFIG="{\"method\":\"dspark\",\"num_speculative_tokens\":$${MTP_NUM_TOKENS:-5},\"draft_sample_method\":\"probabilistic\"}";
+        case "$${DRAFT_SAMPLE_METHOD:-probabilistic}" in
+          probabilistic|greedy) DRAFT_SAMPLE_METHOD="$${DRAFT_SAMPLE_METHOD:-probabilistic}" ;;
+          *) echo "DRAFT_SAMPLE_METHOD must be one of: probabilistic, greedy (got: $${DRAFT_SAMPLE_METHOD})" >&2; exit 2 ;;
+        esac;
+        SPECULATIVE_CONFIG="{\"method\":\"dspark\",\"num_speculative_tokens\":$${MTP_NUM_TOKENS:-5},\"draft_sample_method\":\"$${DRAFT_SAMPLE_METHOD}\"}";
         case "$${DEFAULT_THINKING:-low}" in
           off) DEFAULT_CHAT_TEMPLATE_KWARGS='{"thinking":false}' ;;
           low) DEFAULT_CHAT_TEMPLATE_KWARGS='{"thinking":true,"reasoning_effort":"low"}' ;;
