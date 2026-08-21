@@ -89,13 +89,137 @@ else
   bad "command substitution payload: rc=$RC canary_exists=$([ -e "$canary" ] && echo yes || echo no)"
 fi
 
-# validate-dspark-config.sh must enforce the same contract before compose runs.
+# ---------------------------------------------------------------------------
+# Layer 2: validate-dspark-config.sh, executed rather than grepped.
+#
+# The pre-flight validator must enforce the same contract before compose runs,
+# and must report the *resolved* value rather than a hardcoded one. Both are
+# observable by running it against a stub env file, so assert on behavior.
 VAL="$ROOT/validate-dspark-config.sh"
-if grep -q 'DRAFT_SAMPLE_METHOD must be one of: probabilistic, greedy' "$VAL" \
-  && grep -q 'draft_sample_method=\${DRAFT_SAMPLE_METHOD}' "$VAL"; then
-  ok "validate-dspark-config.sh enforces the same contract and reports the resolved value"
+val_env="$tmp/val.env"
+
+write_val_env() { # $1 = optional DRAFT_SAMPLE_METHOD assignment line
+  {
+    echo 'WORKER_HOST=stub-worker'
+    echo 'MASTER_ADDR=127.0.0.1'
+    echo 'MASTER_PORT=29500'
+    echo 'DSPARK_VLLM_IMAGE=stub:latest'
+    if [ "$#" -eq 1 ]; then printf '%s\n' "$1"; fi
+  } >"$val_env"
+}
+
+run_val() {
+  VRC=0
+  VOUT="$(ENV_FILE="$val_env" COMPOSE_FILE="$COMPOSE" bash "$VAL" 2>"$tmp/val.err")" || VRC=$?
+  VERR="$(cat "$tmp/val.err")"
+}
+
+# The validator ends by shelling out to `docker compose config`; that layer is
+# not what these cases are about, so accept any rc except the contract's own 2
+# and assert on the resolved-value summary, which is printed before it.
+val_accepts() { # $1=label $2=env-line ('' for unset) $3=expected resolved value
+  if [ -n "$2" ]; then write_val_env "$2"; else write_val_env; fi
+  run_val
+  if [ "$VRC" -ne 2 ] && printf '%s\n' "$VOUT" | grep -Fq "draft_sample_method=$3"; then
+    ok "$1"
+  else
+    bad "$1: rc=$VRC resolved=$(printf '%s\n' "$VOUT" | grep -Fo 'draft_sample_method=.*' || echo none)"
+  fi
+}
+
+val_rejects() { # $1=label $2=env-line
+  write_val_env "$2"
+  run_val
+  if [ "$VRC" -eq 2 ] \
+    && printf '%s\n' "$VERR" | grep -Fq 'DRAFT_SAMPLE_METHOD must be one of: probabilistic, greedy' \
+    && ! printf '%s\n' "$VOUT" | grep -Fq 'draft_sample_method='; then
+    ok "$1"
+  else
+    bad "$1: rc=$VRC (want 2) err=$VERR"
+  fi
+}
+
+val_accepts "validator: unset resolves to probabilistic" '' 'probabilistic'
+val_accepts "validator: empty resolves to probabilistic" 'DRAFT_SAMPLE_METHOD=' 'probabilistic'
+val_accepts "validator: explicit probabilistic reported as probabilistic" 'DRAFT_SAMPLE_METHOD=probabilistic' 'probabilistic'
+val_accepts "validator: greedy reported as greedy (not the old hardcoded value)" 'DRAFT_SAMPLE_METHOD=greedy' 'greedy'
+val_rejects "validator: invalid enum exits 2 before any summary" 'DRAFT_SAMPLE_METHOD=random'
+val_rejects "validator: case variant exits 2" 'DRAFT_SAMPLE_METHOD=Greedy'
+val_rejects "validator: duplicate-key payload exits 2" 'DRAFT_SAMPLE_METHOD='"'"'probabilistic","num_speculative_tokens":9999,"draft_sample_method":"greedy'"'"''
+
+# ---------------------------------------------------------------------------
+# Layer 3: the real rendered Compose expansion + entrypoint gate.
+#
+# Layer 1 runs a fragment lifted out of the compose file with sed, which proves
+# the gate logic but not that a value survives `.env` parsing and `${VAR:-...}`
+# interpolation intact. Compose applies its own escape processing (a
+# double-quoted `\n` in .env becomes a real newline), so the value the
+# entrypoint sees is not always the value the operator typed. This layer writes
+# a real .env, renders it with `docker compose config`, takes the gate straight
+# out of the rendered entrypoint, and runs it under the rendered environment.
+if docker compose version >/dev/null 2>&1; then
+  cat >"$tmp/rendered.py" <<'PYEOF'
+import json, os, subprocess, sys
+
+compose, envfile, want_rc, want_out = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+
+env = {k: v for k, v in os.environ.items() if k not in ("NODE_RANK", "HEADLESS")}
+env.update(COMPOSE_DISABLE_ENV_FILE="1", NODE_RANK="0")
+p = subprocess.run(
+    ["docker", "compose", "--env-file", envfile, "-f", compose, "config", "--format", "json"],
+    capture_output=True, text=True, env=env, cwd=os.path.dirname(compose),
+)
+if p.returncode != 0:
+    print("render failed: " + p.stderr.strip().splitlines()[-1:][0] if p.stderr.strip() else "render failed")
+    sys.exit(1)
+
+svc = list(json.loads(p.stdout)["services"].values())[0]
+rendered_env, script = svc["environment"], svc["command"][2]
+
+start = script.find('case "$${DRAFT_SAMPLE_METHOD')
+spec = script.find("SPECULATIVE_CONFIG=", start)
+end = script.find('; case "$${DEFAULT_THINKING', spec)
+if min(start, spec, end) < 0:
+    print("could not locate the gate in the rendered entrypoint")
+    sys.exit(1)
+# `$$` is compose's escape for a literal `$`; the container gets a single `$`.
+gate = script[start:end + 1].replace("$$", "$") + '\nprintf %s "$SPECULATIVE_CONFIG"\n'
+
+run_env = {"PATH": env.get("PATH", "")}
+for key in ("DRAFT_SAMPLE_METHOD", "MTP_NUM_TOKENS"):
+    val = rendered_env.get(key)
+    if val is not None:
+        run_env[key] = val
+
+r = subprocess.run(["bash", "-c", gate], capture_output=True, text=True, env=run_env)
+if r.returncode == want_rc and (want_rc != 0 or r.stdout == want_out) and (want_rc == 0 or not r.stdout):
+    sys.exit(0)
+print("rc=%d (want %d) rendered=%r out=%r" % (r.returncode, want_rc, rendered_env.get("DRAFT_SAMPLE_METHOD"), r.stdout))
+sys.exit(1)
+PYEOF
+
+  rendered_case() { # $1=label $2=env-line ('' for unset) $3=want-rc $4=want-json
+    if [ -n "$2" ]; then write_val_env "$2"; else write_val_env; fi
+    if detail="$(python3 "$tmp/rendered.py" "$COMPOSE" "$val_env" "$3" "$4" 2>&1)"; then
+      ok "$1"
+    else
+      bad "$1: $detail"
+    fi
+  }
+
+  rendered_case "rendered: unset -> exact old hardcoded JSON" '' 0 "$OLD_DEFAULT"
+  rendered_case "rendered: empty -> exact old hardcoded JSON" 'DRAFT_SAMPLE_METHOD=' 0 "$OLD_DEFAULT"
+  rendered_case "rendered: probabilistic -> old JSON" 'DRAFT_SAMPLE_METHOD=probabilistic' 0 "$OLD_DEFAULT"
+  rendered_case "rendered: greedy -> greedy JSON" 'DRAFT_SAMPLE_METHOD=greedy' 0 "$GREEDY_JSON"
+  rendered_case "rendered: .env double quotes stripped, greedy still accepted" 'DRAFT_SAMPLE_METHOD="greedy"' 0 "$GREEDY_JSON"
+  rendered_case "rendered: invalid enum rejected" 'DRAFT_SAMPLE_METHOD=random' 2 ''
+  rendered_case "rendered: compose-expanded newline escape rejected" 'DRAFT_SAMPLE_METHOD="probabilistic\ngreedy"' 2 ''
+  rendered_case "rendered: backslash value rejected" 'DRAFT_SAMPLE_METHOD=gree\dy' 2 ''
+  rendered_case "rendered: JSON escape alias rejected" "DRAFT_SAMPLE_METHOD='gree\\u0064y'" 2 ''
+  rendered_case "rendered: embedded double quote rejected" "DRAFT_SAMPLE_METHOD='gre\"edy'" 2 ''
+  rendered_case "rendered: duplicate-key payload rejected" 'DRAFT_SAMPLE_METHOD='"'"'probabilistic","num_speculative_tokens":9999,"draft_sample_method":"greedy'"'"'' 2 ''
 else
-  bad "validate-dspark-config.sh missing the DRAFT_SAMPLE_METHOD contract or resolved-value report"
+  say "SKIP rendered-compose layer (docker compose unavailable); layers 1-2 still cover the contract"
 fi
 
 printf 'RESULT: %d passed, %d failed\n' "$pass" "$fail"
