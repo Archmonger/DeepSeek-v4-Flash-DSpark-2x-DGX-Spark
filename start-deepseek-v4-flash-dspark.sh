@@ -86,11 +86,24 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 _dspark_env_clean="$(mktemp)"
 chmod 600 "$_dspark_env_clean"
+# DSPARK_API_KEYS ambient guard (begin)
+_dspark_ambient_has=0
+_dspark_ambient_keys=""
+if [ -n "${DSPARK_API_KEYS+x}" ]; then
+  _dspark_ambient_has=1
+  _dspark_ambient_keys="$DSPARK_API_KEYS"
+fi
+unset DSPARK_API_KEYS
 sed $'1s/^\xEF\xBB\xBF//; s/\r$//' "$ENV_FILE" > "$_dspark_env_clean"
 set -a
 # shellcheck disable=SC1090
 source "$_dspark_env_clean"
 set +a
+if [ "$_dspark_ambient_has" = "1" ] && [ "$_dspark_ambient_keys" != "${DSPARK_API_KEYS:-}" ]; then
+  echo "error: DSPARK_API_KEYS is set in the environment but does not match .env.dspark; set it only in .env.dspark" >&2
+  exit 2
+fi
+# DSPARK_API_KEYS ambient guard (end)
 COMPOSE_ENV_FILE="$_dspark_env_clean"
 
 # Vision mode flag selects 0731 GPU util (and whether the VL sidecar starts).
@@ -164,10 +177,51 @@ if [[ "$URL_HOST" == *:* && "$URL_HOST" != \[*\] ]]; then
 fi
 API_URL="${API_URL:-http://$URL_HOST:$VLLM_PORT/v1/models}"
 CHAT_URL="${CHAT_URL:-http://$URL_HOST:$VLLM_PORT/v1/chat/completions}"
+# DSPARK_API_KEYS auth (begin)
 AUTH_HEADER_ARGS=()
+case "${DSPARK_API_KEYS:-}" in
+  *[$'\r\n\v\f']*)
+    echo "error: DSPARK_API_KEYS must be a single-line space-separated list" >&2
+    exit 2
+    ;;
+  *\\*)
+    echo "error: DSPARK_API_KEYS must not contain backslashes" >&2
+    exit 2
+    ;;
+esac
+_dspark_keys_set=0
+case "${DSPARK_API_KEYS:-}" in
+  *[!$' \t']*) _dspark_keys_set=1 ;;
+esac
+if [ -n "${VLLM_API_KEY:-}" ] && [ "$_dspark_keys_set" = "1" ]; then
+  # The server entrypoint refuses this combination too (exit 2); fail the same
+  # way here so a probe never guesses which variable the server honoured.
+  echo "error: VLLM_API_KEY and DSPARK_API_KEYS are both set; set exactly one of them" >&2
+  exit 2
+fi
 if [ -n "${VLLM_API_KEY:-}" ]; then
   AUTH_HEADER_ARGS=(-H "Authorization: Bearer $VLLM_API_KEY")
+elif [ "$_dspark_keys_set" = "1" ]; then
+  _dspark_keys=()
+  read -r -a _dspark_keys <<< "${DSPARK_API_KEYS}"
+  for _dspark_key in "${_dspark_keys[@]}"; do
+    case "$_dspark_key" in
+      -*) echo "error: DSPARK_API_KEYS contains a token beginning with '-'" >&2; exit 2 ;;
+    esac
+  done
+  # Multi-key auth via --api-key: probe with the first parsed key. Without this
+  # the health poll never sees a 200 against a keyed server and waits out its
+  # full timeout on a cluster that is actually serving.
+  AUTH_HEADER_ARGS=(-H "Authorization: Bearer ${_dspark_keys[0]}")
 fi
+# DSPARK_API_KEYS auth (end)
+
+# DSPARK redaction pre-flight (begin)
+if { [ "$_dspark_keys_set" = "1" ] || [ -n "${VLLM_API_KEY:-}" ]; } && [ ! -f "$SCRIPT_DIR/patches/hotfix-vllm-redact-api-key-log.sh" ]; then
+  echo "error: API keys are configured but patches/hotfix-vllm-redact-api-key-log.sh is missing; keyed starts require the startup-log redaction hotfix" >&2
+  exit 1
+fi
+# DSPARK redaction pre-flight (end)
 
 : "${WORKER_HOST:?WORKER_HOST must be set in $ENV_FILE}"
 : "${MASTER_ADDR:?MASTER_ADDR must be set in $ENV_FILE}"
@@ -609,7 +663,7 @@ if [ -f "$DSPARK_SPIN_WAIT_HOTFIX" ]; then
   scp "$DSPARK_SPIN_WAIT_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-gb10-spin-wait.sh"
 fi
 # DSV4 v0.27 .sh hotfixes — entrypoint applies them before exec vllm (issue #38).
-for _hf_sync in hotfix-dsv4-mtp-buffer-50312.sh hotfix-dsv4-adaptive-topk-50004.sh hotfix-dsv4-skip-topk-49486.sh hotfix-dsv4-dense-prefill-indexer-48407.sh hotfix-dsv4-skip-empty-c128-48957.sh hotfix-dsv4-flashmla-workspace-50298.sh hotfix-dsv4-grammar-advance.sh; do
+for _hf_sync in hotfix-dsv4-mtp-buffer-50312.sh hotfix-dsv4-adaptive-topk-50004.sh hotfix-dsv4-skip-topk-49486.sh hotfix-dsv4-dense-prefill-indexer-48407.sh hotfix-dsv4-skip-empty-c128-48957.sh hotfix-dsv4-flashmla-workspace-50298.sh hotfix-dsv4-grammar-advance.sh hotfix-vllm-redact-api-key-log.sh; do
   if [ -f "$SCRIPT_DIR/patches/$_hf_sync" ]; then
     echo "Syncing $_hf_sync to ${WORKER_HOST}:${WORKER_DIR}/patches/"
     ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"

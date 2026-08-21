@@ -22,10 +22,44 @@ case "$_dspark_host" in 0.0.0.0|::|"") _dspark_host=127.0.0.1 ;; esac
 CHAT_URL="${CHAT_URL:-http://${_dspark_host}:${VLLM_PORT:-8888}/v1/chat/completions}"
 
 MODEL="${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"
+# DSPARK_API_KEYS auth (begin)
 AUTH_HEADER_ARGS=()
+case "${DSPARK_API_KEYS:-}" in
+  *[$'\r\n\v\f']*)
+    echo "error: DSPARK_API_KEYS must be a single-line space-separated list" >&2
+    exit 2
+    ;;
+  *\\*)
+    echo "error: DSPARK_API_KEYS must not contain backslashes" >&2
+    exit 2
+    ;;
+esac
+_dspark_keys_set=0
+case "${DSPARK_API_KEYS:-}" in
+  *[!$' \t']*) _dspark_keys_set=1 ;;
+esac
+if [ -n "${VLLM_API_KEY:-}" ] && [ "$_dspark_keys_set" = "1" ]; then
+  # The server entrypoint refuses this combination too (exit 2); fail the same
+  # way here so a probe never guesses which variable the server honoured.
+  echo "error: VLLM_API_KEY and DSPARK_API_KEYS are both set; set exactly one of them" >&2
+  exit 2
+fi
 if [ -n "${VLLM_API_KEY:-}" ]; then
   AUTH_HEADER_ARGS=(-H "Authorization: Bearer $VLLM_API_KEY")
+elif [ "$_dspark_keys_set" = "1" ]; then
+  _dspark_keys=()
+  read -r -a _dspark_keys <<< "${DSPARK_API_KEYS}"
+  for _dspark_key in "${_dspark_keys[@]}"; do
+    case "$_dspark_key" in
+      -*) echo "error: DSPARK_API_KEYS contains a token beginning with '-'" >&2; exit 2 ;;
+    esac
+  done
+  # Multi-key auth via --api-key: probe with the first parsed key. Without this
+  # the health poll never sees a 200 against a keyed server and waits out its
+  # full timeout on a cluster that is actually serving.
+  AUTH_HEADER_ARGS=(-H "Authorization: Bearer ${_dspark_keys[0]}")
 fi
+# DSPARK_API_KEYS auth (end)
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 

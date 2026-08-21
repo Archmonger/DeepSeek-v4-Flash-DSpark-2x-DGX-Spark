@@ -17,6 +17,7 @@ for f in \
   validate-dspark-config.sh \
   prepare-dspark-model-cache.sh \
   smoke-deepseek-v4-flash-dspark.sh \
+  status-deepseek-v4-flash-dspark.sh \
   scripts/ci-validate.sh \
   scripts/verify-overlay-sources.sh \
   scripts/test-draft-sample-method-gate.sh \
@@ -42,6 +43,8 @@ py_files+=(
   scripts/test-spec-acceptance.py
   scripts/test-ruler-lite-pad.py
   scripts/test-env-normalisation.py
+  scripts/test-dspark-api-keys.py
+  scripts/test-redact-api-key-log.py
   scripts/ruler-lite.py
   scripts/verify-dsv4-027-equality-gate.py
 )
@@ -69,6 +72,10 @@ python3 scripts/test-ruler-lite-pad.py -q
 ok "test-ruler-lite-pad"
 python3 scripts/test-env-normalisation.py -q
 ok "test-env-normalisation"
+python3 scripts/test-dspark-api-keys.py -q
+ok "test-dspark-api-keys"
+python3 scripts/test-redact-api-key-log.py -q
+ok "test-redact-api-key-log"
 python3 tests/test_issue27_inflight_cap.py -q
 ok "test_issue27_inflight_cap"
 python3 scripts/verify-dsv4-027-equality-gate.py
@@ -202,7 +209,8 @@ for p in \
   patches/hotfix-nvfp4-ds-mla-issue22.sh \
   patches/hotfix-gb10-spin-wait.sh \
   patches/hotfix-dsv4-suppress-stops-in-reasoning.py \
-  patches/hotfix-dsv4-assistant-final-continuation.py
+  patches/hotfix-dsv4-assistant-final-continuation.py \
+  patches/hotfix-vllm-redact-api-key-log.sh
 do
   if [ -f "$p" ]; then
     ok "present $p"
@@ -210,6 +218,17 @@ do
     bad "missing required $p"
   fi
 done
+
+# Multi-key auth: keyed starts apply and verify redaction fail-closed outside
+# the optional performance-hotfix loop, while the worker sync keeps shipping it.
+if grep -Fq 'bash /opt/dspark-patches/hotfix-vllm-redact-api-key-log.sh || exit 1' docker-compose.dspark.yml \
+  && grep -Fq 'hotfix-vllm-redact-api-key-log.sh --status || exit 1' docker-compose.dspark.yml \
+  && ! grep -E 'for _hf in .*hotfix-vllm-redact-api-key-log.sh' docker-compose.dspark.yml >/dev/null \
+  && grep -E 'for _hf_sync in .*hotfix-vllm-redact-api-key-log.sh' start-deepseek-v4-flash-dspark.sh >/dev/null; then
+  ok "compose redaction gate is fail-closed and worker sync retains the patch"
+else
+  bad "redact-api-key-log must apply + verify outside the optional loop and remain in worker sync"
+fi
 
 if [ "$fail" -ne 0 ]; then
   echo "CI validate FAILED" >&2
