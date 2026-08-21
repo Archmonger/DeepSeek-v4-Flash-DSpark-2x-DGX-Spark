@@ -7,7 +7,12 @@
 # (exclude), then optional "=" (exact match instead of prefix match), then
 # comma-separated name[:port[:rail[:plane]]] tokens. An absent *or empty* port
 # field means any port; a non-empty one is atoi() (base 10, stops at the first
-# non-digit). Every selected member must validate against the preferred match IP
+# non-digit), and a port too wide for shell arithmetic is clamped rather than
+# evaluated, because $(( )) wraps modulo 2^64 and one such value wraps to the
+# -1 wildcard. The selector is applied to the candidate universe ncclIbInit
+# builds — ACTIVE ports with an Ethernet/InfiniBand link layer, capped at
+# MAX_IB_DEVS=32 — so a DOWN sibling port neither fails the resolve nor
+# constrains the index. Every selected member must validate against the match IP
 # or an IPv4 on its own netdev; a member with no usable RoCEv2 GID fails closed
 # (exit 1). Members are reconciled by intersecting their sets of usable indexes
 # — a member can have several, so an arbitrary per-member pick would report a
@@ -72,6 +77,16 @@ mk_gid() { # $1=root $2=dev $3=port $4=index $5=gid $6=type [$7=ndev]
   printf '%s\n' "$5" >"$d/gids/$4"
   printf '%s\n' "$6" >"$d/gid_attrs/types/$4"
   if [ -n "${7:-}" ]; then printf '%s\n' "$7" >"$d/gid_attrs/ndevs/$4"; fi
+}
+
+# Port attributes as the kernel exposes them ("4: ACTIVE" / "Ethernet"). Most
+# fixtures leave them absent on purpose: an unreadable attribute must not be
+# read as "inactive", so those ports stay candidates.
+mk_port_attr() { # $1=root $2=dev $3=port $4=state $5=link_layer
+  local d="$1/sys/class/infiniband/$2/ports/$3"
+  mkdir -p "$d"
+  printf '%s\n' "$4" >"$d/state"
+  printf '%s\n' "$5" >"$d/link_layer"
 }
 
 resolve() { # $1=root $2=fixture $3=spec $4=match-ip [$5=ssh-target]
@@ -183,6 +198,15 @@ expect_rc "explicit empty port field is a wildcard, not port 0" 3 "$pg" "$pgfx" 
 expect_rc "empty port field before a rail field is also a wildcard" 3 "$pg" "$pgfx" 'devP::2' '10.0.99.99'
 expect_idx "omitted port on a single-port match still resolves" 4 "$pg" "$pgfx" 'devP:1:0' '10.0.99.99'
 
+# A port field wider than shell arithmetic must not widen the selection. Left to
+# $(( )) the value wraps modulo 2^64, and 18446744073709551615 wraps to exactly
+# -1 — the "any port" wildcard. Ports 1/8/10 need different indexes here, so a
+# wildcard reading is observable as exit 3 while "matches nothing" is exit 1.
+expect_rc "port that wraps to the -1 wildcard is clamped, not evaluated" 1 "$pg" "$pgfx" 'devP:18446744073709551615' '10.0.99.99'
+expect_rc "absurdly wide port matches no real port" 1 "$pg" "$pgfx" 'devP:99999999999999999999999' '10.0.99.99'
+expect_rc "wide negative port matches no real port" 1 "$pg" "$pgfx" 'devP:-99999999999999999999999' '10.0.99.99'
+expect_idx "zero padding is not width (:0000000008 is still port 8)" 7 "$pg" "$pgfx" 'devP:0000000008' '10.0.99.99'
+
 # --- per-member index sets are intersected, not compared pairwise ---
 # Each member has two usable RoCEv2 indexes and they overlap on 5. Taking one
 # arbitrary winner per member picks 1 for devX and 3 for devY (lowest scanned
@@ -212,8 +236,80 @@ else
   bad "usable-set diagnostic wrong (rc=$rc): $err"
 fi
 
+# The match-IP preference must be observable, so both members carry the *same*
+# two usable indexes {1,5}: own-address validation alone supports 1 and 5 for
+# each, and only index 5 is reachable through the match IP. Lowest-index-wins
+# would answer 1; preferring a match-IP hit answers 5. (An intersection that
+# collapses to a single index cannot tell the two rules apart.)
+# 10.0.48.1 -> ...0a00:3001 ; 10.0.48.9 -> ...0a00:3009
+# 10.0.49.1 -> ...0a00:3101 ; 10.0.49.9 -> ...0a00:3109
+pref="$tmp/pref"
+preffx="$tmp/pref.fixture"
+mk_gid "$pref" devQ 1 1 '::ffff:0a00:3001' 'RoCE v2' enq1
+mk_gid "$pref" devQ 1 5 '::ffff:0a00:3009' 'RoCE v2' enq1
+mk_gid "$pref" devR 1 1 '::ffff:0a00:3101' 'RoCE v2' enr1
+mk_gid "$pref" devR 1 5 '::ffff:0a00:3109' 'RoCE v2' enr1
+printf '%s\n' 'enq1 10.0.48.1' 'enq1 10.0.48.9' 'enr1 10.0.49.1' 'enr1 10.0.49.9' >"$preffx"
+
+expect_idx "no match-ip hit: the intersection {1,5} takes its lowest index" 1 "$pref" "$preffx" '=devQ:1,devR:1' '10.0.99.99'
+expect_idx "match-ip hit is preferred over a lower own-addr index in the same intersection" 5 "$pref" "$preffx" '=devQ:1,devR:1' '10.0.48.9'
+
 # A match-IP hit inside the intersection is preferred over a lower own-addr one.
 expect_idx "match-ip index inside the intersection wins over a lower own-addr index" 5 "$x" "$xfx" '=devX:1,devY:1' '10.0.40.9'
+
+# --- candidate universe: ncclIbInit skips ports that are not ACTIVE or whose
+# link layer is neither Ethernet nor InfiniBand, and it does so *before*
+# applying NCCL_IB_HCA. These dual-port cards ship a DOWN sibling port, so
+# including it would fail a resolve NCCL itself completes.
+# 10.0.80.x -> ...0a00:50xx ; 10.0.81.1 -> ...0a00:5101 ; 10.0.82.1 -> ...0a00:5201
+cu="$tmp/candidates"
+cufx="$tmp/candidates.fixture"
+mk_gid "$cu" devS 1 3 '::ffff:0a00:5001' 'RoCE v2' ens1
+mk_port_attr "$cu" devS 1 '4: ACTIVE' 'Ethernet'
+mk_gid "$cu" devS 2 9 '::ffff:0a00:5002' 'RoCE v2' ens2
+mk_port_attr "$cu" devS 2 '1: DOWN' 'Ethernet'
+mk_gid "$cu" devT 1 7 '::ffff:0a00:5101' 'RoCE v2' ent1
+mk_port_attr "$cu" devT 1 '5: ACTIVE_DEFER' 'Ethernet'
+mk_gid "$cu" devU 1 6 '::ffff:0a00:5201' 'RoCE v2' enu1
+mk_port_attr "$cu" devU 1 '4: ACTIVE' 'Unknown'
+mk_gid "$cu" devV 1 2 '::ffff:0a00:5301' 'RoCE v2' env1
+printf '%s\n' 'ens1 10.0.80.1' 'ens2 10.0.80.2' 'ent1 10.0.81.1' 'enu1 10.0.82.1' 'env1 10.0.83.1' >"$cufx"
+
+expect_idx "DOWN sibling port is not a candidate (omitted port still resolves)" 3 "$cu" "$cufx" 'devS' '10.0.99.99'
+expect_rc "explicitly selecting a DOWN port matches nothing and fails closed" 1 "$cu" "$cufx" 'devS:2' '10.0.99.99'
+expect_rc "ACTIVE_DEFER is not IBV_PORT_ACTIVE" 1 "$cu" "$cufx" '=devT' '10.0.99.99'
+expect_rc "unsupported link layer is not a candidate" 1 "$cu" "$cufx" '=devU' '10.0.99.99'
+expect_idx "port without readable state attributes stays a candidate" 2 "$cu" "$cufx" '=devV' '10.0.99.99'
+
+# The "matched nothing" FATAL must say why, or a DOWN port looks like a typo.
+rc=0
+err="$(resolve "$cu" "$cufx" 'devS:2' '10.0.99.99' 2>&1 >/dev/null)" || rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'not ACTIVE' && printf '%s' "$err" | grep -q 'devS:2'; then
+  ok "skipped-candidate diagnostic names the non-ACTIVE port"
+else
+  bad "candidate diagnostic wrong (rc=$rc): $err"
+fi
+
+# NCCL keeps at most MAX_IB_DEVS=32 entries and ignores the rest, so the
+# resolved index must describe those 32 and not a 33rd device NCCL never opens.
+# 10.0.90.1 -> ...0a00:5a01
+cap="$tmp/maxdevs"
+capfx="$tmp/maxdevs.fixture"
+: >"$capfx"
+for i in $(seq -w 1 32); do
+  mk_gid "$cap" "dev$i" 1 4 '::ffff:0a00:5a01' 'RoCE v2'
+done
+mk_gid "$cap" dev33 1 9 '::ffff:0a00:5a01' 'RoCE v2'
+
+expect_idx "selection is capped at MAX_IB_DEVS=32, mirroring NCCL" 4 "$cap" "$capfx" 'dev' '10.0.90.1'
+rc=0
+err="$(resolve "$cap" "$capfx" 'dev' '10.0.90.1' 2>&1 >/dev/null)" || rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q 'truncated at MAX_IB_DEVS=32' \
+  && printf '%s' "$err" | grep -q 'dev33:1'; then
+  ok "MAX_IB_DEVS truncation is reported with the ignored member"
+else
+  bad "cap diagnostic wrong (rc=$rc): $err"
+fi
 
 # --- independent head/worker layouts in one run (ssh transport path) ---
 expect_idx "head layout resolves independently" 3 "$h" "$hfx" '=devA,devB' '10.0.22.1'

@@ -253,8 +253,17 @@ iface_ipv4() {
 # -1, i.e. any port - "devA" and "devA:" select the same thing. A non-empty port
 # field is atoi(): optional blanks and sign, then leading decimal digits,
 # stopping at the first non-digit. So ":08" is port 8 (atoi is base 10, never
-# octal) and ":abc" is 0, which matches no real port. Only the port field takes
-# part in matching here; rail/plane are parsed off and ignored.
+# octal) and ":abc" is 0, which matches no real port. A port too wide for shell
+# arithmetic is clamped instead of evaluated, because $(( )) wraps modulo 2^64
+# and one such value (18446744073709551615) wraps to -1, the "any port"
+# wildcard. Only the port field takes part in matching here; rail/plane are
+# parsed off and ignored.
+#
+# The selector is applied to the same candidate universe ncclIbInit builds:
+# only ACTIVE ports whose link layer is Ethernet or InfiniBand, capped at
+# MAX_IB_DEVS=32 entries. Both filters run before NCCL_IB_HCA, so a DOWN
+# sibling port (common on these dual-port cards) neither fails the resolve nor
+# constrains the index - NCCL never opens it either.
 #
 # The resolver below mirrors those semantics on the node that owns the sysfs
 # tree, validates every selected member against its own local address (one
@@ -297,12 +306,27 @@ for tok in "$@"; do
     # instead of becoming a bad (or wrong) octal literal.
     if [ -n "$p" ]; then
       digits=$(printf '%s' "$p" | sed -n 's/^[[:space:]]*\([+-]\{0,1\}[0-9][0-9]*\).*/\1/p')
-      case "$digits" in
-        '') port=0 ;;
-        -*) port=$(( 0 - 10#${digits#-} )) ;;
-        +*) port=$(( 10#${digits#+} )) ;;
-        *)  port=$(( 10#$digits )) ;;
-      esac
+      sign=
+      mag=$digits
+      case "$mag" in -*) sign=-; mag=${mag#-} ;; +*) mag=${mag#+} ;; esac
+      # Strip leading zeros so the width test below measures the magnitude and
+      # not the padding ("0000008" is one digit wide).
+      while :; do
+        case "$mag" in 0?*) mag=${mag#0} ;; *) break ;; esac
+      done
+      if [ -z "$mag" ]; then
+        port=0
+      elif [ ${#mag} -gt 9 ]; then
+        # Wider than shell arithmetic can carry. Left to $(( )) the value wraps
+        # modulo 2^64 - and 18446744073709551615 wraps to exactly -1, which is
+        # the "any port" wildcard - so an unrepresentable port would silently
+        # *widen* the selection. Clamp to a value no sysfs port can have: the
+        # token then matches nothing and the resolve fails closed.
+        port=${sign}999999999
+      else
+        port=$(( 10#$mag ))
+        [ -z "$sign" ] || port=$(( 0 - port ))
+      fi
     fi
   ;; esac
   [ -n "$name" ] || continue
@@ -341,17 +365,47 @@ ipv4_hex() { # a.b.c.d -> aabb:ccdd
   printf '%02x%02x:%02x%02x' "$1" "$2" "$3" "$4"
 }
 
+# Candidate universe, mirroring ncclIbInit: a port is a candidate only when it
+# is ACTIVE and its link layer is Ethernet or InfiniBand, and both tests happen
+# *before* NCCL_IB_HCA is applied. A DOWN sibling port therefore cannot be
+# selected into a fail-closed error or drag the index intersection, exactly as
+# NCCL never opens it. An attribute that cannot be read is not evidence of
+# inactivity, so the port stays a candidate. NCCL then keeps at most
+# MAX_IB_DEVS entries and ignores the rest; the cap is mirrored here so the
+# resolved index describes the devices NCCL will actually use.
+max_ib_devs=32
 selected=""
+nsel=0
+skipped_state=""
+skipped_link=""
+capped=""
 for dev in $(ls "$sysroot" 2>/dev/null); do
   [ -d "$sysroot/$dev/ports" ] || continue
   for port in $(ls "$sysroot/$dev/ports" 2>/dev/null); do
+    st=$(cat "$sysroot/$dev/ports/$port/state" 2>/dev/null || true)
+    st=${st#*: }
+    case "$st" in
+      ''|ACTIVE) : ;;
+      *) skipped_state="$skipped_state $dev:$port($st)"; continue ;;
+    esac
+    ll=$(cat "$sysroot/$dev/ports/$port/link_layer" 2>/dev/null || true)
+    case "$ll" in
+      ''|Ethernet|InfiniBand) : ;;
+      *) skipped_link="$skipped_link $dev:$port($ll)"; continue ;;
+    esac
     if pair_matches "$dev" "$port"; then m=1; else m=0; fi
     [ "$m" -ne "$search_not" ] || continue
+    if [ "$nsel" -ge "$max_ib_devs" ]; then capped="$capped $dev:$port"; continue; fi
     selected="$selected $dev:$port"
+    nsel=$((nsel + 1))
   done
 done
+[ -z "$capped" ] || echo "  note: selection truncated at MAX_IB_DEVS=$max_ib_devs; NCCL ignores:$capped" >&2
 if [ -z "$selected" ]; then
-  echo "FATAL: NCCL_IB_HCA selector matched no local HCA/port under $sysroot (selector: $orig_spec)" >&2
+  why=""
+  [ -z "$skipped_state" ] || why="$why; not ACTIVE:$skipped_state"
+  [ -z "$skipped_link" ] || why="$why; unsupported link layer:$skipped_link"
+  echo "FATAL: NCCL_IB_HCA selector matched no candidate HCA/port under $sysroot (selector: $orig_spec)$why" >&2
   exit 1
 fi
 
