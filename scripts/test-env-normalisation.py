@@ -1,273 +1,189 @@
 #!/usr/bin/env python3
-"""Unit tests for the .env.dspark normalisation and worker-copy hardening in
-start-deepseek-v4-flash-dspark.sh.
-
-CPU-only; no GPU, no network, no real worker. The env-loading block and the
-remote-write line are lifted verbatim from the launcher so the tests exercise
-the shipped code rather than a copy of it.
-
-    python3 scripts/test-env-normalisation.py -q
-"""
+"""CPU regressions for env normalization and private worker publication."""
 import os
-import re
+import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
+from pathlib import Path
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LAUNCHER = os.path.join(ROOT, "start-deepseek-v4-flash-dspark.sh")
-
-
-def _extract(start_marker: str, end_marker: str) -> str:
-    """Pull a verbatim block out of the launcher so tests can't drift from it."""
-    with open(LAUNCHER, encoding="utf-8") as fh:
-        src = fh.read()
-    i = src.index(start_marker)
-    j = src.index(end_marker, i) + len(end_marker)
-    return src[i:j]
+ROOT = Path(__file__).resolve().parents[1]
+LAUNCHER = ROOT / "start-deepseek-v4-flash-dspark.sh"
+SOURCE = LAUNCHER.read_text()
 
 
-ENV_BLOCK = _extract('_dspark_env_clean="$(mktemp)"', "trap - EXIT HUP INT TERM")
-def _extract_remote_write() -> str:
-    """The worker-copy pipeline: the `sed` that feeds the ssh write.
-
-    Anchored on the ssh invocation (stable) and bounded by the end of its logical
-    line, so changing the *mode* or the redirect target still yields a runnable
-    block and produces a clean test failure rather than an extraction crash.
-    """
-    with open(LAUNCHER, encoding="utf-8") as fh:
-        src = fh.read()
-    j = src.index('| ssh "$WORKER_HOST" "umask 077;')
-    i = src.rindex("sed $'", 0, j)
-    end = src.index("\n", j)
-    return src[i:end]
+def extract_before(start: str, end: str) -> str:
+    i = SOURCE.index(start)
+    return SOURCE[i:SOURCE.index(end, i)]
 
 
-REMOTE_WRITE = _extract_remote_write()
+ENV_BLOCK = extract_before("_dspark_env_clean=", "# Vision mode flag")
+PUBLISH_BLOCK = extract_before("# Stream into a private sibling", "SIDECAR_COMPOSE_FILE=")
 
 
-def run_env_block(content: bytes, extra: str = "") -> subprocess.CompletedProcess:
-    """Source `content` through the launcher's normalisation block."""
-    d = tempfile.mkdtemp()
-    env_file = os.path.join(d, ".env.dspark")
-    with open(env_file, "wb") as f:
-        f.write(content)
+def run_env(content: bytes, extra: str = "") -> subprocess.CompletedProcess:
+    workdir = Path(tempfile.mkdtemp())
+    tmpdir = workdir / "tmp"
+    tmpdir.mkdir()
+    env_file = workdir / ".env.dspark"
+    env_file.write_bytes(content)
     script = f"""set -euo pipefail
-ENV_FILE={env_file!r}
+export TMPDIR={shlex.quote(str(tmpdir))}
+ENV_FILE={shlex.quote(str(env_file))}
 {ENV_BLOCK}
-printf 'WORKER_HOST=%q\\nVLLM_PORT=%q\\n' "${{WORKER_HOST:-<unset>}}" "${{VLLM_PORT:-<unset>}}"
+printf 'WORKER_HOST=%q\nVLLM_PORT=%q\n' "${{WORKER_HOST:-<unset>}}" "${{VLLM_PORT:-<unset>}}"
 {extra}
 """
-    p = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
-    p.env_file = env_file  # type: ignore[attr-defined]
-    p.workdir = d          # type: ignore[attr-defined]
-    return p
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    result.operator_bytes = env_file.read_bytes()  # type: ignore[attr-defined]
+    result.leftovers = sorted(path.name for path in tmpdir.iterdir())  # type: ignore[attr-defined]
+    shutil.rmtree(workdir)
+    return result
 
 
-class TestEnvNormalisation(unittest.TestCase):
-    def test_plain_file_unaffected(self):
-        p = run_env_block(b"WORKER_HOST=10.0.0.2\nVLLM_PORT=8888\n")
-        self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("WORKER_HOST=10.0.0.2", p.stdout)
-        self.assertIn("VLLM_PORT=8888", p.stdout)
+def write_executable(path: Path, content: str) -> None:
+    path.write_text(content)
+    path.chmod(0o755)
 
-    def test_utf8_bom(self):
-        # A BOM lands on line 1, so an unnormalised source tries to execute it.
-        p = run_env_block(b"\xef\xbb\xbf# cluster (head)\nWORKER_HOST=10.0.0.2\nVLLM_PORT=8888\n")
-        self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("WORKER_HOST=10.0.0.2", p.stdout)
 
-    def test_crlf_with_blank_lines(self):
-        # Blank CRLF lines abort an unnormalised source with $'\r': command not found.
-        p = run_env_block(b"WORKER_HOST=10.0.0.2\r\n\r\nVLLM_PORT=8888\r\n")
-        self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("WORKER_HOST=10.0.0.2", p.stdout)
+class EnvNormalisationTest(unittest.TestCase):
+    def test_plain_file(self):
+        result = run_env(b"WORKER_HOST=10.0.0.2\nVLLM_PORT=8888\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("WORKER_HOST=10.0.0.2", result.stdout)
+        self.assertIn("VLLM_PORT=8888", result.stdout)
+        self.assertEqual(result.leftovers, [])
 
-    def test_crlf_without_blank_lines_is_not_silently_corrupted(self):
-        # The dangerous case: unnormalised this returns rc=0 with a trailing \r
-        # riding inside the value.
-        p = run_env_block(b"WORKER_HOST=10.0.0.2\r\nVLLM_PORT=8888\r\n")
-        self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("WORKER_HOST=10.0.0.2", p.stdout)
-        self.assertNotIn("\\r", p.stdout)
+    def test_bom_crlf_and_private_compose_snapshot(self):
+        result = run_env(
+            b"\xef\xbb\xbfWORKER_HOST=10.0.0.2\r\n\r\nVLLM_PORT=8888\r\n",
+            'printf "MODE=%s\\n" "$(stat -c %a "$COMPOSE_ENV_FILE")"; cat "$COMPOSE_ENV_FILE"',
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("WORKER_HOST=10.0.0.2", result.stdout)
+        self.assertIn("MODE=600", result.stdout)
+        self.assertNotIn("\r", result.stdout)
+        self.assertNotIn("\ufeff", result.stdout)
+        self.assertEqual(result.leftovers, [])
 
-    def test_bom_and_crlf_combined(self):
-        p = run_env_block(b"\xef\xbb\xbfWORKER_HOST=10.0.0.2\r\n\r\nVLLM_PORT=8888\r\n")
-        self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("WORKER_HOST=10.0.0.2", p.stdout)
-        self.assertNotIn("\\r", p.stdout)
-
-    def test_operator_file_is_not_rewritten(self):
+    def test_operator_file_is_unchanged(self):
         raw = b"\xef\xbb\xbfWORKER_HOST=10.0.0.2\r\nVLLM_PORT=8888\r\n"
-        p = run_env_block(raw)
-        self.assertEqual(p.returncode, 0, p.stderr)
-        with open(p.env_file, "rb") as fh:
-            after = fh.read()
-        self.assertEqual(after, raw,
-                         "the operator's .env.dspark must be left byte-identical")
+        result = run_env(raw)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.operator_bytes, raw)
 
-    def test_temp_copy_removed_on_success(self):
-        p = run_env_block(b"WORKER_HOST=10.0.0.2\n", extra='echo "LEFTOVER=$(ls /tmp/tmp.* 2>/dev/null | wc -l)"')
-        self.assertEqual(p.returncode, 0, p.stderr)
-        # the block clears its own trap, so the copy is gone before we look
-        self.assertNotIn("_dspark_env_clean", p.stdout)
+    def test_source_failure_preserves_status_and_cleans(self):
+        result = run_env(b"WORKER_HOST=(unbalanced\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.leftovers, [])
 
-    def test_temp_copy_removed_when_source_fails(self):
-        # A syntax error inside the env file makes `source` fail under set -e.
-        # The secret-bearing copy must not be left behind in TMPDIR.
-        d = tempfile.mkdtemp()
-        tmpdir = os.path.join(d, "tmp"); os.makedirs(tmpdir)
-        env_file = os.path.join(d, ".env.dspark")
-        with open(env_file, "w") as f:
-            f.write("WORKER_HOST=(unbalanced\n")
+    def test_explicit_exit_preserves_status_and_cleans(self):
+        result = run_env(b"exit 7\n")
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.leftovers, [])
+
+    def test_signals_terminate_and_clean(self):
+        for signal, status in (("HUP", 129), ("INT", 130), ("TERM", 143)):
+            with self.subTest(signal=signal):
+                result = run_env(f"kill -{signal} $$\n".encode())
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(result.leftovers, [])
+
+    def test_cleanup_is_armed_before_mktemp(self):
+        self.assertLess(ENV_BLOCK.index("trap _cleanup_dspark_env EXIT"),
+                        ENV_BLOCK.index("mktemp"))
+
+    def test_all_local_compose_calls_use_normalized_snapshot(self):
+        self.assertNotIn('--env-file "$ENV_FILE"', SOURCE)
+        self.assertIn('docker compose -p "$PROJECT_NAME" --env-file "$COMPOSE_ENV_FILE"', SOURCE)
+        self.assertIn('--env-file "$COMPOSE_ENV_FILE" -f "$SIDECAR_COMPOSE_FILE" up -d', SOURCE)
+        self.assertIn('--env-file "$COMPOSE_ENV_FILE" -f "$SIDECAR_COMPOSE_FILE" logs', SOURCE)
+
+
+class WorkerPublishTest(unittest.TestCase):
+    def run_publish(self, *, space=False, fail_cat=False, fail_mv=False):
+        workdir = Path(tempfile.mkdtemp(prefix="worker publish " if space else "worker-publish-"))
+        bindir = workdir / "bin"
+        bindir.mkdir()
+        worker_dir = workdir / "remote dir" if space else workdir / "remote"
+        worker_dir.mkdir()
+        source = workdir / "normalized.env"
+        source.write_text("VLLM_API_KEY=secret\n")
+        source.chmod(0o600)
+        final = worker_dir / ".env.dspark"
+        final.write_text("OLD=1\n")
+        final.chmod(0o644)
+        before_log = workdir / "before.log"
+
+        write_executable(bindir / "ssh", """#!/usr/bin/env bash
+set -euo pipefail
+shift
+exec bash -c "$*"
+""")
+        write_executable(bindir / "cat", """#!/usr/bin/env bash
+set -euo pipefail
+if [ "${FAIL_CAT:-0}" = 1 ]; then
+  IFS= read -r -n 4 partial || true
+  printf %s "$partial"
+  exit 7
+fi
+exec /bin/cat "$@"
+""")
+        write_executable(bindir / "mv", """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s:%s\n' "$(/bin/cat "$FINAL_PATH")" "$(stat -c %a "$FINAL_PATH")" > "$BEFORE_LOG"
+[ "${FAIL_MV:-0}" != 1 ] || exit 9
+exec /bin/mv "$@"
+""")
+
         script = f"""set -euo pipefail
-export TMPDIR={tmpdir!r}
-ENV_FILE={env_file!r}
-{ENV_BLOCK}
-"""
-        p = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
-        self.assertNotEqual(p.returncode, 0, "malformed env file should fail the launch")
-        leftovers = os.listdir(tmpdir)
-        self.assertEqual(leftovers, [],
-                         f"normalised copy (holds HF_TOKEN) survived a source failure: {leftovers}")
-
-    def test_temp_copy_removed_on_signal(self):
-        # Same guarantee when the launcher is interrupted mid-source.
-        d = tempfile.mkdtemp()
-        tmpdir = os.path.join(d, "tmp"); os.makedirs(tmpdir)
-        env_file = os.path.join(d, ".env.dspark")
-        with open(env_file, "w") as f:
-            f.write("WORKER_HOST=10.0.0.2\nkill -TERM $$\n")
-        script = f"""set -uo pipefail
-export TMPDIR={tmpdir!r}
-ENV_FILE={env_file!r}
-{ENV_BLOCK}
-"""
-        subprocess.run(["bash", "-c", script], capture_output=True, text=True)
-        leftovers = os.listdir(tmpdir)
-        self.assertEqual(leftovers, [],
-                         f"normalised copy survived a signal: {leftovers}")
-
-    def test_temp_copy_is_not_world_readable(self):
-        p = run_env_block(b"WORKER_HOST=10.0.0.2\n",
-                          extra='stat -c %a "$_dspark_env_clean" 2>/dev/null || echo gone')
-        self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("gone", p.stdout, "copy should already be removed at this point")
-
-
-class TestRemoteWorkerCopy(unittest.TestCase):
-    """The worker copy must be created 0600 and must fail closed."""
-
-    def _run(self, remote_path: str, ssh_rc: int = 0):
-        d = tempfile.mkdtemp()
-        bindir = os.path.join(d, "bin"); os.makedirs(bindir)
-        log = os.path.join(d, "ssh.log")
-        with open(os.path.join(bindir, "ssh"), "w") as f:
-            f.write("#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> " + repr(log) +
-                    "\ncat > /dev/null\nexit " + str(ssh_rc) + "\n")
-        os.chmod(os.path.join(bindir, "ssh"), 0o755)
-        env_file = os.path.join(d, ".env.dspark")
-        with open(env_file, "w") as fh:
-            fh.write("HF_TOKEN=secret\n")
-        script = f"""set -euo pipefail
-export PATH={bindir!r}:$PATH
+PATH={shlex.quote(str(bindir))}:/usr/bin:/bin
 WORKER_HOST=worker
-REMOTE_ENV_FILE={remote_path}
-ENV_FILE={env_file!r}
-{REMOTE_WRITE}
+REMOTE_ENV_FILE="$(printf %q {shlex.quote(str(final))})"
+COMPOSE_ENV_FILE={shlex.quote(str(source))}
+{PUBLISH_BLOCK}
 echo OK
 """
-        p = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
-        if os.path.exists(log):
-            with open(log) as fh:
-                p.log = fh.read()  # type: ignore[attr-defined]
-        else:
-            p.log = ""  # type: ignore[attr-defined]
-        return p
+        env = dict(os.environ)
+        env.update({
+            "FAIL_CAT": "1" if fail_cat else "0",
+            "FAIL_MV": "1" if fail_mv else "0",
+            "FINAL_PATH": str(final),
+            "BEFORE_LOG": str(before_log),
+        })
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+        result.final_text = final.read_text()  # type: ignore[attr-defined]
+        result.final_mode = final.stat().st_mode & 0o777  # type: ignore[attr-defined]
+        result.staged = sorted(path.name for path in worker_dir.glob(".env.dspark.tmp.*"))  # type: ignore[attr-defined]
+        result.before_text = before_log.read_text() if before_log.exists() else None  # type: ignore[attr-defined]
+        shutil.rmtree(workdir)
+        return result
 
-    def test_creates_with_umask_077(self):
-        p = self._run("/srv/dspark/.env.dspark")
-        self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("umask 077", p.log)
-        self.assertIn("/srv/dspark/.env.dspark", p.log)
+    def test_private_atomic_replace_with_space_path(self):
+        result = self.run_publish(space=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.final_text, "VLLM_API_KEY=secret\n")
+        self.assertEqual(result.final_mode, 0o600)
+        self.assertEqual(result.before_text, "OLD=1:644\n")
+        self.assertEqual(result.staged, [])
 
-    def test_fails_closed_when_remote_write_fails(self):
-        # No `|| true`: a failure to place the secret safely must abort the launch.
-        p = self._run("/srv/dspark/.env.dspark", ssh_rc=1)
-        self.assertNotEqual(p.returncode, 0,
-                            "launch continued despite failing to write the worker credential")
-        self.assertNotIn("OK", p.stdout)
+    def test_partial_stage_failure_keeps_old_destination_and_status(self):
+        result = self.run_publish(fail_cat=True)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.final_text, "OLD=1\n")
+        self.assertEqual(result.final_mode, 0o644)
+        self.assertEqual(result.staged, [])
+        self.assertNotIn("OK", result.stdout)
 
-    def test_enforces_0600_on_preexisting_destination(self):
-        """umask only applies to NEW inodes; an existing 0644 dest must still end 0600."""
-        d = tempfile.mkdtemp()
-        bindir = os.path.join(d, "bin"); os.makedirs(bindir)
-        dest = os.path.join(d, "remote-env")
-        with open(dest, "w") as fh:
-            fh.write("STALE=1\n")
-        os.chmod(dest, 0o644)
-        # stub ssh executes the remote command locally so mode changes are observable
-        with open(os.path.join(bindir, "ssh"), "w") as fh:
-            fh.write('#!/usr/bin/env bash\nshift\nbash -c "$*"\n')
-        os.chmod(os.path.join(bindir, "ssh"), 0o755)
-        env_file = os.path.join(d, ".env.dspark")
-        with open(env_file, "w") as fh:
-            fh.write("HF_TOKEN=secret\n")
-        script = f"""set -euo pipefail
-export PATH={bindir!r}:$PATH
-WORKER_HOST=worker
-REMOTE_ENV_FILE={dest!r}
-ENV_FILE={env_file!r}
-{REMOTE_WRITE}
-"""
-        p = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
-        self.assertEqual(p.returncode, 0, p.stderr)
-        mode = oct(os.stat(dest).st_mode & 0o777)
-        self.assertEqual(mode, "0o600",
-                         f"pre-existing worker credential left at {mode} (umask does not chmod an existing inode)")
-        with open(dest) as fh:
-            self.assertIn("HF_TOKEN=secret", fh.read())
-
-    def test_worker_receives_normalised_bytes(self):
-        """The worker's compose --env-file must not see BOM/CRLF the head was shielded from."""
-        d = tempfile.mkdtemp()
-        bindir = os.path.join(d, "bin"); os.makedirs(bindir)
-        dest = os.path.join(d, "remote-env")
-        with open(os.path.join(bindir, "ssh"), "w") as fh:
-            fh.write('#!/usr/bin/env bash\nshift\nbash -c "$*"\n')
-        os.chmod(os.path.join(bindir, "ssh"), 0o755)
-        env_file = os.path.join(d, ".env.dspark")
-        with open(env_file, "wb") as fh:
-            fh.write(b"\xef\xbb\xbfWORKER_HOST=10.0.0.2\r\nHF_TOKEN=secret\r\n")
-        script = f"""set -euo pipefail
-export PATH={bindir!r}:$PATH
-WORKER_HOST=worker
-REMOTE_ENV_FILE={dest!r}
-ENV_FILE={env_file!r}
-{REMOTE_WRITE}
-"""
-        p = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
-        self.assertEqual(p.returncode, 0, p.stderr)
-        with open(dest, "rb") as fh:
-            got = fh.read()
-        self.assertFalse(got.startswith(b"\xef\xbb\xbf"), "BOM reached the worker copy")
-        self.assertNotIn(b"\r", got, "CRLF reached the worker copy")
-        self.assertIn(b"HF_TOKEN=secret", got)
-
-    def test_escaped_remote_path_with_space(self):
-        # REMOTE_ENV_FILE is already %q-escaped upstream; it must be used unquoted
-        # so the escaping survives rather than being nested inside literal quotes.
-        escaped = subprocess.run(
-            ["bash", "-c", 'printf %q "/srv/dspark lab/.env.dspark"'],
-            capture_output=True, text=True).stdout
-        p = self._run(escaped)
-        self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("dspark", p.log)
-        self.assertNotIn("''", p.log, "escaped path should not be re-wrapped in quotes")
+    def test_publish_failure_keeps_old_destination_and_status(self):
+        result = self.run_publish(fail_mv=True)
+        self.assertEqual(result.returncode, 9)
+        self.assertEqual(result.final_text, "OLD=1\n")
+        self.assertEqual(result.final_mode, 0o644)
+        self.assertEqual(result.staged, [])
+        self.assertNotIn("OK", result.stdout)
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=0 if "-q" in sys.argv else 2,
-                  argv=[a for a in sys.argv if a != "-q"])
+    unittest.main()
