@@ -248,13 +248,15 @@ iface_ipv4() {
 # NCCL_IB_HCA is not a bare sysfs device name. NCCL (parseStringList in
 # src/misc/utils.cc) accepts an optional leading "^" (exclude), then an optional
 # "=" (exact name match instead of prefix match), then a comma-separated list of
-# name[:port[:rail[:plane]]] tokens. Empty names are dropped and an empty token
-# list matches every device/port. A port field that is absent *or empty* means
-# -1, i.e. any port - "devA" and "devA:" select the same thing. A non-empty port
-# field is atoi(): optional blanks and sign, then leading decimal digits,
-# stopping at the first non-digit. So ":08" is port 8 (atoi is base 10, never
-# octal) and ":abc" is 0, which matches no real port. A port too wide for shell
-# arithmetic is clamped instead of evaluated, because $(( )) wraps modulo 2^64
+# name[:port[:rail[:plane]]] tokens. Empty names are dropped; only the first
+# MAX_IB_DEVS=32 non-empty entries are stored, and each stored name is truncated
+# to netIf::prefix's 63-byte payload. An empty token list matches every
+# device/port. A port field that is absent *or empty* means -1, i.e. any port -
+# "devA" and "devA:" select the same thing. A non-empty port field is atoi():
+# optional whitespace and sign, then leading decimal digits, stopping at the
+# first non-digit. So ":08" is port 8 (atoi is base 10, never
+# octal) and ":abc" is 0, which matches no real port. A port outside the resolver's conservative
+# nine-digit arithmetic bound is clamped instead of evaluated, because $(( )) wraps modulo 2^64
 # and one such value (18446744073709551615) wraps to -1, the "any port"
 # wildcard. Only the port field takes part in matching here; rail/plane are
 # parsed off and ignored.
@@ -290,22 +292,37 @@ search_exact=0
 case "$spec" in "^"*) search_not=1; spec="${spec#^}" ;; esac
 case "$spec" in "="*) search_exact=1; spec="${spec#=}" ;; esac
 
+max_ib_devs=32
 ntok=0
+selector_truncated=0
 OLDIFS=$IFS
 IFS=,
 set -- $spec
 IFS=$OLDIFS
 for tok in "$@"; do
   name=${tok%%:*}
+  [ -n "$name" ] || continue
+  if [ "$ntok" -ge "$max_ib_devs" ]; then
+    selector_truncated=1
+    continue
+  fi
+  # NCCL stores the name in netIf::prefix[64]. C locale makes printf's string
+  # precision byte-oriented, matching snprintf's 63-byte payload limit.
+  LC_ALL=C printf -v name '%.63s' "$name"
   port=-1
   case "$tok" in *:*)
     p=${tok#*:}
     p=${p%%:*}
     # Absent or empty port field means "any port"; only a non-empty field is
-    # atoi()'d. Force base 10 so "08"/"010" parse the way atoi() reads them
-    # instead of becoming a bad (or wrong) octal literal.
+    # atoi()'d. Match once against the whole field so conversion cannot restart
+    # after an embedded newline. Force base 10 so "08"/"010" parse the way
+    # atoi() reads them instead of becoming a bad (or wrong) octal literal.
     if [ -n "$p" ]; then
-      digits=$(printf '%s' "$p" | sed -n 's/^[[:space:]]*\([+-]\{0,1\}[0-9][0-9]*\).*/\1/p')
+      if [[ $p =~ ^[[:space:]]*([+-]?[0-9]+) ]]; then
+        digits=${BASH_REMATCH[1]}
+      else
+        digits=
+      fi
       sign=
       mag=$digits
       case "$mag" in -*) sign=-; mag=${mag#-} ;; +*) mag=${mag#+} ;; esac
@@ -317,7 +334,8 @@ for tok in "$@"; do
       if [ -z "$mag" ]; then
         port=0
       elif [ ${#mag} -gt 9 ]; then
-        # Wider than shell arithmetic can carry. Left to $(( )) the value wraps
+        # Outside the conservative nine-digit bound. Evaluating arbitrary-width
+        # text with $(( )) can wrap the value
         # modulo 2^64 - and 18446744073709551615 wraps to exactly -1, which is
         # the "any port" wildcard - so an unrepresentable port would silently
         # *widen* the selection. Clamp to a value no sysfs port can have: the
@@ -329,11 +347,11 @@ for tok in "$@"; do
       fi
     fi
   ;; esac
-  [ -n "$name" ] || continue
   ntok=$((ntok + 1))
   eval "tok_name_$ntok=\$name"
   eval "tok_port_$ntok=\$port"
 done
+[ "$selector_truncated" = 0 ] || echo "  note: selector list truncated to first $max_ib_devs non-empty entries; NCCL ignores later entries" >&2
 
 pair_matches() { # $1=dev $2=port -> 0 when the token list matches
   [ "$ntok" -gt 0 ] || return 0
@@ -372,8 +390,8 @@ ipv4_hex() { # a.b.c.d -> aabb:ccdd
 # NCCL never opens it. An attribute that cannot be read is not evidence of
 # inactivity, so the port stays a candidate. NCCL then keeps at most
 # MAX_IB_DEVS entries and ignores the rest; the cap is mirrored here so the
-# resolved index describes the devices NCCL will actually use.
-max_ib_devs=32
+# resolved index describes the devices NCCL will actually use. The same
+# MAX_IB_DEVS value separately caps the selector entries stored above.
 selected=""
 nsel=0
 skipped_state=""
@@ -584,6 +602,11 @@ resolve_nccl_gid_indexes() {
     fi
     exit 1
   }
+  if ! [[ "$resolved_head" =~ ^[0-9]+$ ]]; then
+    echo "FATAL: head RoCEv2 GID resolver returned invalid output." >&2
+    exit 1
+  fi
+
   resolved_worker="$(resolve_rocev2_gid_index "$WORKER_HOST" "$WORKER_NCCL_IB_HCA" "$worker_match")" || {
     rc=$?
     if [ "$rc" -eq 3 ]; then
@@ -595,6 +618,11 @@ resolve_nccl_gid_indexes() {
     fi
     exit 1
   }
+
+  if ! [[ "$resolved_worker" =~ ^[0-9]+$ ]]; then
+    echo "FATAL: worker RoCEv2 GID resolver returned invalid output." >&2
+    exit 1
+  fi
 
   if [ -n "$ENV_NCCL_IB_GID_INDEX" ] && [ "$ENV_NCCL_IB_GID_INDEX" != "$resolved_head" ]; then
     echo "Note: $ENV_FILE has NCCL_IB_GID_INDEX=$ENV_NCCL_IB_GID_INDEX but sysfs resolved head=$resolved_head (using resolved)."

@@ -5,13 +5,15 @@
 # The resolver mirrors NCCL's selector semantics (parseStringList in
 # src/misc/utils.cc) on the node that owns the sysfs tree: optional leading "^"
 # (exclude), then optional "=" (exact match instead of prefix match), then
-# comma-separated name[:port[:rail[:plane]]] tokens. An absent *or empty* port
-# field means any port; a non-empty one is atoi() (base 10, stops at the first
-# non-digit), and a port too wide for shell arithmetic is clamped rather than
-# evaluated, because $(( )) wraps modulo 2^64 and one such value wraps to the
-# -1 wildcard. The selector is applied to the candidate universe ncclIbInit
-# builds — ACTIVE ports with an Ethernet/InfiniBand link layer, capped at
-# MAX_IB_DEVS=32 — so a DOWN sibling port neither fails the resolve nor
+# comma-separated name[:port[:rail[:plane]]] tokens. Only the first 32
+# non-empty entries are stored, and stored names use netIf::prefix's 63-byte
+# payload. An absent *or empty* port field means any port; a non-empty one is
+# atoi() (base 10, one conversion over the whole field), and a port outside
+# the resolver's conservative nine-digit bound is clamped rather than evaluated, because $(( )) wraps
+# modulo 2^64 and one such value wraps to the -1 wildcard. The selector is
+# applied to the candidate universe ncclIbInit builds — ACTIVE ports with an
+# Ethernet/InfiniBand link layer, separately capped at MAX_IB_DEVS=32 — so a
+# DOWN sibling port neither fails the resolve nor
 # constrains the index. Every selected member must validate against the match IP
 # or an IPv4 on its own netdev; a member with no usable RoCEv2 GID fails closed
 # (exit 1). Members are reconciled by intersecting their sets of usable indexes
@@ -20,12 +22,13 @@
 # because NCCL_IB_GID_INDEX is one global value per rank.
 #
 # The suite extracts the launcher's own functions and runs the launcher's own
-# generated lookup script (transport stubbed, sysfs root redirected, `ip`
-# stubbed from a fixture) against fake sysfs trees — so it exercises the
-# shipped code, and running it against the pre-fix launcher fails these
-# checks *behaviorally* (wrong result / wrong exit code), not merely because
-# a helper cannot be extracted.
+# generated lookup script through its unchanged local/SSH branches. Strict
+# transport and `ip -4 -o addr show dev` stubs plus redirected fake sysfs trees
+# keep the checks CPU-only while exercising the shipped boundaries. Running it
+# against a pre-fix launcher fails behaviorally (wrong result / wrong exit
+# code), not merely because a helper cannot be extracted.
 set -euo pipefail
+unset BASH_ENV SSH_STDOUT_NOISE
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 START="$ROOT/start-deepseek-v4-flash-dspark.sh"
@@ -47,29 +50,44 @@ if [ -n "$resolver_body_src" ]; then
 else
   NCCL_HCA_RESOLVER_BODY=""
 fi
-eval "$(
-  awk '/^resolve_rocev2_gid_index\(\) \{$/,/^\}$/' "$START" \
-    | sed -e 's|bash -c "\$remote"|printf %s "$remote"|' \
-          -e 's|ssh "\$ssh_target" "bash -s" <<<"\$remote"|printf %s "$remote"|'
-)"
+eval "$(awk '/^resolve_rocev2_gid_index\(\) \{$/,/^\}$/' "$START")"
+eval "$(awk '/^resolve_nccl_gid_indexes\(\) \{$/,/^\}$/' "$START")"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-# `ip` stub: answers `ip -4 -o addr show dev NAME` from $IP_FIXTURE
-# ("<netdev> <ipv4>" lines), mimicking the real -o output shape.
+# `ip` stub: accepts only `ip -4 -o addr show dev NAME`, then answers from
+# $IP_FIXTURE ("<netdev> <ipv4>" lines) in the real one-line output shape.
 stub="$tmp/stub-bin"
 mkdir -p "$stub"
 cat >"$stub/ip" <<'STUB'
 #!/usr/bin/env bash
-dev="${!#}"
+if [ "$#" -ne 6 ] || [ "$1" != "-4" ] || [ "$2" != "-o" ] \
+  || [ "$3" != "addr" ] || [ "$4" != "show" ] || [ "$5" != "dev" ]; then
+  printf 'ip stub: unexpected argv\n' >&2
+  exit 64
+fi
+dev=$6
 [ -f "${IP_FIXTURE:-}" ] || exit 0
 while read -r d a; do
   [ "$d" = "$dev" ] && printf '2: %s    inet %s/24 brd 0.0.0.0 scope global %s\n' "$d" "$a" "$d"
 done <"$IP_FIXTURE"
 exit 0
 STUB
-chmod +x "$stub/ip"
+
+# `ssh` stub preserves stdin/stdout/stderr and exit status while requiring the
+# launcher's exact `ssh TARGET "bash -s"` argv. Optional stdout noise models a
+# remote login banner without changing the resolver's successful exit status.
+cat >"$stub/ssh" <<'STUB'
+#!/usr/bin/env bash
+if [ "$#" -ne 2 ] || [ "$1" != "${SSH_EXPECT_TARGET:-}" ] || [ "$2" != "bash -s" ]; then
+  printf 'ssh stub: unexpected argv\n' >&2
+  exit 64
+fi
+[ -z "${SSH_STDOUT_NOISE:-}" ] || printf '%s\n' "$SSH_STDOUT_NOISE"
+exec /bin/bash -s
+STUB
+chmod +x "$stub/ip" "$stub/ssh"
 
 mk_gid() { # $1=root $2=dev $3=port $4=index $5=gid $6=type [$7=ndev]
   local d="$1/sys/class/infiniband/$2/ports/$3"
@@ -90,9 +108,11 @@ mk_port_attr() { # $1=root $2=dev $3=port $4=state $5=link_layer
 }
 
 resolve() { # $1=root $2=fixture $3=spec $4=match-ip [$5=ssh-target]
-  resolve_rocev2_gid_index "${5:-}" "$3" "$4" \
-    | sed "s|/sys/class/infiniband|$1/sys/class/infiniband|g" \
-    | IP_FIXTURE="$2" PATH="$stub:$PATH" bash
+  local NCCL_GID_RESOLVE_SYSROOT="$1/sys/class/infiniband"
+  local IP_FIXTURE="$2" SSH_EXPECT_TARGET="${5:-}"
+  local PATH="$stub:$PATH"
+  export NCCL_GID_RESOLVE_SYSROOT IP_FIXTURE SSH_EXPECT_TARGET PATH
+  resolve_rocev2_gid_index "${5:-}" "$3" "$4"
 }
 
 expect_idx() { # $1=label $2=want $3=root $4=fixture $5=spec $6=ip [$7=ssh]
@@ -167,6 +187,16 @@ expect_idx "explicit port 2" 9 "$w" "$wfx" 'devN:2' '10.0.99.99'
 expect_rc "multiport disagreement fails closed (exit 3)" 3 "$w" "$wfx" 'devN' '10.0.99.99'
 expect_idx "distinct per-HCA addresses both validate via own netdev" 2 "$w" "$wfx" '=devM:1,devN:1' '10.0.99.99'
 expect_idx "match-ip member + own-addr member agree" 2 "$w" "$wfx" '=devM:1,devN:1' '10.0.25.1'
+rc=0
+audit_err="$tmp/member-audit.err"
+got="$(resolve "$w" "$wfx" '=devM:1,devN:1' '10.0.25.1' 2>"$audit_err")" || rc=$?
+if [ "$rc" -eq 0 ] && [ "$got" = 2 ] \
+  && grep -Fqx '  member devM:1 -> RoCEv2 gid index 2 (via match-ip 10.0.25.1)' "$audit_err" \
+  && grep -Fqx '  member devN:1 -> RoCEv2 gid index 2 (via own-addr 10.0.26.1 on enn1)' "$audit_err"; then
+  ok "successful multi-HCA resolve audits every member and address source"
+else
+  bad "success audit lines wrong (rc=$rc got='$got'): $(cat "$audit_err")"
+fi
 expect_idx "port exclusion (^dev:port honors the port)" 2 "$w" "$wfx" '^devN:2' '10.0.99.99'
 expect_rc "non-numeric port token matches no port" 1 "$w" "$wfx" 'devM:abc' '10.0.99.99'
 
@@ -188,6 +218,8 @@ expect_idx "leading-zero port :08 is decimal 8, not a bad octal literal" 7 "$pg"
 expect_idx "leading-zero port :010 is decimal 10, not octal 8" 8 "$pg" "$pgfx" 'devP:010' '10.0.99.99'
 expect_idx "signed port :+8 parses as 8" 7 "$pg" "$pgfx" 'devP:+8' '10.0.99.99'
 expect_idx "atoi stops at the first non-digit (:8abc -> 8)" 7 "$pg" "$pgfx" 'devP:8abc' '10.0.99.99'
+expect_rc "atoi does not restart after an embedded LF" 1 "$pg" "$pgfx" $'devP:abc\n8' '10.0.99.99'
+expect_idx "atoi stops at the first embedded LF instead of combining lines" 2 "$w" "$wfx" $'devN:1\n+1' '10.0.99.99'
 expect_idx "atoi skips leading blanks (: 8 -> 8)" 7 "$pg" "$pgfx" 'devP: 8' '10.0.99.99'
 expect_idx "rail/plane fields are parsed off, port still wins (:8:2:0)" 7 "$pg" "$pgfx" 'devP:8:2:0' '10.0.99.99'
 expect_rc "non-numeric port is atoi 0 and matches no real port" 1 "$pg" "$pgfx" 'devP:abc' '10.0.99.99'
@@ -198,8 +230,8 @@ expect_rc "explicit empty port field is a wildcard, not port 0" 3 "$pg" "$pgfx" 
 expect_rc "empty port field before a rail field is also a wildcard" 3 "$pg" "$pgfx" 'devP::2' '10.0.99.99'
 expect_idx "omitted port on a single-port match still resolves" 4 "$pg" "$pgfx" 'devP:1:0' '10.0.99.99'
 
-# A port field wider than shell arithmetic must not widen the selection. Left to
-# $(( )) the value wraps modulo 2^64, and 18446744073709551615 wraps to exactly
+# A port field outside the conservative nine-digit bound must not widen the
+# selection. Evaluating arbitrary-width text with $(( )) can wrap modulo 2^64, and 18446744073709551615 wraps to exactly
 # -1 — the "any port" wildcard. Ports 1/8/10 need different indexes here, so a
 # wildcard reading is observable as exit 3 while "matches nothing" is exit 1.
 expect_rc "port that wraps to the -1 wildcard is clamped, not evaluated" 1 "$pg" "$pgfx" 'devP:18446744073709551615' '10.0.99.99'
@@ -311,7 +343,32 @@ else
   bad "cap diagnostic wrong (rc=$rc): $err"
 fi
 
-# --- independent head/worker layouts in one run (ssh transport path) ---
+# NCCL separately stores only the first 32 non-empty selector entries. Empty
+# comma entries do not consume a slot, and entry 33 cannot include or exclude a
+# member. This fixture has one member so each boundary outcome is unambiguous.
+tokcap="$tmp/selector-cap"
+tokcapfx="$tmp/selector-cap.fixture"
+: >"$tokcapfx"
+mk_gid "$tokcap" devReal 1 9 '::ffff:0a00:5a01' 'RoCE v2'
+missing31=""
+for i in $(seq -w 1 31); do
+  missing31="${missing31}${missing31:+,}miss$i"
+done
+missing32="$missing31,miss32"
+expect_idx "32nd non-empty include entry is retained" 9 "$tokcap" "$tokcapfx" "=$missing31,,devReal," '10.0.90.1'
+expect_rc "33rd non-empty include entry is ignored" 1 "$tokcap" "$tokcapfx" "=$missing32,,devReal" '10.0.90.1'
+expect_rc "32nd non-empty exclusion entry is retained" 1 "$tokcap" "$tokcapfx" "^=$missing31,,devReal," '10.0.90.1'
+expect_idx "33rd non-empty exclusion entry is ignored" 9 "$tokcap" "$tokcapfx" "^=$missing32,,devReal" '10.0.90.1'
+rc=0
+err="$(resolve "$tokcap" "$tokcapfx" "=$missing32,,devReal" '10.0.90.1' 2>&1 >/dev/null)" || rc=$?
+if [ "$rc" -eq 1 ] && printf '%s\n' "$err" \
+  | grep -Fqx '  note: selector list truncated to first 32 non-empty entries; NCCL ignores later entries'; then
+  ok "selector-list truncation emits the fixed count-only note"
+else
+  bad "selector-list cap diagnostic wrong (rc=$rc): $err"
+fi
+
+# --- independent head/worker layouts in one run (real local/ssh branches) ---
 expect_idx "head layout resolves independently" 3 "$h" "$hfx" '=devA,devB' '10.0.22.1'
 expect_idx "worker layout resolves independently over ssh path" 9 "$w" "$wfx" 'devN:2' '10.0.99.99' 'user@worker'
 
@@ -327,6 +384,16 @@ expect_idx "empty selector matches all (agreeing) ports" 3 "$r3" "$rfx" '' '10.0
 expect_rc "exact form does not prefix-match" 1 "$r3" "$rfx" '=roce' '10.0.22.1'
 expect_idx "prefix token shorter than device name" 3 "$r3" "$rfx" 'rocep1' '10.0.22.1'
 
+# netIf::prefix[64] stores at most 63 name bytes before prefix/exact matching.
+longroot="$tmp/long-prefix"
+longfx="$tmp/long-prefix.fixture"
+: >"$longfx"
+name63=""
+for _ in $(seq 1 63); do name63="${name63}a"; done
+mk_gid "$longroot" "$name63" 1 11 '::ffff:0a00:1601' 'RoCE v2'
+expect_idx "overlong prefix token is stored as its first 63 bytes" 11 "$longroot" "$longfx" "${name63}x" '10.0.22.1'
+expect_idx "overlong exact token is stored as its first 63 bytes" 11 "$longroot" "$longfx" "=${name63}x" '10.0.22.1'
+
 trapdir="$tmp/glob-trap"
 mkdir -p "$trapdir"
 touch "$trapdir/devA-trap" "$trapdir/rocep1s0f1"
@@ -339,6 +406,70 @@ else
 fi
 expect_rc "whitespace inside a token transports literally, fails closed" 1 "$r3" "$rfx" '=de vA' '10.0.22.1'
 expect_rc "missing sysfs tree fails closed" 1 "$tmp/nonexistent" "$rfx" 'devA' '10.0.22.1'
+
+# The top-level caller must accept exactly one captured decimal line before it
+# assigns either node's GID index. Exercise the real local/SSH resolver calls;
+# fixed diagnostics must not repeat transport noise.
+pick_gid_match_ip() {
+  printf '10.0.22.1'
+}
+set_orchestration_fixture() {
+  NCCL_IB_GID_AUTO=1
+  NCCL_IB_HCA='=devA'
+  WORKER_NCCL_IB_HCA='=devB'
+  NCCL_SOCKET_IFNAME=head0
+  WORKER_NCCL_SOCKET_IFNAME=worker0
+  NCCL_IB_GID_MATCH_IP=''
+  WORKER_NCCL_IB_GID_MATCH_IP=''
+  VLLM_HOST_IP='10.0.22.1'
+  WORKER_VLLM_HOST_IP='10.0.22.1'
+  MASTER_ADDR='10.0.22.1'
+  WORKER_HOST='user@worker'
+  ENV_NCCL_IB_GID_INDEX=''
+  ENV_WORKER_NCCL_IB_GID_INDEX=''
+  ENV_FILE="$tmp/test.env"
+  NCCL_GID_RESOLVE_SYSROOT="$h/sys/class/infiniband"
+  IP_FIXTURE="$hfx"
+  SSH_EXPECT_TARGET="$WORKER_HOST"
+  PATH="$stub:$PATH"
+  export NCCL_GID_RESOLVE_SYSROOT IP_FIXTURE SSH_EXPECT_TARGET PATH
+}
+noise_env="$tmp/noisy-bash-env"
+printf '%s\n' "printf '%s\n' HEAD-NOISE" >"$noise_env"
+rc=0
+err="$(
+  (
+    set_orchestration_fixture
+    BASH_ENV="$noise_env"
+    export BASH_ENV
+    resolve_nccl_gid_indexes
+  ) 2>&1 >/dev/null
+)" || rc=$?
+if [ "$rc" -eq 1 ] \
+  && printf '%s\n' "$err" | grep -Fqx 'FATAL: head RoCEv2 GID resolver returned invalid output.' \
+  && ! printf '%s\n' "$err" | grep -Fq 'HEAD-NOISE'; then
+  ok "noisy successful head resolver output is rejected without reflection"
+else
+  bad "head resolver output validation wrong (rc=$rc): $err"
+fi
+
+rc=0
+err="$(
+  (
+    set_orchestration_fixture
+    unset BASH_ENV
+    SSH_STDOUT_NOISE=WORKER-NOISE
+    export SSH_STDOUT_NOISE
+    resolve_nccl_gid_indexes
+  ) 2>&1 >/dev/null
+)" || rc=$?
+if [ "$rc" -eq 1 ] \
+  && printf '%s\n' "$err" | grep -Fqx 'FATAL: worker RoCEv2 GID resolver returned invalid output.' \
+  && ! printf '%s\n' "$err" | grep -Fq 'WORKER-NOISE'; then
+  ok "noisy successful worker resolver output is rejected without reflection"
+else
+  bad "worker resolver output validation wrong (rc=$rc): $err"
+fi
 
 printf 'RESULT: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
