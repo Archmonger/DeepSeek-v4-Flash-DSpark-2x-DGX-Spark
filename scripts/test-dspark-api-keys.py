@@ -59,6 +59,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ROOT / "docker-compose.dspark.yml"
+START = ROOT / "start-deepseek-v4-flash-dspark.sh"
 ENV_EXAMPLE = ROOT / ".env.dspark.example"
 ENVS_DOC = ROOT / "docs" / "ENVS.md"
 CHANGELOG = ROOT / "CHANGELOG.md"
@@ -101,17 +102,25 @@ def find_auth_block(text: str) -> str:
     `$$` form in the docker render — both decode to container-side `$`).
     """
     start = _AUTH_START.search(text)
-    if start is None:
+    if not start:
         raise AssertionError("entrypoint auth block not found")
     end = _AUTH_END.search(text, start.start())
-    if end is None:
-        raise AssertionError("entrypoint auth block not terminated by its ARGS line")
+    if not end:
+        raise AssertionError("entrypoint auth block end not found")
     block = text[start.start():end.end()]
-    if "\n" in block:
-        raise AssertionError(
-            "entrypoint auth block must remain ONE physical compose line"
-        )
+    # The whole block must survive folding: no real newline inside.
+    if "\n" in block.strip("\n"):
+        raise AssertionError("entrypoint auth block must stay ONE physical line")
     return block
+
+
+def worker_sync_loop() -> str:
+    """The start script's `_hf_sync` worker patch sync loop, extracted verbatim."""
+    text = START.read_text(encoding="utf-8")
+    m = re.search(r'(for _hf_sync in [\s\S]*?^\s*done$)', text, re.MULTILINE)
+    if not m:
+        raise AssertionError("_hf_sync loop not found in start script")
+    return m.group(1)
 
 
 def entrypoint_auth_block() -> str:
@@ -661,6 +670,56 @@ class AmbientParent(unittest.TestCase):
 # --------------------------------------------------------------------------
 # Docs + hygiene.
 # --------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------
+# Worker patch sync covers the redaction hotfix too.
+# --------------------------------------------------------------------------
+
+
+class WorkerSync(unittest.TestCase):
+    """The start script's `_hf_sync` loop must actually cp the redaction patch.
+
+    A two-node compose mounts the same `patches/` directory on the worker, and
+    start-deepseek-v4-flash-dspark.sh scps a whitelist there before the worker
+    container starts. If the redaction hotfix is not in that whitelist, the
+    worker rank still prints --api-key values to the startup log.
+    """
+
+    def test_whitelist_contains_redact_and_every_file_exists(self):
+        sync = re.search(r'for _hf_sync in ([^\n;]+);', START.read_text(encoding="utf-8"))
+        self.assertTrue(sync, "_hf_sync whitelist not found in start script")
+        names = sync.group(1).split()
+        self.assertIn("hotfix-vllm-redact-api-key-log.sh", names)
+        missing = [n for n in names
+                   if not (ROOT / "patches" / n).is_file()]
+        self.assertEqual(missing, [], f"sync whitelists files absent from patches/: {missing}")
+
+    def test_loop_runs_and_ships_every_whitelisted_patch(self):
+        with tempfile.TemporaryDirectory() as td:
+            stubdir = Path(td, "stubbin")
+            stubdir.mkdir()
+            log = Path(td, "ssh-scp.log")
+            for name in ("ssh", "scp"):
+                f = stubdir / name
+                f.write_text('#!/bin/bash\n' + f'echo "{name} $*" >>"{log}"\n')
+                f.chmod(0o755)
+            env = dict(os.environ)
+            env["PATH"] = f"{stubdir}:{env.get('PATH','')}"
+            env["WORKER_HOST"] = "w"
+            env["REMOTE_WORKER_DIR"] = "/wdir"
+            env["SCRIPT_DIR"] = str(ROOT)
+            chunk = worker_sync_loop()
+            r = subprocess.run(["bash", "-c", chunk + "\n"
+                                + f'touch "{log}"'],
+                               capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            out = log.read_text(encoding="utf-8")
+            # every whitelisted patch must be scp'd to the worker dir
+            names = re.search(r'for _hf_sync in ([^\n;]+);',
+                              START.read_text(encoding="utf-8")).group(1).split()
+            for n in names:
+                self.assertIn(f"/wdir/patches/{n}", out, n)
 
 
 class Documented(unittest.TestCase):

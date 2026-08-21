@@ -205,7 +205,8 @@ for p in \
   patches/hotfix-nvfp4-ds-mla-issue22.sh \
   patches/hotfix-gb10-spin-wait.sh \
   patches/hotfix-dsv4-suppress-stops-in-reasoning.py \
-  patches/hotfix-dsv4-assistant-final-continuation.py
+  patches/hotfix-dsv4-assistant-final-continuation.py \
+  patches/hotfix-vllm-redact-api-key-log.sh
 do
   if [ -f "$p" ]; then
     ok "present $p"
@@ -213,6 +214,15 @@ do
     bad "missing required $p"
   fi
 done
+
+# Multi-key auth: redaction hotfix is wired into the compose hotfix loop AND
+# synced to the worker (a fresh cluster must not leak keys in worker logs).
+if grep -q 'hotfix-vllm-redact-api-key-log.sh' docker-compose.dspark.yml \
+  && grep -q 'hotfix-vllm-redact-api-key-log.sh' start-deepseek-v4-flash-dspark.sh; then
+  ok "compose + start sync include redact-api-key-log hotfix"
+else
+  bad "redact-api-key-log hotfix missing from compose loop or worker sync"
+fi
 
 if [ "$fail" -ne 0 ]; then
   echo "CI validate FAILED" >&2
