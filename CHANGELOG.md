@@ -1,3 +1,9 @@
+## 2026-08-21
+
+### Fixed
+
+- **Start normalizes BOM/CRLF env files and atomically publishes the worker copy ([PR #98](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/pull/98), reported and initially implemented by [@hecisaza](https://github.com/hecisaza))**: the operator file stays byte-identical while one private `0600` snapshot feeds the head, Compose, and worker. Worker credentials are staged privately and renamed atomically, so a failed transfer cannot expose or truncate the previous env file. The resolved-profile banner now reports the actual `MAX_NUM_SEQS=6` default.
+
 ## 2026-08-20
 
 ### Changed
