@@ -28,6 +28,10 @@ if [ -n "${VLLM_API_KEY:-}" ] && [ "$_dspark_keys_set" = "1" ]; then
   echo "error: VLLM_API_KEY and DSPARK_API_KEYS are both set; set exactly one of them" >&2
   exit 2
 fi
+if [ "$_dspark_keys_set" = "1" ] && [ "${DSPARK_API_KEYS}" != "$(printf '%s' "${DSPARK_API_KEYS}" | tr -d '\n' | tr -d '\r')" ]; then
+  echo "error: DSPARK_API_KEYS must be a single-line space-separated list" >&2
+  exit 2
+fi
 if [ -n "${VLLM_API_KEY:-}" ]; then
   AUTH_HEADER_ARGS=(-H "Authorization: Bearer $VLLM_API_KEY")
 elif [ "$_dspark_keys_set" = "1" ]; then
