@@ -43,23 +43,35 @@ trap 'rm -rf "$tmp"' EXIT
   done
 } >"$tmp/fragment.sh"
 
-# Direction 1: defined-but-empty (what compose injects when .env leaves the
-# knob unconfigured) must end up truly unset.
+# Direction 1: empty is normalized to absent. Defined-but-empty is exactly what
+# compose injects when .env leaves the knob unconfigured; it must end up unset,
+# never forwarded as an empty setting.
 out="$(env NCCL_IB_MERGE_NICS='' NCCL_NET_GDR_LEVEL='' NCCL_NET_GDR_READ='' NCCL_DMABUF_ENABLE='' bash "$tmp/fragment.sh")"
 want="$(printf '%s absent\n' "${KNOBS[@]}")"
 if [ "$out" = "$want" ]; then
-  ok "unconfigured knobs (defined-empty from compose) become truly unset"
+  ok "empty is normalized to absent (defined-empty from compose becomes truly unset)"
 else
   bad "unconfigured knobs still defined after normalization: $out"
 fi
 
-# Direction 2: configured values pass through byte-identical.
+# Direction 2: configured non-empty values pass through byte-identical.
 out="$(env NCCL_IB_MERGE_NICS='0' NCCL_NET_GDR_LEVEL='SYS' NCCL_NET_GDR_READ='1' NCCL_DMABUF_ENABLE='0' bash "$tmp/fragment.sh")"
 want="$(printf '%s\n' 'NCCL_IB_MERGE_NICS=0' 'NCCL_NET_GDR_LEVEL=SYS' 'NCCL_NET_GDR_READ=1' 'NCCL_DMABUF_ENABLE=0')"
 if [ "$out" = "$want" ]; then
-  ok "configured knobs pass through unchanged"
+  ok "configured non-empty values pass through unchanged"
 else
   bad "configured knobs altered: $out"
+fi
+
+# Contract boundary: only *empty* is normalized. A value that is non-empty but
+# unusual (whitespace, punctuation, mixed case) is still a configured value and
+# must reach NCCL byte-identical rather than being trimmed or dropped.
+out="$(env NCCL_IB_MERGE_NICS=' ' NCCL_NET_GDR_LEVEL='PHB ' NCCL_NET_GDR_READ='0' NCCL_DMABUF_ENABLE='Yes' bash "$tmp/fragment.sh")"
+want="$(printf '%s\n' 'NCCL_IB_MERGE_NICS= ' 'NCCL_NET_GDR_LEVEL=PHB ' 'NCCL_NET_GDR_READ=0' 'NCCL_DMABUF_ENABLE=Yes')"
+if [ "$out" = "$want" ]; then
+  ok "non-empty boundary values (whitespace/case preserved) pass through unchanged"
+else
+  bad "non-empty boundary values altered: $out"
 fi
 
 # Mixed: one configured, three unconfigured.

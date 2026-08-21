@@ -134,8 +134,9 @@ services:
       # the entrypoint unsets empty ones again before exec. That matters
       # because NCCL loads config-file values (/etc/nccl.conf, NCCL_CONF_FILE)
       # with overwrite=0 — a defined-empty variable would silently mask them.
-      # Configured values pass through unchanged. See docs/ENVS.md for what
-      # each knob actually controls.
+      # Configured non-empty values pass through unchanged; an empty value is
+      # normalized to absent, so it cannot be used to force an empty setting.
+      # See docs/ENVS.md for what each knob actually controls.
       NCCL_IB_MERGE_NICS: "${NCCL_IB_MERGE_NICS:-}"
       NCCL_NET_GDR_LEVEL: "${NCCL_NET_GDR_LEVEL:-}"
       NCCL_NET_GDR_READ: "${NCCL_NET_GDR_READ:-}"
