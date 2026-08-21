@@ -97,6 +97,17 @@ fi
 # observable by running it against a stub env file, so assert on behavior.
 VAL="$ROOT/validate-dspark-config.sh"
 val_env="$tmp/val.env"
+val_bin="$tmp/val-bin"
+mkdir -p "$val_bin"
+cat >"$val_bin/docker" <<'EOF'
+#!/usr/bin/env bash
+printf 'DRAFT_SAMPLE_METHOD=%s\n' "${DRAFT_SAMPLE_METHOD:-}"
+EOF
+chmod +x "$val_bin/docker"
+
+# Fixtures, not the caller's shell, own both values in Layers 2-3.
+export DRAFT_SAMPLE_METHOD=greedy
+export MTP_NUM_TOKENS=7
 
 write_val_env() { # $1 = optional DRAFT_SAMPLE_METHOD assignment line
   {
@@ -110,20 +121,19 @@ write_val_env() { # $1 = optional DRAFT_SAMPLE_METHOD assignment line
 
 run_val() {
   VRC=0
-  VOUT="$(ENV_FILE="$val_env" COMPOSE_FILE="$COMPOSE" bash "$VAL" 2>"$tmp/val.err")" || VRC=$?
+  VOUT="$(env -u DRAFT_SAMPLE_METHOD -u MTP_NUM_TOKENS PATH="$val_bin:$PATH" ENV_FILE="$val_env" COMPOSE_FILE="$COMPOSE" bash "$VAL" 2>"$tmp/val.err")" || VRC=$?
   VERR="$(cat "$tmp/val.err")"
 }
 
-# The validator ends by shelling out to `docker compose config`; that layer is
-# not what these cases are about, so accept any rc except the contract's own 2
-# and assert on the resolved-value summary, which is printed before it.
+# A deterministic docker stub keeps this validator layer CPU-only while making
+# every accepted case require a successful validator exit.
 val_accepts() { # $1=label $2=env-line ('' for unset) $3=expected resolved value
   if [ -n "$2" ]; then write_val_env "$2"; else write_val_env; fi
   run_val
-  if [ "$VRC" -ne 2 ] && printf '%s\n' "$VOUT" | grep -Fq "draft_sample_method=$3"; then
+  if [ "$VRC" -eq 0 ] && printf '%s\n' "$VOUT" | grep -Fq "draft_sample_method=$3"; then
     ok "$1"
   else
-    bad "$1: rc=$VRC resolved=$(printf '%s\n' "$VOUT" | grep -Fo 'draft_sample_method=.*' || echo none)"
+    bad "$1: rc=$VRC resolved=$(printf '%s\n' "$VOUT" | grep -Eo 'draft_sample_method=[^ ]*' || echo none)"
   fi
 }
 
@@ -163,7 +173,7 @@ import json, os, subprocess, sys
 
 compose, envfile, want_rc, want_out = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 
-env = {k: v for k, v in os.environ.items() if k not in ("NODE_RANK", "HEADLESS")}
+env = {k: v for k, v in os.environ.items() if k not in ("NODE_RANK", "HEADLESS", "DRAFT_SAMPLE_METHOD", "MTP_NUM_TOKENS")}
 env.update(COMPOSE_DISABLE_ENV_FILE="1", NODE_RANK="0")
 p = subprocess.run(
     ["docker", "compose", "--env-file", envfile, "-f", compose, "config", "--format", "json"],
