@@ -45,6 +45,7 @@ py_files+=(
   scripts/test-env-normalisation.py
   scripts/test-dspark-api-keys.py
   scripts/test-redact-api-key-log.py
+  scripts/test-hotfix-atomic-transaction.py
   scripts/ruler-lite.py
   scripts/verify-dsv4-027-equality-gate.py
 )
@@ -76,6 +77,8 @@ python3 scripts/test-dspark-api-keys.py -q
 ok "test-dspark-api-keys"
 python3 scripts/test-redact-api-key-log.py -q
 ok "test-redact-api-key-log"
+python3 scripts/test-hotfix-atomic-transaction.py -q
+ok "test-hotfix-atomic-transaction"
 python3 tests/test_issue27_inflight_cap.py -q
 ok "test_issue27_inflight_cap"
 python3 scripts/verify-dsv4-027-equality-gate.py
