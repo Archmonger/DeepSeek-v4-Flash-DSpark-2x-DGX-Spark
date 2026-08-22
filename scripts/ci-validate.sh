@@ -47,6 +47,7 @@ py_files+=(
   scripts/test-dspark-api-keys.py
   scripts/test-redact-api-key-log.py
   scripts/test-hotfix-atomic-transaction.py
+  scripts/test-python-hotfix-failclosed.py
   scripts/ruler-lite.py
   scripts/verify-dsv4-027-equality-gate.py
 )
@@ -80,6 +81,8 @@ python3 scripts/test-redact-api-key-log.py -q
 ok "test-redact-api-key-log"
 python3 scripts/test-hotfix-atomic-transaction.py -q
 ok "test-hotfix-atomic-transaction"
+python3 scripts/test-python-hotfix-failclosed.py -q
+ok "test-python-hotfix-failclosed"
 python3 tests/test_issue27_inflight_cap.py -q
 ok "test_issue27_inflight_cap"
 python3 scripts/verify-dsv4-027-equality-gate.py
@@ -153,16 +156,16 @@ if grep -q 'hotfix-dsv4-issue26-hybrid-swa-min.py' docker-compose.dspark.yml \
 else
   bad "compose missing #26 or #27 mount"
 fi
-if grep -q 'python3 /opt/hotfix-dsv4-issue26-hybrid-swa-min.py' docker-compose.dspark.yml \
-  && grep -q 'python3 /opt/hotfix-dsv4-issue27-partial-prefill-concurrency.py' docker-compose.dspark.yml; then
-  ok "compose entrypoint applies #26 + #27"
+if grep -Fq 'python3 /opt/hotfix-dsv4-issue26-hybrid-swa-min.py || exit 1' docker-compose.dspark.yml \
+  && grep -Fq 'python3 /opt/hotfix-dsv4-issue27-partial-prefill-concurrency.py || exit 1' docker-compose.dspark.yml; then
+  ok "compose applies #26 + #27 fail-closed"
 else
-  bad "compose entrypoint does not apply #26 + #27"
+  bad "compose must apply #26 + #27 with || exit 1"
 fi
-if grep -q 'hotfix-dsv4-suppress-stops-in-reasoning.py' docker-compose.dspark.yml; then
-  ok "compose applies suppress-stops-in-reasoning"
+if grep -Fq 'python3 /opt/hotfix-dsv4-suppress-stops-in-reasoning.py || exit 1' docker-compose.dspark.yml; then
+  ok "compose applies suppress-stops-in-reasoning fail-closed"
 else
-  bad "compose missing suppress-stops-in-reasoning"
+  bad "compose must apply suppress-stops-in-reasoning with || exit 1"
 fi
 # Issue #66: GPU V2 thinking budget default OFF (stock sampler);
 # ON must be an exactly-1 gate with a fail-closed invocation.
@@ -173,10 +176,10 @@ else
   bad "compose must invoke issue31 GPU hotfix only when DSPARK_ENABLE_ISSUE31_GPU_HOTFIX=1, with || exit 1"
 fi
 if grep -q 'hotfix-dsv4-issue55-tool-truncation.py' docker-compose.dspark.yml \
-  && grep -q 'python3 /opt/hotfix-dsv4-issue55-tool-truncation.py' docker-compose.dspark.yml; then
-  ok "compose applies issue #55 tool-call truncation safety"
+  && grep -Fq 'python3 /opt/hotfix-dsv4-issue55-tool-truncation.py || exit 1' docker-compose.dspark.yml; then
+  ok "compose applies issue #55 tool-call truncation safety fail-closed"
 else
-  bad "compose missing issue #55 tool-call truncation safety"
+  bad "compose must apply issue #55 with || exit 1"
 fi
 # Assistant-final continuation (#52/PR53): default OFF (stock renderer);
 # ON must be an exactly-1 gate with a fail-closed invocation.
