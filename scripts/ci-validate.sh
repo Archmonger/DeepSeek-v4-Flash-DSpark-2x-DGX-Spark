@@ -22,6 +22,7 @@ for f in \
   scripts/verify-overlay-sources.sh \
   scripts/test-draft-sample-method-gate.sh \
   scripts/test-nccl-fabric-passthrough.sh \
+  scripts/test-nccl-ib-hca-gid-resolve.sh \
   patches/*.sh
 do
   [ -e "$f" ] || continue
@@ -89,6 +90,8 @@ bash scripts/test-draft-sample-method-gate.sh -q
 ok "test-draft-sample-method-gate"
 bash scripts/test-nccl-fabric-passthrough.sh -q
 ok "test-nccl-fabric-passthrough"
+bash scripts/test-nccl-ib-hca-gid-resolve.sh -q
+ok "test-nccl-ib-hca-gid-resolve"
 
 echo "== recipe guards (do not re-ship known regressions) =="
 
