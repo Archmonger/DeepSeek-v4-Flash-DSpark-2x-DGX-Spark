@@ -190,6 +190,7 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
         self.assertEqual(
             invocations,
             [
+                "hotfix-vllm-empty-encoder-output.py",
                 "hotfix-dsv4-issue27-partial-prefill-concurrency.py",
                 "hotfix-dsv4-issue43-decode-fairness-and-diag.py",
                 "hotfix-dsv4-issue26-hybrid-swa-min.py",
@@ -200,6 +201,7 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
 
     def test_each_runtime_patcher_failure_blocks_later_steps_and_service_exec(self):
         order = [
+            "hotfix-vllm-empty-encoder-output.py",
             "hotfix-dsv4-issue27-partial-prefill-concurrency.py",
             "hotfix-dsv4-issue43-decode-fairness-and-diag.py",
             "hotfix-dsv4-issue26-hybrid-swa-min.py",
@@ -224,6 +226,7 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
         self.assertEqual(
             invocations,
             [
+                "hotfix-vllm-empty-encoder-output.py",
                 "hotfix-dsv4-issue27-partial-prefill-concurrency.py",
                 "hotfix-dsv4-issue43-decode-fairness-and-diag.py",
                 "hotfix-dsv4-issue26-hybrid-swa-min.py",
