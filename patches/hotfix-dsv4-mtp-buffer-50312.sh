@@ -105,9 +105,13 @@ for b in sorted(counts):
     prev_c = counts[b]
     if n > 0 or b in (100.0, 1000.0, 5000.0, 20000.0, 65536.0, 262144.0, 1048576.0):
         print(f"    <= {b:>10.0f}: {n:>10.0f}  ({100 * n / total:5.1f}%)")
-# Approximate the C128A adaptive topk width this workload would use: within each
+# COUNTERFACTUAL since the #50004 revert (upstream vLLM #51318; this chain no
+# longer applies hotfix-dsv4-adaptive-topk-50004.sh): estimates the C128A topk
+# width this workload WOULD use if that patch were still applied — within each
 # bucket assume prompts spread to the bucket bound, take the midpoint, then
-# width = clamp(next_pow2(mid/128), 128, 8192).
+# width = clamp(next_pow2(mid/128), 128, 8192). The live kernel runs the full
+# fixed width, so treat the printed percentage as hypothetical headroom only,
+# not an active saving.
 active_sum = 0.0
 prev_c = 0.0
 prev_b = 0.0
