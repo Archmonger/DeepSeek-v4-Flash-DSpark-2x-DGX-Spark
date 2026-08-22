@@ -16,6 +16,8 @@
 
 ### Fixed
 
+- **Malformed `DSPARK_MAX_INFLIGHT_PREFILLS` no longer crashes scheduler admission after startup ([Issue #105](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/105))**: the #27 hotfix previously converted the environment value with bare `int(...)` inside every waiting-admission iteration, so values such as `two`, `2.0`, `1x`, or whitespace raised `ValueError` only after traffic reached the waiting queue. Scheduler construction now parses and caches the cap once. Blank, nonpositive, or malformed values use `SchedulerConfig.max_num_partial_prefills`; malformed values emit one warning; values above 3 retain the existing clamp. The scheduling hot loop no longer reads process environment.
+
 - **Start normalizes BOM/CRLF env files and atomically publishes the worker copy ([PR #98](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/pull/98), reported and initially implemented by [@hecisaza](https://github.com/hecisaza))**: the operator file stays byte-identical while one private `0600` snapshot feeds the head, Compose, and worker. Worker credentials are staged privately and renamed atomically, so a failed transfer cannot expose or truncate the previous env file. The resolved-profile banner now reports the actual `MAX_NUM_SEQS=6` default.
 
 ## 2026-08-20
