@@ -48,6 +48,7 @@ py_files+=(
   scripts/test-redact-api-key-log.py
   scripts/test-hotfix-atomic-transaction.py
   scripts/test-python-hotfix-failclosed.py
+  scripts/test-empty-encoder-output-hotfix.py
   scripts/ruler-lite.py
   scripts/verify-dsv4-027-equality-gate.py
 )
@@ -83,6 +84,8 @@ python3 scripts/test-hotfix-atomic-transaction.py -q
 ok "test-hotfix-atomic-transaction"
 python3 scripts/test-python-hotfix-failclosed.py -q
 ok "test-python-hotfix-failclosed"
+python3 scripts/test-empty-encoder-output-hotfix.py -q
+ok "test-empty-encoder-output-hotfix"
 python3 tests/test_issue27_inflight_cap.py -q
 ok "test_issue27_inflight_cap"
 python3 scripts/verify-dsv4-027-equality-gate.py
@@ -181,6 +184,13 @@ if grep -q 'hotfix-dsv4-issue55-tool-truncation.py' docker-compose.dspark.yml \
 else
   bad "compose must apply issue #55 with || exit 1"
 fi
+if grep -Fq 'hotfix-vllm-empty-encoder-output.py}:/opt/hotfix-vllm-empty-encoder-output.py:ro' docker-compose.dspark.yml \
+  && grep -Fq 'python3 /opt/hotfix-vllm-empty-encoder-output.py || exit 1' docker-compose.dspark.yml \
+  && grep -Fq 'scp "$DSPARK_EMPTY_ENCODER_OUTPUT_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-empty-encoder-output.py"' start-deepseek-v4-flash-dspark.sh; then
+  ok "empty encoder output hotfix is mounted, fail-closed, and worker-synced"
+else
+  bad "empty encoder output hotfix wiring is incomplete"
+fi
 # Assistant-final continuation (#52/PR53): default OFF (stock renderer);
 # ON must be an exactly-1 gate with a fail-closed invocation.
 if grep -Fq 'DSPARK_ENABLE_ASSISTANT_FINAL_HOTFIX: "${DSPARK_ENABLE_ASSISTANT_FINAL_HOTFIX:-0}"' docker-compose.dspark.yml \
@@ -215,6 +225,7 @@ for p in \
   patches/hotfix-dsv4-issue55-tool-truncation.py \
   patches/hotfix-dsv4-issue26-hybrid-swa-min.py \
   patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py \
+  patches/hotfix-vllm-empty-encoder-output.py \
   patches/hotfix-nvfp4-ds-mla-issue22.sh \
   patches/hotfix-gb10-spin-wait.sh \
   patches/hotfix-dsv4-suppress-stops-in-reasoning.py \
