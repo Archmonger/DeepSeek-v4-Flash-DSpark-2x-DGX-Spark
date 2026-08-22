@@ -207,7 +207,7 @@ def main(argv: list[str]) -> int:
     target = Path(argv[1]) if len(argv) > 1 else P
     if not target.is_file():
         print(f"[suppress-stops-in-reasoning] missing {target}", file=sys.stderr)
-        return 0
+        return 1
     status = apply_file(target)
     print(f"[suppress-stops-in-reasoning] {status}: {target}")
     return 0 if status.startswith("applied") or status == "skipped" else 1

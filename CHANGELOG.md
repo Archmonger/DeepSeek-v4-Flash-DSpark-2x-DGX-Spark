@@ -1,3 +1,9 @@
+## 2026-08-22
+
+### Changed
+
+- **Default-on Python source hotfixes now fail closed before `vllm serve` ([Issue #107](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/107))**: the encoding copy/reasoning-map rewrite and Issue #21, #55, #27, #43, #26, and suppress-stops patchers were separated by bare semicolons, so a missing file, anchor drift, assertion, or self-check failure could be masked by a later successful command and startup continued with stale runtime code. Every enabled step now propagates failure explicitly with `|| exit 1`, and Issue #21 anchor drift plus a missing suppress-stops target now return nonzero; the existing missing-encoding warning and all enable/skip switches retain their prior behavior. CPU failure injection covers every step, ordering, optional Issue #31, and the suppress-stops skip path.
+
 ## 2026-08-21
 
 ### Added

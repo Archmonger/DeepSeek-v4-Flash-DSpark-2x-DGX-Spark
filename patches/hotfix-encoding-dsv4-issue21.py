@@ -74,11 +74,11 @@ def main(argv: list[str]) -> int:
         print(f"[OK] Issue #21 patch already present: {target}")
         return 0
     print(
-        f"[WARN] encode_arguments_to_dsml pattern not found; "
-        f"Issue #21 patch skipped: {target}",
+        f"[FAIL] encode_arguments_to_dsml pattern not found; "
+        f"Issue #21 patch not applied: {target}",
         file=sys.stderr,
     )
-    return 0
+    return 1
 
 
 if __name__ == "__main__":
