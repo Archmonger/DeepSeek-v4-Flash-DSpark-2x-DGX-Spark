@@ -1,3 +1,9 @@
+## 2026-08-23
+
+### Fixed
+
+- **Trailing `latest_reminder` after a retried assistant turn no longer defeats the assistant-final generation-header hotfix ([Issue #120](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/120); extends Issue #52)**: a harness retry that re-sends its partial assistant turn and appends a trailing `latest_reminder` annotation left the prompt ending on the bare reminder with no generation header — stock closes the turn with EOS first — so the model kept generating from a dead state (immediate EOS or hallucinated DSML markup) and the #52 patcher's final-index guard never fired. The opt-in `DSPARK_ENABLE_ASSISTANT_FINAL_HOTFIX=1` patcher now also matches exactly one shape, a **final** `latest_reminder` whose immediate predecessor is an assistant message, and appends one fresh `<｜Assistant｜><think>` header after the reminder content; reminder tails directly after user/developer already end inside the checkpoint's pending generation slot and stay byte-identical, as do mid-transcript reminders, task rendering precedence, and every assistant-final shape. The post-write self-check now verifies both fixed shapes and fails closed (original bytes restored) if a patched encoder drops either header or double-headers a user→reminder tail. CPU regression tests fail on the pre-extension hotfix; verified against the real `encoding_dsv4.py` snapshot on CPU only — live two-rank boot proof is still outstanding (`docs/PATCHES.md`, "Issue #52").
+
 ## 2026-08-22
 
 ### Changed

@@ -230,6 +230,27 @@ turn, then appends a fresh generation header. Reopening the turn with `wo_eos`
 was measured worse (1-token empty generation on a complete turn) and is not
 used. Runs after the entrypoint copies the encoder into place.
 
+### Extension — trailing `latest_reminder` annotation (Issue #120)
+A harness retry can append a trailing `latest_reminder` message after the
+re-sent partial assistant turn. The reminder defeats the fix above: stock
+closes the assistant turn with EOS, renders the bare reminder after it, and
+the prompt still ends with no generation header — a dead state the model
+escapes with immediate EOS or hallucinated markup. Verified on the real
+checkpoint encoder (`encoding_dsv4.py`, snapshot `9e165c30`): a
+reminder tail directly after `user`/`developer` already ends inside the
+pending generation slot — the checkpoint emits
+`ASSISTANT_SP_TOKEN` + thinking token *before* such a reminder — so those
+tails are correct as-is.
+
+The transition condition is therefore widened by exactly one more clause: a
+**final** `latest_reminder` whose immediate predecessor is an **assistant**
+message gains one fresh generation header appended after the reminder content
+(thinking mode `<｜Assistant｜><think>`, chat mode `<｜Assistant｜></think>`).
+Reminder tails after user/developer, reminders mid-transcript, task-precedence
+rendering, and every assistant-final shape are byte-identical to the
+pre-extension hotfix behavior; the post-write self-check additionally fails
+closed if a patched encoder double-headers a user→reminder tail.
+
 ### Flag (default OFF = stock)
 | value | behavior |
 |---|---|
@@ -238,8 +259,10 @@ used. Runs after the entrypoint copies the encoder into place.
 
 Fail-closed when ON: missing encoder file, missing anchor, or a failed
 post-write self-check (patched module must import and render a
-trailing-assistant transcript with a generation header) → nonzero exit, boot
-aborts; a failed self-check **restores the original file bytes** first. An
+trailing-assistant transcript with a generation header and an
+assistant-plus-trailing-`latest_reminder` transcript with one fresh header,
+without appending a second header to a user→reminder tail) → nonzero exit,
+boot aborts; a failed self-check **restores the original file bytes** first. An
 already-patched encoder is re-validated (idempotent), never double-patched.
 
 ### Evidence status
@@ -261,6 +284,13 @@ same 98 stock token IDs were preserved with exactly
 `alpha beta`. Re-running the patcher on both ranks reported
 `already applied and verified`. A deliberate anchor-drift boot exited `1` on
 both ranks, entered restart/failure state, and never served the API.
+
+Extension evidence is CPU-only so far: the patched patcher was applied to a
+copy of the real checkpoint encoder (snapshot `9e165c30`) and a 16-case
+render matrix confirmed the fixed shape gains exactly one fresh header while
+every other shape stays byte-identical to the pre-extension hotfix. **No live
+serving validation of the reminder-tail rescue exists yet** — run the same
+gated-ON/OFF boot proof on both ranks before relying on it in production.
 
 ### Test
 ```bash
