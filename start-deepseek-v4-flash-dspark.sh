@@ -1116,13 +1116,14 @@ for _ in $(seq 1 "$WAIT_ATTEMPTS"); do
       # Authenticated clusters need a valid bearer or every sweep request 401s
       # and warms nothing. Hand the child the same credential this script's
       # smoke probe uses: the first already-parsed DSPARK_API_KEYS key, else
-      # VLLM_API_KEY (they are mutually exclusive upstream). Environment only —
-      # never argv or an echo — so ps output and boot logs stay key-free.
+      # VLLM_API_KEY (they are mutually exclusive upstream). The launcher-to-
+      # warmup handoff uses the environment, not a script argument or log line.
       _warmup_bearer="${VLLM_API_KEY:-}"
       if [ "$_dspark_keys_set" = "1" ]; then
         _warmup_bearer="${_dspark_keys[0]}"
       fi
-      DSPARK_WARMUP_BEARER="$_warmup_bearer" \
+      DSPARK_WARMUP_MAX_CONCURRENCY="${MAX_NUM_SEQS:-6}" \
+        DSPARK_WARMUP_BEARER="$_warmup_bearer" \
         bash "$SCRIPT_DIR/scripts/boot-shape-warmup.sh" \
         "${CHAT_URL%/v1/chat/completions}" "${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}" || \
         echo "WARN: boot shape warmup incomplete — uncovered shapes may JIT mid-serve (issue #117)" >&2

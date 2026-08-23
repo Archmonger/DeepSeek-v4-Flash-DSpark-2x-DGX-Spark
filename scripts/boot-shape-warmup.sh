@@ -24,10 +24,10 @@
 #   runtime with an authenticated POST /tokenize BEFORE its completion fires,
 #   and any count mismatch fails the rung — and the nonfatal warmup — with a
 #   precise, secret-free diagnostic instead of silently warming a wrong shape.
-# - Chat arms C=1/2/4, medium + multi-chunk long prefill, and one thinking-off
+# - Chat arms C=1/2/4/6 (bounded by the launcher's resolved
+#   --max-num-seqs), medium + multi-chunk long prefill, and one thinking-off
 #   arm keep multi-request batch coverage for other (batch-keyed) kernels;
-#   they contribute nothing to the low buckets above. C=6 is gone: the
-#   deployed nodes run --max-num-seqs 4, so C=6 can never be scheduled.
+#   they contribute nothing to the low buckets above.
 #
 # Non-fatal by design: the cost of a missed shape is a mid-serve JIT (what this
 # script exists to reduce), not an outage — the launcher must treat a warmup
@@ -45,6 +45,9 @@
 #                              over VLLM_API_KEY. Never logged by this script.
 #   VLLM_API_KEY               added as Bearer auth when non-empty and no
 #                              DSPARK_WARMUP_BEARER was provided
+#   DSPARK_WARMUP_MAX_CONCURRENCY
+#                              resolved --max-num-seqs from the launcher
+#                              (default 6); C=1/2/4/6 arms above it are skipped
 #   WARMUP_CURL                test seam: overrides the curl binary
 set -u
 
@@ -52,6 +55,13 @@ BASE="${1:-http://127.0.0.1:8888}"
 MODEL="${2:-deepseek-v4-flash-0731}"
 CURL_BIN="${WARMUP_CURL:-curl}"
 REQ_TIMEOUT="${DSPARK_WARMUP_REQ_TIMEOUT:-240}"
+MAX_CONCURRENCY="${DSPARK_WARMUP_MAX_CONCURRENCY:-6}"
+case "$MAX_CONCURRENCY" in
+  ''|*[!0-9]*|0)
+    echo "boot-shape-warmup: invalid DSPARK_WARMUP_MAX_CONCURRENCY=${MAX_CONCURRENCY@Q}; using 6" >&2
+    MAX_CONCURRENCY=6
+    ;;
+esac
 NONCE="$$-$(date +%s)"
 
 AUTH_ARGS=()
@@ -175,9 +185,14 @@ total_t0=$(date +%s)
 # completions), then the batch/chat arms.
 ladder
 
+EXPECTED_CHAT_REQUESTS=4        # c1 + mid + longchunk + nothink
 burst c1        1 300
-burst c2        2 420
-burst c4        4 380
+if [ "$MAX_CONCURRENCY" -ge 2 ]; then burst c2 2 420; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 2)); fi
+if [ "$MAX_CONCURRENCY" -ge 4 ]; then burst c4 4 380; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 4)); fi
+if [ "$MAX_CONCURRENCY" -ge 6 ]; then burst c6 6 340; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 6)); fi
+if [ "$MAX_CONCURRENCY" -gt 6 ]; then
+  echo "boot-shape-warmup: WARN: MAX_NUM_SEQS=${MAX_CONCURRENCY}; batch shapes above C=6 are not pre-warmed" >&2
+fi
 burst mid       1 2600
 burst longchunk 1 9500          # crosses the 8192-token chunk boundary (BLOCK 256); its tail does NOT reach low buckets
 t0=$(date +%s)
@@ -192,7 +207,7 @@ for f in "$tmpdir"/*-*; do
   total=$((total + 1))
   [ "$(cat "$f")" = "ok" ] && ok_count=$((ok_count + 1))
 done
-EXPECTED_REQUESTS=$(( ${#LADDER_S[@]} + 10 ))   # 6 ladder rungs + 10 chat arms (c1..c4 bursts = 7, mid, longchunk, nothink)
+EXPECTED_REQUESTS=$(( ${#LADDER_S[@]} + EXPECTED_CHAT_REQUESTS ))
 if [ "$total" -ne "$EXPECTED_REQUESTS" ]; then
   echo "boot-shape-warmup: internal error: tallied $total outcomes for $EXPECTED_REQUESTS scheduled requests" >&2
   exit 1

@@ -19,7 +19,7 @@ ok()  { pass=$((pass + 1)); [ "$QUIET" = "-q" ] || printf '  ok  %s\n' "$*"; }
 bad() { fail=$((fail + 1)); printf '  FAIL %s\n' "$*" >&2; }
 
 # Recording curl stub.
-# STUB_MODE: ok | chatfail | probefail | killparent | tokfail45 | badcount45.
+# STUB_MODE: ok | chatfail | probefail | killparent | tokfail45 | badcount45 | nocount45.
 cat > "$work/curl-stub" <<'STUB'
 #!/usr/bin/env bash
 rec="${STUB_REC:?}"
@@ -48,6 +48,7 @@ if [ "$is_tok" = 1 ]; then
   cnt=$(printf '%s' "$p" | wc -w | tr -d ' ')
   [ "${STUB_MODE:-ok}" = "tokfail45" ] && [ "$cnt" = 45 ] && exit 22
   [ "${STUB_MODE:-ok}" = "badcount45" ] && [ "$cnt" = 45 ] && cnt=$((cnt + 1))
+  [ "${STUB_MODE:-ok}" = "nocount45" ] && [ "$cnt" = 45 ] && { printf '{"tokens":[]}\n'; exit 0; }
   printf '{"tokens":[],"count":%s}\n' "$cnt"
   exit 0
 fi
@@ -85,28 +86,28 @@ file_ts() { # $1 = recorded file path -> leading nanosecond timestamp of its nam
   printf '%s' "${b%%-*}"
 }
 
-# ---- 1. all-success run: exit 0; 10 chats + 6 completions + 6 tokenizes ------
+# ---- 1. shipped-default run: exit 0; 16 chats + 6 completions + 6 tokenizes --
 rec="$work/r1"
 if run_sweep ok "$rec"; then ok "all-success sweep exits 0"; else bad "all-success sweep exited nonzero"; fi
 
 chat_n=$(ls "$rec"/chat-* 2>/dev/null | wc -l)
-[ "$chat_n" -eq 10 ] && ok "10 chat requests fired" || bad "expected 10 chat requests, got $chat_n"
+[ "$chat_n" -eq 16 ] && ok "16 chat requests fired" || bad "expected 16 chat requests, got $chat_n"
 comp_n=$(ls "$rec"/comp-* 2>/dev/null | wc -l)
 [ "$comp_n" -eq 6 ] && ok "6 ladder completions fired" || bad "expected 6 ladder completions, got $comp_n"
 tok_n=$(ls "$rec"/tok-* 2>/dev/null | wc -l)
 [ "$tok_n" -eq 6 ] && ok "6 tokenize verifications performed" || bad "expected 6 tokenize calls, got $tok_n"
 
-for tag in c1-1 c2-1 c2-2 c4-1 c4-2 c4-3 c4-4 mid-1 longchunk-1; do
+for tag in c1-1 c2-1 c2-2 c4-1 c4-2 c4-3 c4-4 c6-1 c6-2 c6-3 c6-4 c6-5 c6-6 mid-1 longchunk-1; do
   grep -lq "warmup .* ${tag}\]" "$rec"/chat-* || bad "arm ${tag} missing from recorded bodies"
 done
-grep -lq 'warmup .* nothink-1\]' "$rec"/chat-* && ok "all 10 arm tags present" \
+grep -lq 'warmup .* nothink-1\]' "$rec"/chat-* && ok "all 16 arm tags present" \
   || bad "nothink arm missing"
 
 # ---- 2. thinking-off arm is exactly one --------------------------------------
 tf=$(grep -l '"thinking":false' "$rec"/chat-* | wc -l)
 [ "$tf" -eq 1 ] && ok "exactly one thinking:false arm" || bad "thinking:false arms: $tf (want 1)"
 tt=$(grep -l '"thinking":true' "$rec"/chat-* | wc -l)
-[ "$tt" -eq 9 ] && ok "9 thinking:true arms" || bad "thinking:true arms: $tt (want 9)"
+[ "$tt" -eq 15 ] && ok "15 thinking:true arms" || bad "thinking:true arms: $tt (want 15)"
 
 # ---- 3. long arm actually crosses the 8192 chunk boundary --------------------
 longlen=$(wc -c < "$(grep -l 'longchunk-1\]' "$rec"/chat-*)")
@@ -121,7 +122,7 @@ n2=$(grep -oh 'warmup [^ ]*' "$rec2"/chat-* | sort -u | head -1)
 [ -n "$n1" ] && [ "$n1" != "$n2" ] && ok "nonce differs across runs ($n1 vs $n2)" \
   || bad "nonce identical across runs — prefix cache would skip the warmed prefill"
 uniq_tags=$(grep -oh 'warmup [^]]*\]' "$rec"/chat-* | sort -u | wc -l)
-[ "$uniq_tags" -eq 10 ] && ok "10 distinct chat tags within a run" || bad "distinct chat tags: $uniq_tags (want 10)"
+[ "$uniq_tags" -eq 16 ] && ok "16 distinct chat tags within a run" || bad "distinct chat tags: $uniq_tags (want 16)"
 
 # ---- 5. bucket ladder: exact declared token counts, all six live BLOCK keys --
 counts=$(for f in "$rec"/comp-*; do comp_prompt "$f" | wc -w; done | sort -un | tr '\n' ' ')
@@ -133,11 +134,25 @@ for b in 8 16 32 64 128 256; do
     && ok "BLOCK ${b} rung mapped and fired" \
     || bad "no stdout evidence that BLOCK ${b} was mapped/fired"
 done
-if grep -rqE 'arm c6| c6-[0-9]' "$rec" 2>/dev/null; then
-  bad "C=6 arm still present somewhere in requests/logs"
+for tag in c6-1 c6-2 c6-3 c6-4 c6-5 c6-6; do
+  grep -lq "warmup .* ${tag}\]" "$rec"/chat-* || bad "shipped MAX_NUM_SEQS=6 arm ${tag} missing"
+done
+ok "C=6 arm runs at shipped MAX_NUM_SEQS=6 default"
+
+rec_cap4="$work/r-cap4"
+run_sweep ok "$rec_cap4" DSPARK_WARMUP_MAX_CONCURRENCY=4 >/dev/null 2>&1 \
+  || bad "MAX_NUM_SEQS=4 profile sweep exited nonzero"
+cap4_chat_n=$(ls "$rec_cap4"/chat-* 2>/dev/null | wc -l)
+[ "$cap4_chat_n" -eq 10 ] && ok "MAX_NUM_SEQS=4 profile fires 10 chat requests" \
+  || bad "MAX_NUM_SEQS=4 profile fired $cap4_chat_n chat requests (want 10)"
+if grep -rqE 'arm c6| c6-[0-9]' "$rec_cap4" 2>/dev/null; then
+  bad "C=6 arm fired above the MAX_NUM_SEQS=4 profile"
 else
-  ok "no C=6 arm remains (deployed MAX_NUM_SEQS=4)"
+  ok "C=6 arm is skipped at MAX_NUM_SEQS=4"
 fi
+grep -q "^boot-shape-warmup: 16/16 requests ok" "$rec_cap4/stdout" \
+  && ok "MAX_NUM_SEQS=4 profile tallies exactly 16/16" \
+  || bad "MAX_NUM_SEQS=4 summary wrong: $(grep 'requests ok' "$rec_cap4/stdout" || true)"
 
 # ---- 6. tokenize gate: verified, authenticated, BEFORE its completion --------
 for s in 1 6 20 45 100 200; do
@@ -162,8 +177,8 @@ for f in "$rec5"/chat-* "$rec5"/comp-* "$rec5"/tok-* "$rec5"/probe-*; do
   req_n=$((req_n + 1))
   [ "$(head -n 1 "$f")" = "Authorization: Bearer warmup-first-key" ] || missing_auth=$((missing_auth + 1))
 done
-[ "$req_n" -eq 23 ] && ok "probe + 10 chats + 6 tokenizes + 6 completions recorded" \
-  || bad "expected 23 recorded requests, got $req_n"
+[ "$req_n" -eq 29 ] && ok "probe + 16 chats + 6 tokenizes + 6 completions recorded" \
+  || bad "expected 29 recorded requests, got $req_n"
 [ "$missing_auth" -eq 0 ] && ok "every request (incl. /tokenize gate) carries the launcher-provided bearer" \
   || bad "$missing_auth request(s) missing/mismatching Authorization header"
 grep -rq "ambient-vllm-key" "$rec5" && bad "ambient VLLM_API_KEY value leaked into requests or logs" \
@@ -171,11 +186,11 @@ grep -rq "ambient-vllm-key" "$rec5" && bad "ambient VLLM_API_KEY value leaked in
 
 # ---- 8. VLLM_API_KEY-only fallback preserved; open cluster sends no header ----
 rec6="$work/r6"
-run_sweep ok "$rec6" VLLM_API_KEY=sk-solo-vllm >/dev/null 2>&1 || true
+run_sweep ok "$rec6" VLLM_API_KEY=solo-vllm-key >/dev/null 2>&1 || true
 solo_bad=0
 for f in "$rec6"/chat-* "$rec6"/comp-* "$rec6"/tok-*; do
   [ -f "$f" ] || continue
-  [ "$(head -n 1 "$f")" = "Authorization: Bearer sk-solo-vllm" ] || solo_bad=$((solo_bad + 1))
+  [ "$(head -n 1 "$f")" = "Authorization: Bearer solo-vllm-key" ] || solo_bad=$((solo_bad + 1))
 done
 [ "$solo_bad" -eq 0 ] && ok "VLLM_API_KEY fallback authenticates every chat/ladder request" \
   || bad "$solo_bad requests unauthenticated under fallback"
@@ -187,8 +202,8 @@ grep -rq "Authorization:" "$rec7" && bad "open cluster sent an Authorization hea
 # ---- 9. chat failures: exit 1, precise failure count on stderr ----------------
 rec3="$work/r3"
 if run_sweep chatfail "$rec3"; then bad "chatfail sweep exited 0"; else ok "chatfail sweep exits nonzero"; fi
-grep -q "10 request(s) failed" "$rec3/stderr" && ok "failure count named on stderr" \
-  || bad "expected '10 request(s) failed' on stderr"
+grep -q "16 request(s) failed" "$rec3/stderr" && ok "failure count named on stderr" \
+  || bad "expected '16 request(s) failed' on stderr"
 
 # ---- 10. unreachable API: exit 1 fast, no requests fired ----------------------
 rec4="$work/r4"
@@ -197,12 +212,12 @@ post_probe=$(ls "$rec4"/chat-* "$rec4"/comp-* "$rec4"/tok-* 2>/dev/null | wc -l)
 [ "$post_probe" -eq 0 ] && ok "nothing fired after failed probe" \
   || bad "$post_probe request(s) fired after failed probe"
 
-# ---- 11. subshell dying before writing still tallies: 15/16, never n/n short ---
+# ---- 11. subshell dying before writing still tallies: 21/22, never n/n short ---
 rec8="$work/r8"
 if run_sweep killparent "$rec8"; then bad "killparent sweep exited 0"; else ok "lost outcome fails the sweep"; fi
-grep -q "^boot-shape-warmup: 15/16 requests ok" "$rec8/stdout" \
+grep -q "^boot-shape-warmup: 21/22 requests ok" "$rec8/stdout" \
   && ok "request whose subshell died before writing counted as failed" \
-  || bad "summary not 15/16: $(grep 'requests ok' "$rec8/stdout" || true)"
+  || bad "summary not 21/22: $(grep 'requests ok' "$rec8/stdout" || true)"
 grep -q "1 request(s) failed" "$rec8/stderr" || bad "failure count missing on stderr"
 
 # ---- 12. tokenize endpoint error: rung skipped, counted, precise diagnostic ----
@@ -214,9 +229,9 @@ grep -q "rung s=45: POST /tokenize errored" "$rec9/stderr" \
 tf_comp=$(ls "$rec9"/comp-* 2>/dev/null | wc -l)
 [ "$tf_comp" -eq 5 ] && ok "failed-gate rung did NOT fire its completion" \
   || bad "expected 5 completions after skipped rung, got $tf_comp"
-grep -q "^boot-shape-warmup: 15/16 requests ok" "$rec9/stdout" \
-  && ok "skipped rung still counted (15/16)" \
-  || bad "summary not 15/16 after tokenize transport failure"
+grep -q "^boot-shape-warmup: 21/22 requests ok" "$rec9/stdout" \
+  && ok "skipped rung still counted (21/22)" \
+  || bad "summary not 21/22 after tokenize transport failure"
 
 # ---- 13. tokenize count mismatch: rung skipped, counted, secret-free diag ------
 rec10="$work/r10"
@@ -227,9 +242,22 @@ grep -q "/tokenize reported 46 tokens, need exactly 45" "$rec10/stderr" \
 bc_comp=$(ls "$rec10"/comp-* 2>/dev/null | wc -l)
 [ "$bc_comp" -eq 5 ] && ok "mismatched rung did NOT fire its completion" \
   || bad "expected 5 completions after mismatched rung, got $bc_comp"
-grep -q "^boot-shape-warmup: 15/16 requests ok" "$rec10/stdout" \
-  && ok "mismatched rung still counted (15/16)" \
-  || bad "summary not 15/16 after count mismatch"
+grep -q "^boot-shape-warmup: 21/22 requests ok" "$rec10/stdout" \
+  && ok "mismatched rung still counted (21/22)" \
+  || bad "summary not 21/22 after count mismatch"
+
+# ---- 14. tokenize response without count: rung skipped and diagnosed ----------
+rec11="$work/r11"
+if run_sweep nocount45 "$rec11"; then bad "nocount45 sweep exited 0"; else ok "missing-count rung fails the sweep"; fi
+grep -q 'rung s=45: no usable "count"' "$rec11/stderr" \
+  && ok "missing tokenize count diagnosed precisely (rung s=45)" \
+  || bad "missing precise diagnostic for absent tokenize count"
+nc_comp=$(ls "$rec11"/comp-* 2>/dev/null | wc -l)
+[ "$nc_comp" -eq 5 ] && ok "missing-count rung did NOT fire its completion" \
+  || bad "expected 5 completions after missing-count rung, got $nc_comp"
+grep -q "^boot-shape-warmup: 21/22 requests ok" "$rec11/stdout" \
+  && ok "missing-count rung still counted (21/22)" \
+  || bad "summary not 21/22 after absent tokenize count"
 
 printf 'test-boot-shape-warmup: %d ok, %d failed\n' "$pass" "$fail"
 exit "$((fail > 0 ? 1 : 0))"
