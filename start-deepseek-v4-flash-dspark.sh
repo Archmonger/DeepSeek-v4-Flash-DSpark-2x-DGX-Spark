@@ -1108,6 +1108,28 @@ for _ in $(seq 1 "$WAIT_ATTEMPTS"); do
         -d '{"model":"'"${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"'","messages":[{"role":"user","content":"Reply with OK."}],"max_tokens":32,"temperature":0.6,"top_p":0.95,"chat_template_kwargs":{"thinking":true,"reasoning_effort":"low"}}' >/dev/null
       echo "Minimal chat request succeeded."
     fi
+    # Issue #117: burn the spec-decode/prefill Triton shape buckets before real
+    # traffic can JIT them mid-serve (a compiling rank can stall its peer past
+    # torch's 600 s NCCL watchdog). Non-fatal: warmup gaps degrade back to the
+    # mid-serve-JIT status quo, never to a failed boot.
+    if [ "${DSPARK_BOOT_SHAPE_WARMUP:-1}" = "1" ]; then
+      # Authenticated clusters need a valid bearer or every sweep request 401s
+      # and warms nothing. Hand the child the same credential this script's
+      # smoke probe uses: the first already-parsed DSPARK_API_KEYS key, else
+      # VLLM_API_KEY (they are mutually exclusive upstream). The launcher-to-
+      # warmup handoff uses the environment, not a script argument or log line.
+      _warmup_bearer="${VLLM_API_KEY:-}"
+      if [ "$_dspark_keys_set" = "1" ]; then
+        _warmup_bearer="${_dspark_keys[0]}"
+      fi
+      DSPARK_WARMUP_MAX_CONCURRENCY="${MAX_NUM_SEQS:-6}" \
+        DSPARK_WARMUP_BEARER="$_warmup_bearer" \
+        bash "$SCRIPT_DIR/scripts/boot-shape-warmup.sh" \
+        "${CHAT_URL%/v1/chat/completions}" "${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}" || \
+        echo "WARN: boot shape warmup incomplete — uncovered shapes may JIT mid-serve (issue #117)" >&2
+    else
+      echo "Boot shape warmup: SKIPPED (DSPARK_BOOT_SHAPE_WARMUP=0)"
+    fi
     exit 0
   fi
   wait_with_startup_logs
