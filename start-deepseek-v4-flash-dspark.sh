@@ -1113,7 +1113,17 @@ for _ in $(seq 1 "$WAIT_ATTEMPTS"); do
     # torch's 600 s NCCL watchdog). Non-fatal: warmup gaps degrade back to the
     # mid-serve-JIT status quo, never to a failed boot.
     if [ "${DSPARK_BOOT_SHAPE_WARMUP:-1}" = "1" ]; then
-      bash "$SCRIPT_DIR/scripts/boot-shape-warmup.sh" \
+      # Authenticated clusters need a valid bearer or every sweep request 401s
+      # and warms nothing. Hand the child the same credential this script's
+      # smoke probe uses: the first already-parsed DSPARK_API_KEYS key, else
+      # VLLM_API_KEY (they are mutually exclusive upstream). Environment only —
+      # never argv or an echo — so ps output and boot logs stay key-free.
+      _warmup_bearer="${VLLM_API_KEY:-}"
+      if [ "$_dspark_keys_set" = "1" ]; then
+        _warmup_bearer="${_dspark_keys[0]}"
+      fi
+      DSPARK_WARMUP_BEARER="$_warmup_bearer" \
+        bash "$SCRIPT_DIR/scripts/boot-shape-warmup.sh" \
         "${CHAT_URL%/v1/chat/completions}" "${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}" || \
         echo "WARN: boot shape warmup incomplete — uncovered shapes may JIT mid-serve (issue #117)" >&2
     else
