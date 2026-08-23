@@ -25,9 +25,10 @@
 #   and any count mismatch fails the rung — and the nonfatal warmup — with a
 #   precise, secret-free diagnostic instead of silently warming a wrong shape.
 # - Chat arms C=1/2/4/6 (bounded by the launcher's resolved
-#   --max-num-seqs), medium + multi-chunk long prefill, and one thinking-off
-#   arm keep multi-request batch coverage for other (batch-keyed) kernels;
-#   they contribute nothing to the low buckets above.
+#   --max-num-seqs) cover both bounded longer prompts and ordinary short
+#   requests with client-default generation settings. Medium + multi-chunk
+#   long prefill and one thinking-off arm cover other batch-keyed variants;
+#   none of these arms contributes to the low buckets above.
 #
 # Non-fatal by design: the cost of a missed shape is a mid-serve JIT (what this
 # script exists to reduce), not an outage — the launcher must treat a warmup
@@ -91,32 +92,39 @@ mk_prompt() { # $1 = approx token count (repeated filler words), $2 = tag
     "$NONCE" "$tag" "$body"
 }
 
-fire() { # $1 = tag, $2 = words, $3 = thinking(true|false), $4 = result file
-  local tag=$1 words=$2 thinking=$3 out=$4 prompt
+fire() { # $1 = tag, $2 = words, $3 = thinking, $4 = result file, $5 = request profile
+  local tag=$1 words=$2 thinking=$3 out=$4 profile=${5:-bounded} prompt payload
   prompt=$(mk_prompt "$words" "$tag")
+  if [ "$profile" = "serve-default" ]; then
+    # Mirror an ordinary short client request: no explicit max_tokens or
+    # chat-template override. These scheduler defaults have distinct Triton
+    # variants from the bounded long-context arms below.
+    payload='{"model":"'"$MODEL"'","messages":[{"role":"user","content":"'"$prompt"'"}],"temperature":0}'
+  else
+    payload='{"model":"'"$MODEL"'","messages":[{"role":"user","content":"'"$prompt"'"}],"max_tokens":24,"temperature":0,"chat_template_kwargs":{"thinking":'"$thinking"',"reasoning_effort":"low"}}'
+  fi
   if "$CURL_BIN" -fsS --max-time "$REQ_TIMEOUT" "${AUTH_ARGS[@]}" \
       "$BASE/v1/chat/completions" -H "Content-Type: application/json" \
-      -d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"'"$prompt"'"}],"max_tokens":24,"temperature":0,"chat_template_kwargs":{"thinking":'"$thinking"',"reasoning_effort":"low"}}' \
-      >/dev/null 2>>"$tmpdir/errors"; then
+      -d "$payload" >/dev/null 2>>"$tmpdir/errors"; then
     echo ok > "$out"
   else
     echo fail > "$out"
   fi
 }
 
-burst() { # $1 = arm name, $2 = concurrency, $3 = words-per-request
-  local arm=$1 c=$2 words=$3 i t0 t1
+burst() { # $1 = arm name, $2 = concurrency, $3 = words-per-request, $4 = request profile
+  local arm=$1 c=$2 words=$3 profile=${4:-bounded} i t0 t1
   # Pre-create every result file in the parent before forking so a subshell
   # that dies before writing still tallies as a failed outcome: the summary
   # can never claim n/n over fewer outcomes than requests scheduled.
   for i in $(seq 1 "$c"); do : > "$tmpdir/${arm}-${i}"; done
   t0=$(date +%s)
   for i in $(seq 1 "$c"); do
-    fire "${arm}-${i}" "$words" true "$tmpdir/${arm}-${i}" &
+    fire "${arm}-${i}" "$words" true "$tmpdir/${arm}-${i}" "$profile" &
   done
   wait
   t1=$(date +%s)
-  echo "  arm ${arm}: C=${c} x ~${words} tok, $((t1 - t0))s"
+  echo "  arm ${arm}: C=${c} x ~${words} tok, profile=${profile}, $((t1 - t0))s"
 }
 
 mk_ladder_prompt() { # $1 = exact token count ('hello' + (N-1)x ' hello')
@@ -185,11 +193,12 @@ total_t0=$(date +%s)
 # completions), then the batch/chat arms.
 ladder
 
-EXPECTED_CHAT_REQUESTS=4        # c1 + mid + longchunk + nothink
+EXPECTED_CHAT_REQUESTS=5        # c1 + short-c1 + mid + longchunk + nothink
 burst c1        1 300
-if [ "$MAX_CONCURRENCY" -ge 2 ]; then burst c2 2 420; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 2)); fi
-if [ "$MAX_CONCURRENCY" -ge 4 ]; then burst c4 4 380; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 4)); fi
-if [ "$MAX_CONCURRENCY" -ge 6 ]; then burst c6 6 340; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 6)); fi
+burst short-c1  1 8 serve-default
+if [ "$MAX_CONCURRENCY" -ge 2 ]; then burst c2 2 420; burst short-c2 2 8 serve-default; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 4)); fi
+if [ "$MAX_CONCURRENCY" -ge 4 ]; then burst c4 4 380; burst short-c4 4 8 serve-default; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 8)); fi
+if [ "$MAX_CONCURRENCY" -ge 6 ]; then burst c6 6 340; burst short-c6 6 8 serve-default; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 12)); fi
 if [ "$MAX_CONCURRENCY" -gt 6 ]; then
   echo "boot-shape-warmup: WARN: MAX_NUM_SEQS=${MAX_CONCURRENCY}; batch shapes above C=6 are not pre-warmed" >&2
 fi
