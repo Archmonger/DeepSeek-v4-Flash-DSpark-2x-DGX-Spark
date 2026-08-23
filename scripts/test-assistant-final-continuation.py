@@ -3,8 +3,9 @@
 
 These are CPU-only gates: they verify the patcher transforms a faithful
 minimal stock encoder shape (trailing-assistant generation gains exactly one
-header; the same shape without a generation prompt and every unrelated shape
-render byte-identically),
+header, the same shape annotated by a trailing latest_reminder gains exactly
+one fresh header after the reminder, reminder tails directly after
+user/developer and every unrelated shape render byte-identically),
 that apply is idempotent, that a gated-ON invocation fails closed on missing
 target / missing anchor / failed self-check and restores the original bytes,
 and that the compose/.env/start wiring invokes the patch only when
@@ -35,6 +36,7 @@ STOCK_ENCODER = '''\
 eos_token = "<|end of sentence|>"
 user_sp_token = "<|User|>"
 assistant_sp_token = "<|Assistant|>"
+latest_reminder_sp_token = "<|latest_reminder|>"
 thinking_start_token = "<think>"
 
 
@@ -52,6 +54,8 @@ def render_message(index, messages, thinking_mode, drop_thinking=True, reasoning
         out.append(content)
     elif role == "assistant":
         out = [content, eos_token]
+    elif role == "latest_reminder":
+        out = [latest_reminder_sp_token + content]
     else:
         raise NotImplementedError(role)
 
@@ -85,6 +89,30 @@ TRAILING_ASSISTANT = [
     {"role": "assistant", "content": "A finished answer."},
 ]
 
+# The extension defect: a harness retry re-sends the closed assistant turn
+# and appends a trailing latest_reminder annotation after it. Stock (and the
+# pre-extension hotfix) end this shape without any generation header.
+ASSISTANT_FINAL_WITH_TRAILING_REMINDER = [
+    {"role": "system", "content": "s"},
+    {"role": "user", "content": "u"},
+    {"role": "assistant", "content": "A finished answer."},
+    {"role": "latest_reminder", "content": "Fresh context."},
+]
+
+# Reminder tails directly after user/developer already end inside the
+# pending generation slot in stock; they must stay byte-identical.
+USER_THEN_TRAILING_REMINDER = [
+    {"role": "system", "content": "s"},
+    {"role": "user", "content": "u"},
+    {"role": "latest_reminder", "content": "Fresh context."},
+]
+
+DEVELOPER_THEN_TRAILING_REMINDER = [
+    {"role": "system", "content": "s"},
+    {"role": "developer", "content": "d"},
+    {"role": "latest_reminder", "content": "Fresh context."},
+]
+
 # Shapes whose final message is NOT assistant: the hotfix must not touch
 # their rendering at all.
 UNRELATED_SHAPES = [
@@ -114,6 +142,25 @@ UNRELATED_SHAPES = [
         {"role": "system", "content": "s"},
         {"role": "user", "content": "u"},
         {"role": "tool", "content": "t"},
+    ],
+    # reminders mid-transcript (the trailing slot belongs to another turn)
+    [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+        {"role": "latest_reminder", "content": "r"},
+        {"role": "user", "content": "u2"},
+    ],
+    [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+        {"role": "assistant", "content": "a"},
+        {"role": "latest_reminder", "content": "r"},
+        {"role": "user", "content": "u2"},
+    ],
+    # task precedence keeps winning next to reminder tails
+    [
+        {"role": "user", "content": "u", "task": "title"},
+        {"role": "latest_reminder", "content": "r"},
     ],
     [
         {"role": "system", "content": "s"},
@@ -176,6 +223,53 @@ class AssistantFinalHotfixTest(unittest.TestCase):
                 stock_out + ["<|Assistant|>", "<think>"],
             )
             self.assertEqual(len(out), len(stock_out) + 2)
+
+    def test_assistant_final_with_trailing_latest_reminder_gains_exactly_one_generation_header(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, STOCK_ENCODER)
+            self.assertEqual(self._run(path), 0)
+            patched = _load_module_from(path)
+            stock = _exec_dict(STOCK_ENCODER)
+            messages = ASSISTANT_FINAL_WITH_TRAILING_REMINDER
+            out = patched.encode_messages(messages, "thinking")
+            stock_out = stock["encode_messages"](messages, "thinking")
+            # Stock ends on the bare reminder after the EOS-closed assistant
+            # turn (no generation header). Patched rendering preserves those
+            # stock bytes and appends exactly one fresh generation header.
+            self.assertEqual(stock_out[-2:], ["<|end of sentence|>",
+                                              "<|latest_reminder|>Fresh context."])
+            self.assertEqual(
+                out,
+                stock_out + ["<|Assistant|>", "<think>"],
+            )
+            self.assertEqual(len(out), len(stock_out) + 2)
+
+    def test_user_then_trailing_latest_reminder_stays_byte_identical(self):
+        # Stock already ends a user->latest_reminder tail inside the pending
+        # generation slot (header emitted before the reminder); the widened
+        # transition must not append a second header there.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, STOCK_ENCODER)
+            self.assertEqual(self._run(path), 0)
+            patched = _load_module_from(path)
+            stock = _exec_dict(STOCK_ENCODER)
+            self.assertEqual(patched.encode_messages(
+                USER_THEN_TRAILING_REMINDER, "thinking"),
+                stock["encode_messages"](USER_THEN_TRAILING_REMINDER, "thinking"),
+            )
+
+    def test_developer_then_trailing_latest_reminder_stays_byte_identical(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, STOCK_ENCODER)
+            self.assertEqual(self._run(path), 0)
+            patched = _load_module_from(path)
+            stock = _exec_dict(STOCK_ENCODER)
+            self.assertEqual(patched.encode_messages(
+                DEVELOPER_THEN_TRAILING_REMINDER, "thinking"),
+                stock["encode_messages"](DEVELOPER_THEN_TRAILING_REMINDER, "thinking"),
+            )
 
 
     def test_unrelated_shapes_byte_identical(self):
