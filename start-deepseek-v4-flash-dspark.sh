@@ -9,7 +9,6 @@ WAIT_ATTEMPTS="${WAIT_ATTEMPTS:-100}"
 WAIT_SECONDS="${WAIT_SECONDS:-15}"
 ENABLE_VLLM_GB10_PATCH="${ENABLE_VLLM_GB10_PATCH:-0}"
 VLLM_GB10_PATCH_DIR="${VLLM_GB10_PATCH_DIR:-$SCRIPT_DIR/vllm_patch_gb10}"
-DSPARK_PROPOSER_FILE="${DSPARK_PROPOSER_FILE:-$SCRIPT_DIR/recipe/vllm/v1/spec_decode/dspark_proposer.py}"
 CLI_VLLM_HOST=""
 CLI_VLLM_PORT=""
 
@@ -861,11 +860,6 @@ if [ "$ENABLE_VLLM_GB10_PATCH" = "1" ] && [ ! -d "$VLLM_GB10_PATCH_DIR" ]; then
   exit 1
 fi
 
-if [ ! -f "$DSPARK_PROPOSER_FILE" ]; then
-  echo "Missing DSpark proposer bind-mount source: $DSPARK_PROPOSER_FILE" >&2
-  exit 1
-fi
-
 docker compose version >/dev/null
 docker image inspect "$DSPARK_VLLM_IMAGE" >/dev/null || {
   echo "Missing local Docker image $DSPARK_VLLM_IMAGE." >&2
@@ -937,8 +931,6 @@ SIDECAR_COMPOSE_FILE="${SIDECAR_COMPOSE_FILE:-$SCRIPT_DIR/docker-compose.vl-side
 if [ -f "$SIDECAR_COMPOSE_FILE" ]; then
   scp "$SIDECAR_COMPOSE_FILE" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/docker-compose.vl-sidecar.yml"
 fi
-ssh "$WORKER_HOST" "mkdir -p $REMOTE_WORKER_DIR/recipe/vllm/v1/spec_decode"
-scp "$DSPARK_PROPOSER_FILE" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/recipe/vllm/v1/spec_decode/dspark_proposer.py"
 DSPARK_HOTFIX_FILE="$SCRIPT_DIR/patches/hotfix-nvfp4-ds-mla-issue22.sh"
 if [ -f "$DSPARK_HOTFIX_FILE" ]; then
   echo "Syncing Issue #22 hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"

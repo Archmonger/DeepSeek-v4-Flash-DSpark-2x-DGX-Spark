@@ -73,8 +73,8 @@ This work also relies on:
 ## TonyD2Wild NVFP4 Recipe Lineage
 
 TonyD2Wild's public NVFP4 recipe work informed this fork's garble-fix launcher
-defaults, runtime documentation, and the non-uniform batch guard merged into the
-bind-mounted `dspark_proposer.py`.
+defaults, runtime documentation, and the non-uniform batch guard in the Stage-C
+`dspark_proposer.py`.
 
 - https://github.com/tonyd2wild/DeepSeek-v4-Flash-DSpark-1M-NVFP4-KV-2x-DGX-Spark
 
@@ -82,7 +82,7 @@ bind-mounted `dspark_proposer.py`.
 
 MiaAI-Lab maintains this fork's validated 2x DGX Spark NVFP4-KV recipe, Stage
 A/B/C runtime packaging, sanitized two-node launch flow, Keys concurrency patch
-integration, runtime proposer bind-mount, and benchmark artifacts from the
+integration, runtime proposer overlay, and benchmark artifacts from the
 validated runs.
 
 ## License Notes
