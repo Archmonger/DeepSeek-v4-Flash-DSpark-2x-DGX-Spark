@@ -19,9 +19,11 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.dspark import (
     DSparkDiagnostics,
+    DrafterCompilationConfigView,
     confidence_threshold_prefix_length,
     hardware_aware_prefix_schedule,
     make_dspark_warmup_draft_token_ids,
+    resolve_drafter_capture_sizes,
     score_prefix_lengths,
 )
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
@@ -89,6 +91,19 @@ class DSparkProposer(SpecDecodeBaseProposer):
         # batch-row position, which vLLM-v1 condenses as requests finish.
         self._req_id_to_slot: dict[str, int] = {}
         self._free_slots: list[int] = list(range(self.max_batch_size))
+        self._draft_capture_sizes = resolve_drafter_capture_sizes(
+            os.getenv("VLLM_DSPARK_DRAFT_CAPTURE_SIZES", "0"),
+            self.max_batch_size,
+        )
+        if self._draft_capture_sizes is not None:
+            self.cudagraph_dispatcher.compilation_config = (
+                DrafterCompilationConfigView(
+                    self.compilation_config, self._draft_capture_sizes
+                )
+            )
+            logger.info(
+                "DSpark drafter CUDA graph sizes: %s", self._draft_capture_sizes
+            )
         self.diagnostics = DSparkDiagnostics(
             max_spec_tokens=self.num_speculative_tokens
         )
@@ -383,8 +398,35 @@ class DSparkProposer(SpecDecodeBaseProposer):
         is_graph_capturing: bool = False,
         slot_mappings: dict[str, torch.Tensor] | None = None,
     ) -> None:
-        del is_graph_capturing, slot_mappings
+        del slot_mappings
         batch_size = max(1, min(int(num_tokens), self.max_batch_size))
+        if (
+            is_graph_capturing
+            and use_cudagraphs
+            and self._draft_capture_sizes is not None
+            and self._draft_graph_runner is not None
+        ):
+            num_warmups = max(
+                1, int(self.compilation_config.cudagraph_num_of_warmups)
+            )
+            for size in reversed(self._draft_capture_sizes):
+                if self._draft_graph_is_captured(size):
+                    continue
+                for _ in range(num_warmups):
+                    self._dummy_draft(size, use_cudagraphs=False)
+                self._dummy_draft(size, use_cudagraphs=True)
+        self._dummy_draft(batch_size, use_cudagraphs=use_cudagraphs)
+
+    def _draft_graph_is_captured(self, batch_size: int) -> bool:
+        assert self._draft_graph_runner is not None
+        mode, descriptor = self.cudagraph_dispatcher.dispatch(batch_size)
+        if mode != CUDAGraphMode.PIECEWISE:
+            return True
+        entries = self._draft_graph_runner.concrete_cudagraph_entries
+        entry = entries.get(descriptor)
+        return entry is not None and entry.cudagraph is not None
+
+    def _dummy_draft(self, batch_size: int, *, use_cudagraphs: bool) -> None:
         (
             cudagraph_runtime_mode,
             padded_batch_size,

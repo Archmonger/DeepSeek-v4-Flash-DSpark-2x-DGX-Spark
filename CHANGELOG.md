@@ -1,3 +1,14 @@
+## 2026-08-24
+
+### Added
+
+- **Stage-C-only drafter CUDA graph sizing**: `VLLM_DSPARK_DRAFT_CAPTURE_SIZES=1` captures request-count buckets without mutating target graph sizes. It defaults off; the Anemll 0.1.1 runtime already uses a different, speculator-private graph manager and is unchanged.
+
+### Fixed
+
+- **Stage-C DSpark shared-expert loading**: draft `w1`/`w3` tensors now load into `shared_experts.gate_up_proj` instead of being skipped. The default Anemll 0.1.1 image already carries equivalent loader mappings.
+- Removed the unused duplicate proposer and its stale launcher validation/worker copy. Stage-C builds continue to use `recipe/overlay/vllm/v1/spec_decode/dspark_proposer.py`.
+
 ## 2026-08-23
 
 ### Added

@@ -53,7 +53,7 @@ py_files+=(
   scripts/test-empty-encoder-output-hotfix.py
   scripts/ruler-lite.py
   scripts/verify-dsv4-027-equality-gate.py
-  tests/test_dspark_stacked_mapping.py
+  tests/test_dspark_helpers.py
 )
 python3 -m py_compile "${py_files[@]}"
 ok "py_compile ${#py_files[@]} files"
@@ -91,8 +91,8 @@ python3 scripts/test-empty-encoder-output-hotfix.py -q
 ok "test-empty-encoder-output-hotfix"
 python3 tests/test_issue27_inflight_cap.py -q
 ok "test_issue27_inflight_cap"
-python3 tests/test_dspark_stacked_mapping.py -q
-ok "test_dspark_stacked_mapping"
+python3 tests/test_dspark_helpers.py -q
+ok "test_dspark_helpers"
 python3 scripts/verify-dsv4-027-equality-gate.py
 ok "verify-dsv4-027-equality-gate"
 bash scripts/verify-overlay-sources.sh
@@ -107,6 +107,13 @@ bash scripts/test-nccl-ib-hca-gid-resolve.sh -q
 ok "test-nccl-ib-hca-gid-resolve"
 
 echo "== recipe guards (do not re-ship known regressions) =="
+
+if grep -Fq 'VLLM_DSPARK_DRAFT_CAPTURE_SIZES: "${VLLM_DSPARK_DRAFT_CAPTURE_SIZES:-0}"' \
+  docker-compose.stage-c.override.yml; then
+  ok "Stage-C drafter graph switch is forwarded default-off"
+else
+  bad "Stage-C drafter graph switch is not forwarded by compose"
+fi
 
 # The withdrawn #31/#34 CPU-scanning path must stay gone (decode tok/s cliff).
 old_i31=patches/hotfix-dsv4-issue31-v2-thinking-budget.py

@@ -189,6 +189,7 @@ if TYPE_CHECKING:
     ] = "relax"
     VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP: bool = True
     VLLM_DSPARK_CONFIDENCE_THRESHOLD: str = "0.0"
+    VLLM_DSPARK_DRAFT_CAPTURE_SIZES: str = "0"
     VLLM_DSPARK_FORCE_DRAFT_LENGTH: str = ""
     VLLM_DSPARK_REPLICATE_MARKOV_W1: bool = False
     VLLM_DSPARK_STAGE_TIMING: bool = False
@@ -1488,6 +1489,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DSPARK_CONFIDENCE_SCHEDULER": lambda: os.getenv(
         "VLLM_DSPARK_CONFIDENCE_SCHEDULER", "auto"
+    ),
+    "VLLM_DSPARK_DRAFT_CAPTURE_SIZES": lambda: os.getenv(
+        "VLLM_DSPARK_DRAFT_CAPTURE_SIZES", "0"
     ),
     "VLLM_DSPARK_SPS_CURVE": lambda: os.getenv("VLLM_DSPARK_SPS_CURVE", ""),
     "VLLM_DSPARK_HARDWARE_SCHEDULER_EARLY_STOP": lambda: os.getenv(

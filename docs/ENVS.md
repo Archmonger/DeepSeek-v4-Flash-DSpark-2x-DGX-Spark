@@ -97,6 +97,7 @@ produce unknown-env warnings if injected.
 | `VLLM_USE_B12X_WO_PROJECTION` | B12X WO projection path |
 | `VLLM_DSPARK_CONFIDENCE_THRESHOLD` | Draft confidence threshold |
 | `VLLM_DSPARK_CONFIDENCE_SCHEDULER` | Confidence scheduler mode |
+| `VLLM_DSPARK_DRAFT_CAPTURE_SIZES` | Private request-count CUDA graph sizes (`0` off, `1` on). Extra graph memory is outside target profiling; measure KV headroom before enabling. |
 | `VLLM_DSPARK_LOCAL_ARGMAX` | Local argmax draft path |
 | `VLLM_DSPARK_REPLICATE_MARKOV_W1` | Markov W1 replicate |
 | `VLLM_DSPARK_FUSED_MARKOV_ARGMAX` | Fused Markov argmax |

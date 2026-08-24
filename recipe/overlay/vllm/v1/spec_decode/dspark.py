@@ -35,6 +35,32 @@ def map_dspark_stacked_param_name(name: str) -> tuple[str, int] | None:
     return None
 
 
+class DrafterCompilationConfigView:
+    def __init__(self, base: Any, capture_sizes: list[int]) -> None:
+        self._base = base
+        self.cudagraph_capture_sizes = list(capture_sizes)
+        self.max_cudagraph_capture_size = capture_sizes[-1]
+        self.compile_sizes = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+
+def resolve_drafter_capture_sizes(raw: str, max_batch_size: int) -> list[int] | None:
+    raw = raw.strip()
+    if raw == "0":
+        return None
+    if raw != "1":
+        raise ValueError("VLLM_DSPARK_DRAFT_CAPTURE_SIZES must be 0 or 1")
+    limit = int(max_batch_size)
+    sizes = {limit}
+    size = 1
+    while size < limit:
+        sizes.add(size)
+        size *= 2
+    return sorted(sizes)
+
+
 def make_dspark_warmup_draft_token_ids(
     *,
     batch_size: int,
