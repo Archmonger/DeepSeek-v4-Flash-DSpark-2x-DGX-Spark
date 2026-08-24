@@ -53,7 +53,9 @@ py_files+=(
   scripts/test-empty-encoder-output-hotfix.py
   scripts/ruler-lite.py
   scripts/verify-dsv4-027-equality-gate.py
+  scripts/ab-issue133-triton-specialization.py
   tests/test_dspark_stacked_mapping.py
+  tests/test_issue133_triton_specialization.py
 )
 python3 -m py_compile "${py_files[@]}"
 ok "py_compile ${#py_files[@]} files"
@@ -93,6 +95,8 @@ python3 tests/test_issue27_inflight_cap.py -q
 ok "test_issue27_inflight_cap"
 python3 tests/test_dspark_stacked_mapping.py -q
 ok "test_dspark_stacked_mapping"
+python3 tests/test_issue133_triton_specialization.py -q
+ok "test_issue133_triton_specialization"
 python3 scripts/verify-dsv4-027-equality-gate.py
 ok "verify-dsv4-027-equality-gate"
 bash scripts/verify-overlay-sources.sh
@@ -172,6 +176,13 @@ if grep -Fq 'python3 /opt/hotfix-dsv4-issue26-hybrid-swa-min.py || exit 1' docke
 else
   bad "compose must apply #26 + #27 with || exit 1"
 fi
+if grep -Fq 'hotfix-dsv4-issue133-triton-specialization.py}:/opt/hotfix-dsv4-issue133-triton-specialization.py:ro' docker-compose.dspark.yml \
+  && grep -Fq 'python3 /opt/hotfix-dsv4-issue133-triton-specialization.py || exit 1' docker-compose.dspark.yml \
+  && grep -Fq 'scp "$DSPARK_ISSUE133_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-issue133-triton-specialization.py"' start-deepseek-v4-flash-dspark.sh; then
+  ok "issue133 triton specialization hotfix is mounted, fail-closed, and worker-synced"
+else
+  bad "issue133 hotfix wiring is incomplete"
+fi
 if grep -Fq 'python3 /opt/hotfix-dsv4-suppress-stops-in-reasoning.py || exit 1' docker-compose.dspark.yml; then
   ok "compose applies suppress-stops-in-reasoning fail-closed"
 else
@@ -232,6 +243,7 @@ for p in \
   patches/hotfix-dsv4-issue55-tool-truncation.py \
   patches/hotfix-dsv4-issue26-hybrid-swa-min.py \
   patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py \
+  patches/hotfix-dsv4-issue133-triton-specialization.py \
   patches/hotfix-vllm-empty-encoder-output.py \
   patches/hotfix-nvfp4-ds-mla-issue22.sh \
   patches/hotfix-gb10-spin-wait.sh \
