@@ -1,3 +1,9 @@
+## 2026-08-24
+
+### Fixed
+
+- **Bounded `_compute_global_topk_indices_and_lens_kernel` to two deterministic Triton compile variants ([Issue #133](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/133))**: mixed prefill slices the `int32` token-to-request map and `bool` validity mask at the same traffic-dependent token offset, so their pointer-alignment specialization produced three cache-key states; the observed effective block sizes 64 and 2 doubled that family to six. The kernel now disables alignment specialization only for those two scalar-loaded pointers and treats its stable strides, top-k width, and block size as compile-time constants, matching upstream vLLM's kernel optimization without padding fixed-address CUDA-graph metadata or copying slices per step. A driverless Triton 3.6 regression test proves the three alignment classes share a key, only block size remains as a two-member axis, and both variants compile for SM121; an optional CUDA case checks bit-exact outputs across all former alignment classes when a device is available.
+
 ## 2026-08-23
 
 ### Added
