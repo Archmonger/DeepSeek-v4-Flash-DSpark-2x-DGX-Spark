@@ -111,27 +111,8 @@ echo "  model: ${DSPARK_MODEL}"
 echo "  served model: ${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"
 echo "  max model len: ${MAX_MODEL_LEN:-1048576}"
 
-# Numeric knobs are interpolated into arithmetic here and forwarded into the
-# container-side $(( )) via compose, so validate them the way VLLM_PORT is above.
-# 10# normalisation is required: bash reads a leading zero as octal, so an
-# unnormalised 010 would silently mean 8. On the head we also rewrite the private
-# env snapshot, because the worker consumes it via `docker compose --env-file`
-# over ssh and never sees exported shell vars.
-for _dspark_num in MAX_NUM_SEQS MTP_NUM_TOKENS MAX_NUM_BATCHED_TOKENS; do
-  _dspark_val="${!_dspark_num:-}"
-  [ -z "$_dspark_val" ] && continue
-  if ! [[ "$_dspark_val" =~ ^[0-9]+$ ]]; then
-    echo "$_dspark_num must be a non-negative integer: $_dspark_val" >&2
-    exit 2
-  fi
-  printf -v "$_dspark_num" "%d" "$((10#$_dspark_val))"
-  export "$_dspark_num"
-  if [ -n "${_dspark_env_clean:-}" ] && [ -f "${_dspark_env_clean:-}" ] \
-     && grep -q "^${_dspark_num}=" "$_dspark_env_clean"; then
-    sed -i "s|^${_dspark_num}=.*|${_dspark_num}=${!_dspark_num}|" "$_dspark_env_clean"
-  fi
-done
-unset _dspark_num _dspark_val
+source "$SCRIPT_DIR/dspark-numeric-knobs.sh"
+dspark_validate_numeric_knobs || exit $?
 
 echo "  max num seqs: ${MAX_NUM_SEQS:-6}"
 echo "  max batched tokens: ${MAX_NUM_BATCHED_TOKENS:-8192}"

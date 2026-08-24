@@ -1,106 +1,140 @@
 #!/usr/bin/env python3
-"""Unit tests for numeric-knob validation in the DSpark recipe.
+"""Tests for the shared numeric-knob validation (dspark-numeric-knobs.sh).
 
-MAX_NUM_SEQS / MTP_NUM_TOKENS / MAX_NUM_BATCHED_TOKENS are interpolated into bash
-arithmetic (and forwarded into the container's own $(( )) via compose). Without
-validation, a malformed value either aborts with a cryptic arithmetic error, is
-accepted as a false success by the validator, or is silently misread as octal
-(010 -> 8). This exercises the validation block lifted verbatim from the launcher.
+Exercises the real sourced function — not an extracted copy — so both the launcher
+and the validator, which source the same file, are covered. Checks: non-integer
+rejection, empty/default passthrough, leading-zero decimal normalisation (010 -> 10,
+never octal), overflow/oversize rejection (no 64-bit wrap to negative), real CRLF,
+per-knob bounds, and the worker env-snapshot writeback.
 
     python3 scripts/test-numeric-knob-validation.py -q
 
-CPU-only; no GPU, no container, no network.
+CPU-only; no GPU, container, or network.
 """
 import os
-import re
 import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HELPER = os.path.join(ROOT, "dspark-numeric-knobs.sh")
 LAUNCHER = os.path.join(ROOT, "start-deepseek-v4-flash-dspark.sh")
+VALIDATOR = os.path.join(ROOT, "validate-dspark-config.sh")
 
 
-def _extract_block() -> str:
-    """Lift the validation for-loop verbatim so the test can't drift from shipped code."""
-    with open(LAUNCHER, encoding="utf-8") as _fh:
-        src = _fh.read()
-    i = src.index("for _dspark_num in MAX_NUM_SEQS")
-    j = src.index("unset _dspark_num _dspark_val", i) + len("unset _dspark_num _dspark_val")
-    return src[i:j]
-
-
-BLOCK = _extract_block()
-
-
-def run(var: str, val: str):
-    """Run the validation block with <var>=<val>, then echo the normalized value."""
+def call(var, val, snapshot=None):
+    """Set <var>=<val> (real bytes via env), source the helper, run the function."""
+    env = dict(os.environ, **{var: val})
+    snap = f'"{snapshot}"' if snapshot else ""
     script = f"""set -euo pipefail
-_dspark_env_clean=
-{var}={val!r}
-export {var}
-{BLOCK}
-printf 'OK %s=%s cap=%s\\n' "{var}" "${{{var}:-<unset>}}" \
+source {HELPER!r}
+dspark_validate_numeric_knobs {snap}
+printf 'OK %s=%s cap=%s\\n' {var!r} "${{{var}:-<unset>}}" \
   "$(( ${{MAX_NUM_SEQS:-6}} * (${{MTP_NUM_TOKENS:-5}} + 1) ))"
 """
-    p = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
-    return p.returncode, (p.stdout + p.stderr)
+    p = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+    return p.returncode, p.stdout + p.stderr
 
 
-class TestNumericValidation(unittest.TestCase):
-    def test_valid_passes(self):
-        rc, out = run("MAX_NUM_SEQS", "6")
-        self.assertEqual(rc, 0, out)
-        self.assertIn("MAX_NUM_SEQS=6", out)
-        self.assertIn("cap=36", out)
-
-    def test_decimal_rejected(self):
-        rc, out = run("MAX_NUM_SEQS", "6.5")
-        self.assertEqual(rc, 2, out)
-        self.assertIn("MAX_NUM_SEQS must be a non-negative integer", out)
-
-    def test_alnum_rejected(self):
-        rc, out = run("MAX_NUM_SEQS", "6x")
-        self.assertEqual(rc, 2, out)
-        self.assertIn("must be a non-negative integer", out)
-
-    def test_bareword_rejected(self):
-        rc, out = run("MAX_NUM_SEQS", "eight")
-        self.assertEqual(rc, 2, out)
-        self.assertIn("must be a non-negative integer", out)
-
-    def test_crlf_rejected(self):
-        rc, out = run("MAX_NUM_SEQS", "6\r")
-        self.assertEqual(rc, 2, out)
-        self.assertIn("must be a non-negative integer", out)
-
-    def test_leading_zero_normalized_not_octal(self):
-        # The core octal fix: 010 must mean decimal 10 (cap 60), never octal 8 (cap 48).
-        rc, out = run("MAX_NUM_SEQS", "010")
-        self.assertEqual(rc, 0, out)
-        self.assertIn("MAX_NUM_SEQS=10", out)
-        self.assertIn("cap=60", out)
-
-    def test_leading_zero_eight(self):
-        rc, out = run("MAX_NUM_SEQS", "08")
-        self.assertEqual(rc, 0, out)
-        self.assertIn("MAX_NUM_SEQS=8", out)
-        self.assertIn("cap=48", out)
-
-    def test_mtp_bareword_rejected(self):
-        rc, out = run("MTP_NUM_TOKENS", "five")
-        self.assertEqual(rc, 2, out)
-        self.assertIn("MTP_NUM_TOKENS must be a non-negative integer", out)
-
-    def test_batched_tokens_rejected(self):
-        rc, out = run("MAX_NUM_BATCHED_TOKENS", "bad")
-        self.assertEqual(rc, 2, out)
-        self.assertIn("MAX_NUM_BATCHED_TOKENS must be a non-negative integer", out)
+class Accepts(unittest.TestCase):
+    def test_valid(self):
+        rc, out = call("MAX_NUM_SEQS", "6")
+        self.assertEqual(rc, 0, out); self.assertIn("MAX_NUM_SEQS=6", out); self.assertIn("cap=36", out)
 
     def test_empty_uses_default(self):
-        rc, out = run("MAX_NUM_SEQS", "")
-        self.assertEqual(rc, 0, out)
-        self.assertIn("cap=36", out)  # :- default of 6 applies
+        rc, out = call("MAX_NUM_SEQS", "")
+        self.assertEqual(rc, 0, out); self.assertIn("cap=36", out)
+
+    def test_leading_zero_is_decimal_not_octal(self):
+        rc, out = call("MAX_NUM_SEQS", "010")
+        self.assertEqual(rc, 0, out); self.assertIn("MAX_NUM_SEQS=10", out); self.assertIn("cap=60", out)
+
+    def test_leading_zero_eight(self):
+        rc, out = call("MAX_NUM_SEQS", "08")
+        self.assertEqual(rc, 0, out); self.assertIn("MAX_NUM_SEQS=8", out); self.assertIn("cap=48", out)
+
+    def test_upper_bound_ok(self):
+        rc, out = call("MAX_NUM_SEQS", "4096")
+        self.assertEqual(rc, 0, out); self.assertIn("MAX_NUM_SEQS=4096", out)
+
+
+class Rejects(unittest.TestCase):
+    def _reject(self, var, val, needle="must be"):
+        rc, out = call(var, val)
+        self.assertEqual(rc, 2, f"expected reject, got rc={rc}: {out}")
+        self.assertIn(needle, out, out)
+        # never leak a wrapped/negative value or continue
+        self.assertNotIn("cap=-", out); self.assertNotIn("OK ", out)
+
+    def test_decimal(self):        self._reject("MAX_NUM_SEQS", "6.5", "non-negative integer")
+    def test_alnum(self):          self._reject("MAX_NUM_SEQS", "6x", "non-negative integer")
+    def test_bareword(self):       self._reject("MAX_NUM_SEQS", "eight", "non-negative integer")
+    def test_mtp_bareword(self):   self._reject("MTP_NUM_TOKENS", "five", "non-negative integer")
+    def test_batched_bad(self):    self._reject("MAX_NUM_BATCHED_TOKENS", "bad", "non-negative integer")
+
+    def test_real_carriage_return(self):
+        # a genuine \r byte (not literal backslash-r) — CRLF from a Windows-edited env
+        self._reject("MAX_NUM_SEQS", "6\r", "non-negative integer")
+
+    def test_overflow_2p64_minus_1(self):
+        # the documented case: must NOT wrap to -1 and exit 0
+        self._reject("MAX_NUM_SEQS", "18446744073709551615", "must be between")
+
+    def test_overflow_2p63(self):
+        self._reject("MAX_NUM_SEQS", "9223372036854775808", "must be between")
+
+    def test_over_per_knob_max(self):
+        self._reject("MAX_NUM_SEQS", "5000", "must be between")     # > 4096
+
+    def test_zero_seqs_rejected(self):
+        self._reject("MAX_NUM_SEQS", "0", "must be between")        # min is 1
+
+
+class SnapshotWriteback(unittest.TestCase):
+    """The load-bearing worker sync: the passed snapshot must be normalised in place."""
+    def _snapshot(self, line):
+        fd, path = tempfile.mkstemp(suffix=".env")
+        with os.fdopen(fd, "w") as f:
+            f.write("WORKER_HOST=w\n" + line + "\nMASTER_ADDR=127.0.0.1\n")
+        return path
+
+    def test_snapshot_normalised_to_decimal(self):
+        snap = self._snapshot("MAX_NUM_SEQS=010")
+        try:
+            rc, out = call("MAX_NUM_SEQS", "010", snapshot=snap)
+            self.assertEqual(rc, 0, out)
+            with open(snap) as f:
+                body = f.read()
+            self.assertIn("MAX_NUM_SEQS=10", body, "snapshot not normalised for the worker")
+            self.assertNotIn("MAX_NUM_SEQS=010", body)
+        finally:
+            os.unlink(snap)
+
+    def test_snapshot_untouched_when_valid(self):
+        snap = self._snapshot("MAX_NUM_SEQS=6")
+        try:
+            rc, _ = call("MAX_NUM_SEQS", "6", snapshot=snap)
+            self.assertEqual(rc, 0)
+            with open(snap) as f:
+                self.assertIn("MAX_NUM_SEQS=6", f.read())
+        finally:
+            os.unlink(snap)
+
+
+class WiredIn(unittest.TestCase):
+    """Guard against drift: both shipped scripts must source + call the helper."""
+    def test_launcher_sources_and_passes_snapshot(self):
+        with open(LAUNCHER) as f:
+            s = f.read()
+        self.assertIn("dspark-numeric-knobs.sh", s)
+        self.assertIn('dspark_validate_numeric_knobs "$_dspark_env_clean"', s)
+
+    def test_validator_sources_and_calls(self):
+        with open(VALIDATOR) as f:
+            s = f.read()
+        self.assertIn("dspark-numeric-knobs.sh", s)
+        self.assertIn("dspark_validate_numeric_knobs", s)
 
 
 if __name__ == "__main__":
