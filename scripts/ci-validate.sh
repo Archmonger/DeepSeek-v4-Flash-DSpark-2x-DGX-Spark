@@ -53,6 +53,7 @@ py_files+=(
   scripts/test-empty-encoder-output-hotfix.py
   scripts/ruler-lite.py
   scripts/verify-dsv4-027-equality-gate.py
+  tests/test_dspark_stacked_mapping.py
 )
 python3 -m py_compile "${py_files[@]}"
 ok "py_compile ${#py_files[@]} files"
@@ -90,6 +91,8 @@ python3 scripts/test-empty-encoder-output-hotfix.py -q
 ok "test-empty-encoder-output-hotfix"
 python3 tests/test_issue27_inflight_cap.py -q
 ok "test_issue27_inflight_cap"
+python3 tests/test_dspark_stacked_mapping.py -q
+ok "test_dspark_stacked_mapping"
 python3 scripts/verify-dsv4-027-equality-gate.py
 ok "verify-dsv4-027-equality-gate"
 bash scripts/verify-overlay-sources.sh
