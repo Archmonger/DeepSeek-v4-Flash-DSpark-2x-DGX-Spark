@@ -29,6 +29,22 @@
 #   requests with client-default generation settings. Medium + multi-chunk
 #   long prefill and one thinking-off arm cover other batch-keyed variants;
 #   none of these arms contributes to the low buckets above.
+# - Sampling arms (2026-08-24 incident follow-up): every arm above runs
+#   greedy (temperature 0), so vllm/v1/sample/ops/topk_topp_triton.py's
+#   _topk_topp_kernel — dispatched only when a request carries top_k and/or
+#   top_p — was never warmed and JIT-compiled mid-serve (persistent-cache
+#   entries born 15:26/15:27 UTC on a serving box prove it). Its compile key
+#   axes are the TOPK_ENABLED x TOPP_ENABLED constexpr pair plus the
+#   BATCH_SIZE int specialization, so the sweep fires all three combos
+#   (k-only, p-only, k+p) at C=1 AND at C=3, then verifies the resulting
+#   cache signature classes as an observable postcondition: whether three
+#   concurrent curls actually formed one BATCH_SIZE=3 step is never assumed
+#   — if the scheduler ran them as three BATCH_SIZE=1 steps, the missing
+#   cache class is detected and the C=3 bursts are retried (bounded).
+#   (The second family from the same incident,
+#   _compute_global_topk_indices_and_lens_kernel's pointer-alignment keys,
+#   is closed engine-side by #135's do_not_specialize_on_alignment fix and
+#   needs no request-side arms.)
 #
 # Non-fatal by design: the cost of a missed shape is a mid-serve JIT (what this
 # script exists to reduce), not an outage — the launcher must treat a warmup
@@ -48,7 +64,13 @@
 #                              DSPARK_WARMUP_BEARER was provided
 #   DSPARK_WARMUP_MAX_CONCURRENCY
 #                              resolved --max-num-seqs from the launcher
-#                              (default 6); C=1/2/4/6 arms above it are skipped
+#                              (default 6); C=1/2/3/4/6 arms above it are skipped
+#   DSPARK_WARMUP_TRITON_CACHE_DIR
+#                              host path of THIS node's persistent Triton cache
+#                              (launcher derives it from HF_CACHE when
+#                              TRITON_CACHE_DIR sits on the HF volume). Used
+#                              only by the sampler-cache postcondition; empty
+#                              or missing dir skips that check with a note.
 #   WARMUP_CURL                test seam: overrides the curl binary
 set -u
 
@@ -93,13 +115,23 @@ mk_prompt() { # $1 = approx token count (repeated filler words), $2 = tag
 }
 
 fire() { # $1 = tag, $2 = words, $3 = thinking, $4 = result file, $5 = request profile
-  local tag=$1 words=$2 thinking=$3 out=$4 profile=${5:-bounded} prompt payload
+  local tag=$1 words=$2 thinking=$3 out=$4 profile=${5:-bounded} prompt payload sample_fields
   prompt=$(mk_prompt "$words" "$tag")
   if [ "$profile" = "serve-default" ]; then
     # Mirror an ordinary short client request: no explicit max_tokens or
     # chat-template override. These scheduler defaults have distinct Triton
     # variants from the bounded long-context arms below.
     payload='{"model":"'"$MODEL"'","messages":[{"role":"user","content":"'"$prompt"'"}],"temperature":0}'
+  elif [ "${profile#sampling}" != "$profile" ]; then
+    # Sampling arms: temperature must be > 0 or vLLM drops the k/p tensors and
+    # _topk_topp_kernel never dispatches. Bounded max_tokens keeps each arm to
+    # a few sampler steps — the kernel key does not depend on output length.
+    case "$profile" in
+      sampling-k)  sample_fields='"top_k":40' ;;
+      sampling-p)  sample_fields='"top_p":0.9' ;;
+      *)           sample_fields='"top_k":40,"top_p":0.9' ;;
+    esac
+    payload='{"model":"'"$MODEL"'","messages":[{"role":"user","content":"'"$prompt"'"}],"max_tokens":24,"temperature":0.8,'"$sample_fields"',"chat_template_kwargs":{"thinking":'"$thinking"',"reasoning_effort":"low"}}'
   else
     payload='{"model":"'"$MODEL"'","messages":[{"role":"user","content":"'"$prompt"'"}],"max_tokens":24,"temperature":0,"chat_template_kwargs":{"thinking":'"$thinking"',"reasoning_effort":"low"}}'
   fi
@@ -125,6 +157,67 @@ burst() { # $1 = arm name, $2 = concurrency, $3 = words-per-request, $4 = reques
   wait
   t1=$(date +%s)
   echo "  arm ${arm}: C=${c} x ~${words} tok, profile=${profile}, $((t1 - t0))s"
+}
+
+SAMPLER_KERNEL=_topk_topp_kernel
+SAMPLER_C3=0                     # set to 1 once the C=3 sampler bursts are eligible
+
+sampler_c3_arms() {
+  # The three constexpr combos again, at a >1 (and non-divisible-by-16)
+  # BATCH_SIZE. Reused arm names on retry: result files are overwritten in
+  # place, so the outcome tally stays constant across retries.
+  burst samp-k-c3  3 8 sampling-k
+  burst samp-p-c3  3 8 sampling-p
+  burst samp-kp-c3 3 8 sampling-kp
+}
+
+sampler_cache_classes() { # $1 = cache root; emits one "combo batch-class" line per distinct class
+  local root=$1 ttir kuse puse combo bsig
+  for ttir in "$root"/*/"$SAMPLER_KERNEL.ttir"; do
+    [ -f "$ttir" ] || continue
+    # TOPK_ENABLED/TOPP_ENABLED are constexprs, folded out of the TTIR
+    # signature — observe them through argument USE instead: a disabled side
+    # never touches its tensor, so its %K / %P symbol appears exactly once
+    # (the declaration); an enabled side is referenced again in the body.
+    # ([^A-Za-z0-9_] guards %P against matching %PERCENTILE_TO_STD_TABLE.)
+    kuse=$(grep -oE '%K[^A-Za-z0-9_]' "$ttir" | wc -l)
+    puse=$(grep -oE '%P[^A-Za-z0-9_]' "$ttir" | wc -l)
+    if [ "$kuse" -gt 1 ] && [ "$puse" -gt 1 ]; then combo=k+p
+    elif [ "$kuse" -gt 1 ]; then combo=k-only
+    elif [ "$puse" -gt 1 ]; then combo=p-only
+    else combo=neither; fi
+    # BATCH_SIZE int-specialization class, read literally off the declared
+    # argument: absent (folded away, the ==1 specialization), attributed
+    # (e.g. tt.divisibility for multiples of 16), or plain.
+    if ! grep -q '%BATCH_SIZE' "$ttir"; then bsig=const-folded
+    elif grep -qE '%BATCH_SIZE: i32 \{' "$ttir"; then bsig=attr-specialized
+    else bsig=plain; fi
+    printf '%s %s\n' "$combo" "$bsig"
+  done | sort -u
+}
+
+verify_sampler_cache() { # postcondition; returns 0 = met or skipped, 1 = unmet
+  # The sampler dispatches on TP rank 0 — the head node, where this sweep
+  # runs — and each node's persistent cache holds only its own rank's
+  # compiles, so the local cache is the correct observable for this kernel.
+  local root="${DSPARK_WARMUP_TRITON_CACHE_DIR:-}" classes combo n need missing=""
+  if [ -z "$root" ] || [ ! -d "$root" ]; then
+    echo "  sampler-cache postcondition: SKIPPED (DSPARK_WARMUP_TRITON_CACHE_DIR unset or not a directory)"
+    return 0
+  fi
+  need=$((1 + SAMPLER_C3))       # one BATCH_SIZE class per combo at C<3, two once C=3 arms ran
+  classes=$(sampler_cache_classes "$root")
+  for combo in k-only p-only k+p; do
+    n=$(printf '%s\n' "$classes" | grep -c "^${combo} ")
+    [ "$n" -ge "$need" ] || missing="${missing} ${combo}:${n}/${need}"
+  done
+  if [ -z "$missing" ]; then
+    echo "  sampler-cache postcondition: MET — ${SAMPLER_KERNEL} signature classes on this rank:"
+    printf '%s\n' "$classes" | sed 's/^/    /'
+    return 0
+  fi
+  echo "  sampler-cache postcondition: unmet —${missing} (distinct BATCH_SIZE classes per constexpr combo)"
+  return 1
 }
 
 mk_ladder_prompt() { # $1 = exact token count ('hello' + (N-1)x ' hello')
@@ -193,10 +286,19 @@ total_t0=$(date +%s)
 # completions), then the batch/chat arms.
 ladder
 
-EXPECTED_CHAT_REQUESTS=5        # c1 + short-c1 + mid + longchunk + nothink
+EXPECTED_CHAT_REQUESTS=8        # c1 + short-c1 + samp-k + samp-p + samp-kp + mid + longchunk + nothink
 burst c1        1 300
 burst short-c1  1 8 serve-default
+# _topk_topp_kernel constexpr combos at BATCH_SIZE=1: k-only, p-only, k+p.
+burst samp-k    1 8 sampling-k
+burst samp-p    1 8 sampling-p
+burst samp-kp   1 8 sampling-kp
 if [ "$MAX_CONCURRENCY" -ge 2 ]; then burst c2 2 420; burst short-c2 2 8 serve-default; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 4)); fi
+if [ "$MAX_CONCURRENCY" -ge 3 ]; then
+  SAMPLER_C3=1
+  sampler_c3_arms
+  EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 9))
+fi
 if [ "$MAX_CONCURRENCY" -ge 4 ]; then burst c4 4 380; burst short-c4 4 8 serve-default; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 8)); fi
 if [ "$MAX_CONCURRENCY" -ge 6 ]; then burst c6 6 340; burst short-c6 6 8 serve-default; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 12)); fi
 if [ "$MAX_CONCURRENCY" -gt 6 ]; then
@@ -209,6 +311,24 @@ t0=$(date +%s)
 fire nothink-1 300 false "$tmpdir/nothink-1"
 t1=$(date +%s)
 echo "  arm nothink: C=1 x ~300 tok, thinking=false, $((t1 - t0))s"
+
+# Observable postcondition for the sampler arms: the cache must actually hold
+# the expected _topk_topp_kernel signature classes. If the C=3 bursts were
+# scheduled as three BATCH_SIZE=1 steps (a real failure mode — the requests
+# all succeed, so nothing else would notice), the missing class shows up here
+# and the C=3 bursts are retried, bounded. Runs before the tally: retries
+# overwrite the same per-arm result files, so accounting stays exact.
+SAMPLER_POSTCOND=ok
+sampler_attempt=0
+until verify_sampler_cache; do
+  if [ "$SAMPLER_C3" -ne 1 ] || [ "$sampler_attempt" -ge 2 ]; then
+    SAMPLER_POSTCOND=fail
+    break
+  fi
+  sampler_attempt=$((sampler_attempt + 1))
+  echo "  sampler-cache postcondition unmet — re-firing C=3 sampler bursts (retry ${sampler_attempt}/2)"
+  sampler_c3_arms
+done
 
 total=0 ok_count=0
 for f in "$tmpdir"/*-*; do
@@ -227,6 +347,10 @@ echo "boot-shape-warmup: ${ok_count}/${total} requests ok in $((total_t1 - total
 if [ "$ok_count" -lt "$total" ]; then
   echo "boot-shape-warmup: $((total - ok_count)) request(s) failed — uncovered shapes may JIT mid-serve" >&2
   sed -n '1,5p' "$tmpdir/errors" >&2 2>/dev/null || true
+  exit 1
+fi
+if [ "$SAMPLER_POSTCOND" != ok ]; then
+  echo "boot-shape-warmup: sampler-cache postcondition UNMET after retries — ${SAMPLER_KERNEL} variants may JIT mid-serve" >&2
   exit 1
 fi
 exit 0
