@@ -33,14 +33,12 @@
 #   greedy (temperature 0), so vllm/v1/sample/ops/topk_topp_triton.py's
 #   _topk_topp_kernel — dispatched only when a request carries top_k and/or
 #   top_p — was never warmed and JIT-compiled mid-serve (persistent-cache
-#   entries born 15:26/15:27 UTC on a serving box prove it). Its compile key
-#   axes are the TOPK_ENABLED x TOPP_ENABLED constexpr pair plus the
-#   BATCH_SIZE int specialization, so the sweep fires all three combos
-#   (k-only, p-only, k+p) at C=1 AND at C=3, then verifies the resulting
-#   cache signature classes as an observable postcondition: whether three
-#   concurrent curls actually formed one BATCH_SIZE=3 step is never assumed
-#   — if the scheduler ran them as three BATCH_SIZE=1 steps, the missing
-#   cache class is detected and the C=3 bursts are retried (bounded).
+#   entries born 15:26/15:27 UTC on a serving box prove it). The pinned
+#   runtime's enumerable compile-key axes are the TOPK_ENABLED x TOPP_ENABLED
+#   constexpr pair. BATCH_SIZE remains a plain TTIR runtime argument: live
+#   C=3 and n=3 probes reuse the C=1 cache entries. The sweep therefore fires
+#   all three combos (k-only, p-only, k+p) and verifies them as an observable
+#   cache postcondition.
 #   (The second family from the same incident,
 #   _compute_global_topk_indices_and_lens_kernel's pointer-alignment keys,
 #   is closed engine-side by #135's do_not_specialize_on_alignment fix and
@@ -160,19 +158,9 @@ burst() { # $1 = arm name, $2 = concurrency, $3 = words-per-request, $4 = reques
 }
 
 SAMPLER_KERNEL=_topk_topp_kernel
-SAMPLER_C3=0                     # set to 1 once the C=3 sampler bursts are eligible
 
-sampler_c3_arms() {
-  # The three constexpr combos again, at a >1 (and non-divisible-by-16)
-  # BATCH_SIZE. Reused arm names on retry: result files are overwritten in
-  # place, so the outcome tally stays constant across retries.
-  burst samp-k-c3  3 8 sampling-k
-  burst samp-p-c3  3 8 sampling-p
-  burst samp-kp-c3 3 8 sampling-kp
-}
-
-sampler_cache_classes() { # $1 = cache root; emits one "combo batch-class" line per distinct class
-  local root=$1 ttir kuse puse combo bsig
+sampler_cache_combos() { # $1 = cache root; emits one line per distinct constexpr combo
+  local root=$1 ttir kuse puse combo
   for ttir in "$root"/*/"$SAMPLER_KERNEL.ttir"; do
     [ -f "$ttir" ] || continue
     # TOPK_ENABLED/TOPP_ENABLED are constexprs, folded out of the TTIR
@@ -186,13 +174,7 @@ sampler_cache_classes() { # $1 = cache root; emits one "combo batch-class" line 
     elif [ "$kuse" -gt 1 ]; then combo=k-only
     elif [ "$puse" -gt 1 ]; then combo=p-only
     else combo=neither; fi
-    # BATCH_SIZE int-specialization class, read literally off the declared
-    # argument: absent (folded away, the ==1 specialization), attributed
-    # (e.g. tt.divisibility for multiples of 16), or plain.
-    if ! grep -q '%BATCH_SIZE' "$ttir"; then bsig=const-folded
-    elif grep -qE '%BATCH_SIZE: i32 \{' "$ttir"; then bsig=attr-specialized
-    else bsig=plain; fi
-    printf '%s %s\n' "$combo" "$bsig"
+    printf '%s\n' "$combo"
   done | sort -u
 }
 
@@ -200,23 +182,22 @@ verify_sampler_cache() { # postcondition; returns 0 = met or skipped, 1 = unmet
   # The sampler dispatches on TP rank 0 — the head node, where this sweep
   # runs — and each node's persistent cache holds only its own rank's
   # compiles, so the local cache is the correct observable for this kernel.
-  local root="${DSPARK_WARMUP_TRITON_CACHE_DIR:-}" classes combo n need missing=""
+  local root="${DSPARK_WARMUP_TRITON_CACHE_DIR:-}" combos combo n missing=""
   if [ -z "$root" ] || [ ! -d "$root" ]; then
     echo "  sampler-cache postcondition: SKIPPED (DSPARK_WARMUP_TRITON_CACHE_DIR unset or not a directory)"
     return 0
   fi
-  need=$((1 + SAMPLER_C3))       # one BATCH_SIZE class per combo at C<3, two once C=3 arms ran
-  classes=$(sampler_cache_classes "$root")
+  combos=$(sampler_cache_combos "$root")
   for combo in k-only p-only k+p; do
-    n=$(printf '%s\n' "$classes" | grep -c "^${combo} ")
-    [ "$n" -ge "$need" ] || missing="${missing} ${combo}:${n}/${need}"
+    n=$(printf '%s\n' "$combos" | grep -cx "$combo")
+    [ "$n" -ge 1 ] || missing="${missing} ${combo}:0/1"
   done
   if [ -z "$missing" ]; then
-    echo "  sampler-cache postcondition: MET — ${SAMPLER_KERNEL} signature classes on this rank:"
-    printf '%s\n' "$classes" | sed 's/^/    /'
+    echo "  sampler-cache postcondition: MET — ${SAMPLER_KERNEL} constexpr combos on this rank:"
+    printf '%s\n' "$combos" | sed 's/^/    /'
     return 0
   fi
-  echo "  sampler-cache postcondition: unmet —${missing} (distinct BATCH_SIZE classes per constexpr combo)"
+  echo "  sampler-cache postcondition: unmet —${missing} (constexpr combos)"
   return 1
 }
 
@@ -289,16 +270,11 @@ ladder
 EXPECTED_CHAT_REQUESTS=8        # c1 + short-c1 + samp-k + samp-p + samp-kp + mid + longchunk + nothink
 burst c1        1 300
 burst short-c1  1 8 serve-default
-# _topk_topp_kernel constexpr combos at BATCH_SIZE=1: k-only, p-only, k+p.
+# _topk_topp_kernel constexpr combos: k-only, p-only, k+p.
 burst samp-k    1 8 sampling-k
 burst samp-p    1 8 sampling-p
 burst samp-kp   1 8 sampling-kp
 if [ "$MAX_CONCURRENCY" -ge 2 ]; then burst c2 2 420; burst short-c2 2 8 serve-default; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 4)); fi
-if [ "$MAX_CONCURRENCY" -ge 3 ]; then
-  SAMPLER_C3=1
-  sampler_c3_arms
-  EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 9))
-fi
 if [ "$MAX_CONCURRENCY" -ge 4 ]; then burst c4 4 380; burst short-c4 4 8 serve-default; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 8)); fi
 if [ "$MAX_CONCURRENCY" -ge 6 ]; then burst c6 6 340; burst short-c6 6 8 serve-default; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 12)); fi
 if [ "$MAX_CONCURRENCY" -gt 6 ]; then
@@ -313,22 +289,10 @@ t1=$(date +%s)
 echo "  arm nothink: C=1 x ~300 tok, thinking=false, $((t1 - t0))s"
 
 # Observable postcondition for the sampler arms: the cache must actually hold
-# the expected _topk_topp_kernel signature classes. If the C=3 bursts were
-# scheduled as three BATCH_SIZE=1 steps (a real failure mode — the requests
-# all succeed, so nothing else would notice), the missing class shows up here
-# and the C=3 bursts are retried, bounded. Runs before the tally: retries
-# overwrite the same per-arm result files, so accounting stays exact.
+# each _topk_topp_kernel constexpr combo. Request success alone cannot prove
+# that every sampling branch dispatched.
 SAMPLER_POSTCOND=ok
-sampler_attempt=0
-until verify_sampler_cache; do
-  if [ "$SAMPLER_C3" -ne 1 ] || [ "$sampler_attempt" -ge 2 ]; then
-    SAMPLER_POSTCOND=fail
-    break
-  fi
-  sampler_attempt=$((sampler_attempt + 1))
-  echo "  sampler-cache postcondition unmet — re-firing C=3 sampler bursts (retry ${sampler_attempt}/2)"
-  sampler_c3_arms
-done
+verify_sampler_cache || SAMPLER_POSTCOND=fail
 
 total=0 ok_count=0
 for f in "$tmpdir"/*-*; do
@@ -350,7 +314,7 @@ if [ "$ok_count" -lt "$total" ]; then
   exit 1
 fi
 if [ "$SAMPLER_POSTCOND" != ok ]; then
-  echo "boot-shape-warmup: sampler-cache postcondition UNMET after retries — ${SAMPLER_KERNEL} variants may JIT mid-serve" >&2
+  echo "boot-shape-warmup: sampler-cache postcondition UNMET — ${SAMPLER_KERNEL} variants may JIT mid-serve" >&2
   exit 1
 fi
 exit 0
