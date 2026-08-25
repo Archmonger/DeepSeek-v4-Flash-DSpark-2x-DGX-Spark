@@ -1,3 +1,9 @@
+## 2026-08-25
+
+### Added
+
+- **Third JIT cache persisted: B12X CuTeDSL MoE compile cache (follow-up to issue #117)**: with Triton (`TRITON_CACHE_DIR`) and TileLang (`TILELANG_CACHE_DIR`) already on the HF volume, a validated boot still logged `jit_monitor`'s "CuTeDSL JIT compilation during inference: W4A16FusedMoeKernel" — the B12X MoE backend compiles through `nvidia_cutlass_dsl` with its own disk cache defaulting to in-image `~/.cache/b12x/cute_compile` (resolution order in `b12x/cute/compiler.py`: `B12X_CUTE_COMPILE_CACHE_DIR` → `CUTE_DSL_CACHE_DIR`/`b12x_object_cache` → XDG → home), which dies on container recreate, so the fused-MoE kernel re-JITs after every restart with the same TP-desync hazard as the Triton case. Compose now defaults `B12X_CUTE_COMPILE_CACHE_DIR=/cache/huggingface/b12x-cute-cache`; documented in `.env.dspark.example` and `docs/ENVS.md`.
+
 ## 2026-08-24
 
 ### Fixed
