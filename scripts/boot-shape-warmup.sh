@@ -188,9 +188,9 @@ sampler_cache_combos() { # $1 = cache root; emits one line per distinct constexp
 }
 
 verify_sampler_cache() { # postcondition; returns 0 = met or skipped, 1 = unmet
-  # The sampler dispatches on TP rank 0 — the head node, where this sweep
-  # runs — and each node's persistent cache holds only its own rank's
-  # compiles, so the local cache is the correct observable for this kernel.
+  # Every TP rank executes the sampler. This host-side script can inspect only
+  # the head rank's cache, so the local check is a dispatch-shape proxy, not a
+  # worker-filesystem attestation; acceptance evidence must inspect both ranks.
   local root="${DSPARK_WARMUP_TRITON_CACHE_DIR:-}" combos combo n missing=""
   if [ -z "$root" ] || [ ! -d "$root" ]; then
     echo "  sampler-cache postcondition: SKIPPED (DSPARK_WARMUP_TRITON_CACHE_DIR unset or not a directory)"
