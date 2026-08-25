@@ -154,6 +154,9 @@ if (( 10#$VLLM_PORT < 1 || 10#$VLLM_PORT > 65535 )); then
   exit 2
 fi
 VLLM_PORT="$((10#$VLLM_PORT))"
+
+source "$SCRIPT_DIR/dspark-numeric-knobs.sh"
+dspark_validate_numeric_knobs "$_dspark_env_clean" || exit $?
 # Keep PORT as a backwards-compatible alias, but use VLLM_PORT internally.
 PORT="$VLLM_PORT"
 DEFAULT_THINKING="${DEFAULT_THINKING:-low}"
