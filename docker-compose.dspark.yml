@@ -172,7 +172,7 @@ services:
       #    Flight Recorder debug info" log line or for the dump file to
       #    appear and its size to settle (bounded wait) before killing or
       #    restarting the pair, or the dump can be lost or truncated.
-      TORCH_NCCL_TRACE_BUFFER_SIZE: "${TORCH_NCCL_TRACE_BUFFER_SIZE:-2000}"
+      TORCH_FR_BUFFER_SIZE: "${TORCH_FR_BUFFER_SIZE:-2000}"
       TORCH_NCCL_DUMP_ON_TIMEOUT: "${TORCH_NCCL_DUMP_ON_TIMEOUT:-1}"
       TORCH_NCCL_ENABLE_MONITORING: "${TORCH_NCCL_ENABLE_MONITORING:-1}"
       TORCH_FR_DUMP_TEMP_FILE: "${TORCH_FR_DUMP_TEMP_FILE:-/cache/huggingface/nccl-fr/comm_lib_trace_rank_}"
