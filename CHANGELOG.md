@@ -1,3 +1,9 @@
+## 2026-08-25
+
+### Added
+
+- **PyTorch flight recorder wired for TP-hang forensics (issue #117 disposition)**: every pair-loss incident so far ended with zero collective-level evidence — the stalled rank logs nothing, the peer spins, and after the restart only coarse metrics remain. Compose now pins the ProcessGroupNCCL flight recorder explicitly on (`TORCH_NCCL_TRACE_BUFFER_SIZE=2000`, `TORCH_NCCL_DUMP_ON_TIMEOUT=1`, `TORCH_NCCL_ENABLE_MONITORING=1` — torch 2.11 defaults, but the header documents the pairing requirement, so all three are pinned), persists dumps on the HF volume (`TORCH_FR_DUMP_TEMP_FILE=/cache/huggingface/nccl-fr/comm_lib_trace_rank_`, directory created non-fatally by the entrypoint), and exposes torch's named-pipe trigger (`TORCH_NCCL_DEBUG_INFO_PIPE_FILE=/tmp/fr_dump_pipe_`; the stem lives on `/tmp` because `DumpPipe` `TORCH_CHECK`s its mkfifo at process-group init and must never depend on a directory that might not exist — note `/tmp` is the `DSPARK_TMP_HOST` bind mount in this stack, so the FIFO is also host-visible there, root-owned; writing anything to `/tmp/fr_dump_pipe_<rank>.pipe` triggers an on-demand dump). With this, a torch-600s kill dumps automatically, and an external #87-style watchdog can poke the pipe on a frozen-but-not-timed-out pair before restarting it, leaving per-rank dumps that `torchfrtrace` aligns to name the stalled rank and collective. Two operator rules are part of the contract (documented in `.env.dspark.example` and `docs/ENVS.md`): dump filenames are static per rank and torch truncates on every dump, so both ranks' `comm_lib_trace_rank_*` must be archived together after each dump before the next poke or timeout overwrites them; and a pipe poke is an asynchronous best-effort request, so wait for torch's "Finished writing Flight Recorder debug info" log line (or a bounded file-size-settle check) before killing or restarting the pair.
+
 ## 2026-08-24
 
 ### Fixed

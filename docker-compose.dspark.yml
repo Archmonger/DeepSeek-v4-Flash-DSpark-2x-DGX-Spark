@@ -146,6 +146,37 @@ services:
       # by Triton version/backend hash, so sharing the dir across image
       # updates is safe.
       TRITON_CACHE_DIR: "${TRITON_CACHE_DIR:-/cache/huggingface/triton-cache}"
+      # PyTorch ProcessGroupNCCL flight recorder (issue #117 disposition):
+      # pin the ring buffer + dump-on-timeout explicitly on (torch 2.11
+      # defaults, but DUMP_ON_TIMEOUT is documented to require
+      # ENABLE_MONITORING=1 and BUFFER_SIZE>0, so pin all three), persist
+      # dumps on the HF volume (dir created by the entrypoint, non-fatally),
+      # and expose a named-pipe trigger so an external watchdog can capture
+      # a dump from a frozen-but-not-yet-timed-out rank (write anything to
+      # /tmp/fr_dump_pipe_<rank>.pipe inside the container). The pipe stem
+      # lives on /tmp because DumpPipe TORCH_CHECKs its mkfifo at
+      # process-group init: the stem must never point at a directory that
+      # might not exist (like an unmounted volume), or the boot fails. Note
+      # /tmp here is NOT container-local — it is the DSPARK_TMP_HOST bind
+      # mount above, so the FIFO is also host-visible at
+      # ${DSPARK_TMP_HOST:-~/.cache/dspark-tmp}/fr_dump_pipe_<rank>.pipe
+      # (root-owned: host-side pokes need root, or go through docker exec;
+      # torch unlinks/recreates a stale FIFO left by a previous container).
+      # Incident-response contract (details in docs/ENVS.md):
+      # 1) Dump filenames are static per rank and torch TRUNCATES on every
+      #    dump — archive comm_lib_trace_rank_* from BOTH nodes together
+      #    after each dump, before the next poke/timeout overwrites them;
+      #    torchfrtrace needs the complete rank set in one directory.
+      # 2) A pipe poke only REQUESTS a dump (torch launches it async,
+      #    best-effort) — after poking, wait for torch's "Finished writing
+      #    Flight Recorder debug info" log line or for the dump file to
+      #    appear and its size to settle (bounded wait) before killing or
+      #    restarting the pair, or the dump can be lost or truncated.
+      TORCH_NCCL_TRACE_BUFFER_SIZE: "${TORCH_NCCL_TRACE_BUFFER_SIZE:-2000}"
+      TORCH_NCCL_DUMP_ON_TIMEOUT: "${TORCH_NCCL_DUMP_ON_TIMEOUT:-1}"
+      TORCH_NCCL_ENABLE_MONITORING: "${TORCH_NCCL_ENABLE_MONITORING:-1}"
+      TORCH_FR_DUMP_TEMP_FILE: "${TORCH_FR_DUMP_TEMP_FILE:-/cache/huggingface/nccl-fr/comm_lib_trace_rank_}"
+      TORCH_NCCL_DEBUG_INFO_PIPE_FILE: "${TORCH_NCCL_DEBUG_INFO_PIPE_FILE:-/tmp/fr_dump_pipe_}"
       DG_JIT_USE_NVRTC: "${DG_JIT_USE_NVRTC:-0}"
       DG_JIT_NVCC_COMPILER: "${DG_JIT_NVCC_COMPILER:-/usr/local/cuda/bin/nvcc}"
       PYTORCH_CUDA_ALLOC_CONF: "${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -224,6 +255,7 @@ services:
         if [ -z "$${NCCL_NET_GDR_LEVEL:-}" ]; then unset NCCL_NET_GDR_LEVEL; fi;
         if [ -z "$${NCCL_NET_GDR_READ:-}" ]; then unset NCCL_NET_GDR_READ; fi;
         if [ -z "$${NCCL_DMABUF_ENABLE:-}" ]; then unset NCCL_DMABUF_ENABLE; fi;
+        if [ -n "$${TORCH_FR_DUMP_TEMP_FILE:-}" ]; then mkdir -p "$$(dirname "$${TORCH_FR_DUMP_TEMP_FILE}")" || echo "warn: cannot create flight-recorder dump dir; dumps will be lost (boot continues)" >&2; fi;
         ENCODING_SOURCE="$${DSPARK_ENCODING_FILE:-}";
         if [ -z "$${ENCODING_SOURCE}" ]; then
           MODEL_HUB_DIR=$$(printf '%s' "$${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}" | sed 's|/|--|g');
