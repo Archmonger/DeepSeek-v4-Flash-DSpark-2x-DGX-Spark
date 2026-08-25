@@ -35,10 +35,11 @@
 #   top_p — was never warmed and JIT-compiled mid-serve (persistent-cache
 #   entries born 15:26/15:27 UTC on a serving box prove it). The pinned
 #   runtime's enumerable compile-key axes are the TOPK_ENABLED x TOPP_ENABLED
-#   constexpr pair. BATCH_SIZE remains a plain TTIR runtime argument: live
-#   C=3 and n=3 probes reuse the C=1 cache entries. The sweep therefore fires
-#   all three combos (k-only, p-only, k+p) and verifies them as an observable
-#   cache postcondition.
+#   constexpr pair. BATCH_SIZE remains a plain TTIR runtime argument. Each
+#   combo runs once at C=1 and, when the profile permits it, in one C=3 burst:
+#   live cold-cache validation showed the repeated dispatch is needed to
+#   materialize every combo reliably, but it must not require a second cache
+#   class. The resulting combos are verified as an observable postcondition.
 #   (The second family from the same incident,
 #   _compute_global_topk_indices_and_lens_kernel's pointer-alignment keys,
 #   is closed engine-side by #135's do_not_specialize_on_alignment fix and
@@ -159,6 +160,14 @@ burst() { # $1 = arm name, $2 = concurrency, $3 = words-per-request, $4 = reques
 
 SAMPLER_KERNEL=_topk_topp_kernel
 
+sampler_c3_arms() {
+  # Re-dispatch each constexpr combo three times. This is reliability
+  # redundancy, not a BATCH_SIZE compile-key axis.
+  burst samp-k-c3  3 8 sampling-k
+  burst samp-p-c3  3 8 sampling-p
+  burst samp-kp-c3 3 8 sampling-kp
+}
+
 sampler_cache_combos() { # $1 = cache root; emits one line per distinct constexpr combo
   local root=$1 ttir kuse puse combo
   for ttir in "$root"/*/"$SAMPLER_KERNEL.ttir"; do
@@ -275,6 +284,10 @@ burst samp-k    1 8 sampling-k
 burst samp-p    1 8 sampling-p
 burst samp-kp   1 8 sampling-kp
 if [ "$MAX_CONCURRENCY" -ge 2 ]; then burst c2 2 420; burst short-c2 2 8 serve-default; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 4)); fi
+if [ "$MAX_CONCURRENCY" -ge 3 ]; then
+  sampler_c3_arms
+  EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 9))
+fi
 if [ "$MAX_CONCURRENCY" -ge 4 ]; then burst c4 4 380; burst short-c4 4 8 serve-default; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 8)); fi
 if [ "$MAX_CONCURRENCY" -ge 6 ]; then burst c6 6 340; burst short-c6 6 8 serve-default; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 12)); fi
 if [ "$MAX_CONCURRENCY" -gt 6 ]; then
