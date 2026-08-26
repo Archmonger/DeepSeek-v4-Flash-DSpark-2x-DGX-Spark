@@ -1011,6 +1011,12 @@ if [ -f "$DSPARK_ISSUE133_HOTFIX" ]; then
   ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
   scp "$DSPARK_ISSUE133_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-issue133-triton-specialization.py"
 fi
+DSPARK_ISSUE117_DISPATCH_TRACE_HOTFIX="${DSPARK_ISSUE117_DISPATCH_TRACE_HOTFIX:-$SCRIPT_DIR/patches/hotfix-vllm-issue117-dispatch-trace.py}"
+if [ -f "$DSPARK_ISSUE117_DISPATCH_TRACE_HOTFIX" ]; then
+  echo "Syncing Issue #117 dispatch trace hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_ISSUE117_DISPATCH_TRACE_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-issue117-dispatch-trace.py"
+fi
 DSPARK_SUPPRESS_STOPS_HOTFIX="${DSPARK_SUPPRESS_STOPS_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-suppress-stops-in-reasoning.py}"
 if [ -f "$DSPARK_SUPPRESS_STOPS_HOTFIX" ]; then
   echo "Syncing suppress-stops-in-reasoning hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"

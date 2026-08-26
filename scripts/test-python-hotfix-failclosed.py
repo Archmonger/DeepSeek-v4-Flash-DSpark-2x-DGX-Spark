@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ROOT / "docker-compose.dspark.yml"
 ENCODING_TOKEN = "python3 /opt/hotfix-encoding-dsv4-issue21.py"
 RUNTIME_TOKEN = "python3 /opt/hotfix-dsv4-issue27-partial-prefill-concurrency.py"
+TRACE_TOKEN = "python3 /opt/hotfix-vllm-issue117-dispatch-trace.py"
 
 PYTHON_STUB = """#!/usr/bin/env bash
 case "${1:-}" in
@@ -52,6 +53,7 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
     def setUpClass(cls):
         cls.encoding_line = _compose_line(ENCODING_TOKEN)
         cls.runtime_line = _compose_line(RUNTIME_TOKEN)
+        cls.trace_line = _compose_line(TRACE_TOKEN)
 
     def _run_line(
         self,
@@ -87,6 +89,7 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
                     "ENCODING_SOURCE": str(encoding),
                     "DSPARK_ENABLE_ISSUE31_GPU_HOTFIX": "0",
                     "DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX": "0",
+                    "DSPARK_ISSUE117_DISPATCH_TRACE": "0",
                 }
             )
             if fail_step is not None:
@@ -236,6 +239,32 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
             ],
         )
         self.assertTrue(reached)
+
+    def test_issue117_trace_is_not_invoked_when_disabled(self):
+        proc, invocations, reached = self._run_line(self.trace_line)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(invocations, [])
+        self.assertTrue(reached)
+
+    def test_issue117_trace_enabled_runs_and_fails_closed(self):
+        enabled = {"DSPARK_ISSUE117_DISPATCH_TRACE": "1"}
+        proc, invocations, reached = self._run_line(
+            self.trace_line,
+            env_extra=enabled,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(invocations, ["hotfix-vllm-issue117-dispatch-trace.py"])
+        self.assertTrue(reached)
+
+        proc, invocations, reached = self._run_line(
+            self.trace_line,
+            fail_step="hotfix-vllm-issue117-dispatch-trace.py",
+            env_extra=enabled,
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(invocations, ["hotfix-vllm-issue117-dispatch-trace.py"])
+        self.assertFalse(reached)
+
 
 
 if __name__ == "__main__":

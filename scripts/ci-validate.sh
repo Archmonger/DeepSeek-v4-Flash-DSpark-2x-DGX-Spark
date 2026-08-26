@@ -56,6 +56,7 @@ py_files+=(
   scripts/ab-issue133-triton-specialization.py
   tests/test_dspark_stacked_mapping.py
   tests/test_issue133_triton_specialization.py
+  tests/test_issue117_dispatch_trace.py
 )
 python3 -m py_compile "${py_files[@]}"
 ok "py_compile ${#py_files[@]} files"
@@ -97,6 +98,8 @@ python3 tests/test_issue27_inflight_cap.py -q
 ok "test_issue27_inflight_cap"
 python3 tests/test_dspark_stacked_mapping.py -q
 ok "test_dspark_stacked_mapping"
+python3 tests/test_issue117_dispatch_trace.py -q
+ok "test_issue117_dispatch_trace"
 python3 tests/test_issue133_triton_specialization.py -q
 ok "test_issue133_triton_specialization"
 python3 scripts/verify-dsv4-027-equality-gate.py
@@ -185,6 +188,14 @@ if grep -Fq 'hotfix-dsv4-issue133-triton-specialization.py}:/opt/hotfix-dsv4-iss
 else
   bad "issue133 hotfix wiring is incomplete"
 fi
+if grep -Fq 'hotfix-vllm-issue117-dispatch-trace.py}:/opt/hotfix-vllm-issue117-dispatch-trace.py:ro' docker-compose.dspark.yml \
+  && grep -Fq 'DSPARK_ISSUE117_DISPATCH_TRACE: "${DSPARK_ISSUE117_DISPATCH_TRACE:-0}"' docker-compose.dspark.yml \
+  && grep -Fq 'if [ "$${DSPARK_ISSUE117_DISPATCH_TRACE:-0}" = "1" ]; then python3 /opt/hotfix-vllm-issue117-dispatch-trace.py || exit 1; fi;' docker-compose.dspark.yml \
+  && grep -Fq 'scp "$DSPARK_ISSUE117_DISPATCH_TRACE_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-issue117-dispatch-trace.py"' start-deepseek-v4-flash-dspark.sh; then
+  ok "issue117 dispatch trace is default-off, fail-closed, and worker-synced"
+else
+  bad "issue117 dispatch trace wiring is incomplete"
+fi
 if grep -Fq 'python3 /opt/hotfix-dsv4-suppress-stops-in-reasoning.py || exit 1' docker-compose.dspark.yml; then
   ok "compose applies suppress-stops-in-reasoning fail-closed"
 else
@@ -247,6 +258,7 @@ for p in \
   patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py \
   patches/hotfix-dsv4-issue133-triton-specialization.py \
   patches/hotfix-vllm-empty-encoder-output.py \
+  patches/hotfix-vllm-issue117-dispatch-trace.py \
   patches/hotfix-nvfp4-ds-mla-issue22.sh \
   patches/hotfix-gb10-spin-wait.sh \
   patches/hotfix-dsv4-suppress-stops-in-reasoning.py \

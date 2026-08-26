@@ -1,3 +1,9 @@
+## 2026-08-26
+
+### Added
+
+- **Opt-in TP dispatch trace for issue #117**: `DSPARK_ISSUE117_DISPATCH_TRACE=1` now applies a fail-closed hotfix against the pinned vLLM executor and correlates driver dispatch/response with each worker's receive, callable completion, and response enqueue using existing FIFO/ring positions. The default remains `0`; the trace changes no wire payload and exists only for the controlled clean-pair versus worker-only dirty-restart experiment.
+
 ## 2026-08-25
 
 ### Added
