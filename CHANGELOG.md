@@ -1,3 +1,9 @@
+## 2026-08-26
+
+### Changed
+
+- **docs(env): measured high-concurrency profile — `MAX_NUM_SEQS=32` + `MAX_NUM_BATCHED_TOKENS=12288` at full 1M context**: on 2x DGX Spark TP=2 at `70a7cc4`, raising admission lifts short-prompt aggregate decode from ~108 tok/s (c=8 with admission at the shipped default class, `MAX_NUM_SEQS` 4-6) to 154/213/325 tok/s at c=8/16/32, with single-stream fully recovered by the batched-tokens raise (the draft-slot squeeze the engine already warns about at boot). The KV pool is nearly `MAX_NUM_SEQS`-invariant (2.6x -> 2.1x concurrent 1M-token requests), so the prior "drop `MAX_MODEL_LEN` to 200K for concurrency" suggestion is unnecessary. The block now also warns that `MAX_NUM_SEQS=16` reliably kills the engine on its first c=16 burst on current main (#143; 8 and 32 verified clean including full-batch c=32), notes that heavy concurrent prefills remain scheduler-bound (#80/#140), and corrects the capture-size comment to reflect the engine's clamp to 24.
+
 ## 2026-08-25
 
 ### Added
