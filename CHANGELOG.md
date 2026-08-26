@@ -1,3 +1,9 @@
+## 2026-08-27
+
+### Fixed
+
+- **`pi-models.dspark.example.json` no longer advertises `thinking_token_budget` against a server that rejects it**: issue #66 made the GPU budget hotfix opt-in (`DSPARK_ENABLE_ISSUE31_GPU_HOTFIX`, default `0`) on the premise that fresh clones omit the field, but the shipped pi model entry kept `compat.supportsThinkingTokenBudget: true`. A clone that followed the README on both sides — `.env.dspark.example` for the server, `pi-models.dspark.example.json` into `~/.pi/agent/models.json` for the client — therefore failed every pi request with `thinking_token_budget is not yet supported by the V2 model runner`, and the error's own advice (`VLLM_USE_V2_MODEL_RUNNER=0`) points at a knob this recipe does not expose. The example now ships `false`, matching the server default; the README's pi section states that the budget needs the boot flag *and* the client capability, quotes the error produced by an out-of-step pair, and documents the reverse direction (turn the capability off, keep `DEFAULT_THINKING` and the `reasoning_effort` mapping, leave `maxTokens` generous enough for reasoning to finish).
+
 ## 2026-08-25
 
 ### Added
