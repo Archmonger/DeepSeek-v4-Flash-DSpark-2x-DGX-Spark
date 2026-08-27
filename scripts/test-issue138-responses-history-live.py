@@ -90,7 +90,7 @@ class FakeClient:
         if self.mode == "rejected":
             raise AssertionError(f"unexpected rejected-mode call {index}")
         if index == 4:
-            return success(T1)
+            return success(NONCE)
         if 5 <= index <= 10:
             return rejection()
         if 11 <= index <= 13:
@@ -162,9 +162,33 @@ class Issue138LiveVerifierTests(unittest.TestCase):
 
         semantic = client.calls[4]["input"]
         self.assertEqual(len(semantic), 3)
-        self.assertEqual(semantic[1], legacy_item)
-        self.assertNotIn(T1, semantic[0]["content"])
-        self.assertNotIn(T1, semantic[2]["content"][0]["text"])
+        semantic_legacy_item = semantic[1]
+        self.assertEqual(
+            semantic_legacy_item,
+            {
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": f"The launch code is {NONCE}.",
+                }],
+            },
+        )
+        self.assertNotEqual(semantic_legacy_item, legacy_item)
+        self.assertNotIn(NONCE, semantic[0]["content"])
+        self.assertEqual(
+            semantic[2],
+            {
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": (
+                        "What launch code did the immediately preceding assistant "
+                        "state? Reply with exactly the code and no other text."
+                    ),
+                }],
+            },
+        )
+        self.assertNotIn(NONCE, semantic[2]["content"][0]["text"])
         self.assertIn("assistant_semantic_continuity", result["gates"])
 
         negative_names = list(self.module.NEGATIVE_ITEMS)

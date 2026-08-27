@@ -326,19 +326,29 @@ def verify(
     }
 
     if expected_mode == "accepted":
+        semantic_legacy_item = {
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": f"The launch code is {nonce}.",
+            }],
+        }
         semantic_input = [
             {"role": "system", "content": SYSTEM_TEXT},
-            legacy_item,
+            semantic_legacy_item,
             {
                 "role": "user",
                 "content": [{
                     "type": "input_text",
-                    "text": "Repeat the immediately preceding assistant text exactly.",
+                    "text": (
+                        "What launch code did the immediately preceding assistant "
+                        "state? Reply with exactly the code and no other text."
+                    ),
                 }],
             },
         ]
         status, semantic = post(client, model, semantic_input)
-        require_200(status, semantic, expected_text=turn1_sentinel)
+        require_200(status, semantic, expected_text=nonce)
         gates["assistant_semantic_continuity"] = "PASS"
 
         for name, item in NEGATIVE_ITEMS.items():
