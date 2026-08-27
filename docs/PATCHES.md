@@ -385,9 +385,10 @@ against shared-backing fake tensors across the 1–576 boundary row matrix in
 SWA-only and compressed-cache shapes. It also checks exact-1 fail-closed
 Compose ordering and worker wiring.
 
-The initial live TP=2 campaign covered pinned-image apply/boot on both ranks
-and a short concurrency-16 generation with post-run smoke and restore. Before
-relying on the workaround, close the outstanding gates: disposable pinned-image
+The initial live TP=2 campaign at pre-trim head `890d9de` covered
+pinned-image apply/boot on both ranks, short concurrency-16 generation, and
+post-run smoke and restore. Before relying on the workaround, close the
+outstanding gates: disposable pinned-image
 extraction plus SM121a numerical/CUDA-graph tests, a two-rank OFF/ON/drift boot
 proof, and repeated stochastic generation soaks verifying terminal
 `finish_reason`, rank stability, throughput, and peak scratch memory. The
