@@ -1,21 +1,77 @@
 #!/usr/bin/env bash
 # Launch the per-node LMCache MP server. Run once per node with that node's
 # fabric IP. Requires the derived image (see README.md).
+#
+# Boot order is load-bearing: BOTH servers must be up and verified here BEFORE
+# the engine starts (see README, "Operational risk"). This script fails loudly
+# rather than leaving a half-up server behind a green exit code.
 set -euo pipefail
 FABRIC_IP="${1:?usage: run-lmcache-server.sh <this-node-fabric-ip> [image]}"
 IMAGE="${2:-dspark-vllm-gx10:lmcache054}"
 DISK="${LMCACHE_DISK_DIR:-$HOME/lmcache-disk}"
-mkdir -p "$DISK"
+PORT="${LMCACHE_PORT:-6667}"
+# 0 = kernel default (Docker's default too), so this is a no-op unless set.
+# A negative value biases the OOM killer away from the cache server on 128 GB
+# unified-memory boards; see README, "Operational risk" — it makes the engine
+# the likelier victim instead, which is the recoverable failure of the two.
+OOM_SCORE_ADJ="${LMCACHE_OOM_SCORE_ADJ:-0}"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# --- preflight (fail before we touch a running cache) -----------------------
+command -v docker >/dev/null 2>&1 || die "docker not found on PATH"
+docker image inspect "$IMAGE" >/dev/null 2>&1 \
+  || die "image '$IMAGE' not present locally; build the derived image first (README)"
+
+# The server must bind THIS node's fabric IP; a typo binds nothing and the
+# engine's lookups then go to a socket that never answers.
+if command -v ip >/dev/null 2>&1; then
+  ip -o -4 addr show 2>/dev/null | grep -qw "$FABRIC_IP" \
+    || die "$FABRIC_IP is not bound on this host; pass THIS node's fabric IP"
+fi
+
+# cupy is load-bearing: without it the server silently fails GPU-context
+# creation and every engine registration kills the vLLM head (LMCache #4759).
+docker run --rm --entrypoint python3 "$IMAGE" -c 'import cupy, lmcache' >/dev/null 2>&1 \
+  || die "image '$IMAGE' cannot import cupy and lmcache; see README requirements"
+
+mkdir -p "$DISK" || die "cannot create L2 dir $DISK"
+[ -w "$DISK" ] || die "L2 dir $DISK is not writable"
+
+# Replacing a LIVE server is the documented wedge condition: the replacement
+# comes up with no GPU contexts and the engine parks every lookup hit forever.
+if [ -n "$(docker ps -q -f name="^lmcache-server$")" ]; then
+  [ "${LMCACHE_FORCE_REPLACE:-0}" = "1" ] \
+    || die "lmcache-server is already RUNNING. Replacing it wedges a live engine
+       (see README, 'Operational risk'). Stop the pair first, or re-run with
+       LMCACHE_FORCE_REPLACE=1 if the pair is already down."
+fi
 docker rm -f lmcache-server >/dev/null 2>&1 || true
+
 # --restart no is deliberate: a dead server must be VISIBLE (see README —
 # an auto-restarted empty server currently wedges the engine silently).
 docker run -d --name lmcache-server --network host --ipc host --gpus all \
   --restart no \
+  --oom-score-adj "$OOM_SCORE_ADJ" \
   -e PYTHONHASHSEED=0 \
   -v "$DISK:/lmcache-disk" \
   --entrypoint lmcache "$IMAGE" server \
-  --host "$FABRIC_IP" --port 6667 --chunk-size 256 \
+  --host "$FABRIC_IP" --port "$PORT" --chunk-size 256 \
   --l1-size-gb "${LMCACHE_L1_GB:-12}" --l1-use-lazy --eviction-policy LRU \
   --l2-adapter '{"type":"fs","base_path":"/lmcache-disk"}' \
-  --disable-observability
-echo "lmcache server up on ${FABRIC_IP}:6667 (L1 ${LMCACHE_L1_GB:-12}G, fs L2 at $DISK)"
+  --disable-observability >/dev/null
+
+# --- verify the resulting state, not the exit code of docker run -----------
+for _ in $(seq 1 30); do
+  [ -n "$(docker ps -q -f name="^lmcache-server$")" ] || break
+  if (exec 3<>"/dev/tcp/${FABRIC_IP}/${PORT}") 2>/dev/null; then
+    exec 3<&- 2>/dev/null || true
+    echo "lmcache server up on ${FABRIC_IP}:${PORT} (L1 ${LMCACHE_L1_GB:-12}G, fs L2 at $DISK)"
+    echo "NOTE: start the engine only after EVERY node reports this line."
+    exit 0
+  fi
+  sleep 1
+done
+echo "--- lmcache-server logs ---" >&2
+docker logs --tail=50 lmcache-server >&2 2>&1 || true
+die "lmcache-server did not come up listening on ${FABRIC_IP}:${PORT}"
