@@ -1,3 +1,9 @@
+## 2026-08-27
+
+### Fixed
+
+- **Default-off Responses full-history compatibility for type-less assistant output replay ([Issue #138](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/138))**: `DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT=1` now applies an atomic, exact-source-locked patch to the pinned vLLM `ResponsesRequest.input_item_parsing` validator on both TP ranks. It recognizes only a missing-item-type assistant message with exactly one string `output_text` part, inserts `type=message`, and reuses stock coercion so supplied `id`, `status`, `phase`, annotations, logprobs, and item order survive. The flag defaults to `0`; every non-`1` value preserves stock bytes and the reported HTTP 400. Multipart, malformed, explicit-type and non-assistant inputs retain stock behavior, as do canonical OpenAI items, tools, reasoning, Chat Completions, and all default traffic. Enabled drift/apply/post-check failures restore original bytes when needed and abort before engine exec; switching either direction requires container recreation.
+
 ## 2026-08-25
 
 ### Added

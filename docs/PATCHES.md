@@ -296,3 +296,91 @@ gated-ON/OFF boot proof on both ranks before relying on it in production.
 ```bash
 python3 scripts/test-assistant-final-continuation.py
 ```
+
+## Issue #138 — type-less assistant `output_text` history replay
+
+### Scope and source identity
+
+The Anemll 0.1.1 image contains vanilla vLLM commit
+`752a3a504485790a2e8491cacbb35c137339ad34` at this serving boundary. The
+pinned file is:
+
+```text
+/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/responses/protocol.py
+Git blob ba8bc5a40f1bcffe8073cfdb4f0a8995da5e02e4
+ResponsesRequest.input_item_parsing old-method SHA-256 2412484a81e8679cedf1934287f1b4187a72bf6e8c910c8ecad463b29b79d9d7
+expected new-method SHA-256 536f3a305821445328c1f2131b898bef8a8f0c7d278cef4ba29701501eaf3d78
+```
+
+`patches/hotfix-vllm-issue138-responses-history.py` locks the complete validator
+method plus the surrounding `ResponseInputOutputItem` alias and request `input`
+field. A version string alone is not accepted.
+
+### Compatibility transformation
+
+With `DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT=1`, and only then, this
+reported replay item:
+
+```json
+{"role":"assistant","content":[{"type":"output_text","text":"hello"}]}
+```
+
+receives only the missing item-level `"type":"message"`. It is then handed to
+the pinned validator's existing assistant-output branch, which supplies only
+missing `id`, `status`, and `annotations`. Supplied `id`, `status`, `phase`,
+`annotations`, `logprobs`, text, optional model fields, list position, and all
+other input items are preserved.
+
+The exception requires a **missing** `type` key, assistant role, a content list
+of length exactly one, and one dictionary part with `type=output_text` and a
+string `text`. The singleton rule is required: pinned downstream conversion
+reads `content[0]`, so newly accepting type-less multipart content could drop
+parts. Explicit null/empty/unknown types, multipart or mixed content, missing or
+non-string text, refusals, non-assistant roles, malformed id/status/annotations,
+tools, reasoning, and other typed items retain stock acceptance or rejection.
+Canonical replay remains the complete output item:
+
+```json
+{
+  "type": "message",
+  "id": "msg_...",
+  "status": "completed",
+  "role": "assistant",
+  "content": [{"type":"output_text","text":"hello","annotations":[]}]
+}
+```
+
+Clients that can emit this canonical form should continue to do so. The hotfix
+is compatibility behavior, not a new canonical schema, and it does not alter
+Chat Completions, response storage, `previous_response_id`, tools, reasoning,
+tokenization, scheduling, or model output.
+
+### Gate, transaction, and removal
+
+| value | behavior |
+|---|---|
+| unset / `0` / anything other than exact `1` | stock bytes and stock `/v1/responses` validation; patcher not invoked |
+| exact `1` | both TP containers atomically apply or idempotently verify the exact postimage before engine exec |
+
+The patcher stages in the target directory, preserves mode, flushes and fsyncs,
+uses `os.replace`, re-reads the published bytes, rechecks the exact source
+state, and compiles again. Missing targets, source drift, duplicate/mixed/partial
+states, invalid UTF-8, compile failures, or publication errors exit nonzero. A
+post-publication failure atomically restores and verifies the original exact
+bytes and mode. Compose uses `|| exit 1`; neither rank has a masked path to
+engine exec. Recreate both containers when changing the flag in either
+direction because restart cannot unpatch an existing writable layer.
+
+Remove the flag, mount, patcher, focused tests, verifier, and this compatibility
+text together when a future pinned image contains a merged upstream fix that
+accepts the exact raw singleton fixture with the same rejection boundary.
+
+CPU contracts:
+
+```bash
+python3 scripts/test-issue138-responses-history-hotfix.py
+python3 scripts/test-issue138-responses-history-live.py
+```
+
+Live stock/enabled commands are in the README. No live A/B result is claimed by
+this implementation commit; the mode-strict two-turn run is the release gate.

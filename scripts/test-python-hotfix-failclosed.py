@@ -10,8 +10,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ROOT / "docker-compose.dspark.yml"
+START = ROOT / "start-deepseek-v4-flash-dspark.sh"
 ENCODING_TOKEN = "python3 /opt/hotfix-encoding-dsv4-issue21.py"
 RUNTIME_TOKEN = "python3 /opt/hotfix-dsv4-issue27-partial-prefill-concurrency.py"
+ISSUE138_TOKEN = "python3 /opt/hotfix-vllm-issue138-responses-history.py"
+LAUNCHER_BEGIN = "# Issue #138 Responses history compatibility pre-flight (begin)."
+LAUNCHER_END = "# Issue #138 Responses history compatibility pre-flight (end)."
 
 PYTHON_STUB = """#!/usr/bin/env bash
 case "${1:-}" in
@@ -52,6 +56,11 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
     def setUpClass(cls):
         cls.encoding_line = _compose_line(ENCODING_TOKEN)
         cls.runtime_line = _compose_line(RUNTIME_TOKEN)
+        cls.issue138_line = _compose_line(ISSUE138_TOKEN)
+        start_source = START.read_text()
+        cls.launcher_preflight = start_source.split(LAUNCHER_BEGIN, 1)[1].split(
+            LAUNCHER_END, 1
+        )[0]
 
     def _run_line(
         self,
@@ -89,6 +98,8 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
                     "DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX": "0",
                 }
             )
+            env.pop("DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT", None)
+            env.pop("DSPARK_ISSUE138_HOTFIX", None)
             if fail_step is not None:
                 env["FAIL_STEP"] = fail_step
                 env["FAIL_CODE"] = "7"
@@ -183,6 +194,117 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
             ],
         )
         self.assertTrue(reached)
+
+    def test_issue138_unset_zero_and_non_one_values_do_not_invoke_patcher(self):
+        for value in (None, "0", "true", "2"):
+            with self.subTest(value=value):
+                extra = ({} if value is None else {
+                    "DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT": value
+                })
+                proc, invocations, reached = self._run_line(
+                    self.issue138_line, env_extra=extra
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(invocations, [])
+                self.assertTrue(reached)
+
+    def test_issue138_exact_one_runs_before_permanent_chain(self):
+        proc, invocations, reached = self._run_line(
+            self.issue138_line + "\n" + self.runtime_line,
+            env_extra={"DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT": "1"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(
+            invocations,
+            [
+                "hotfix-vllm-issue138-responses-history.py",
+                "hotfix-vllm-empty-encoder-output.py",
+                "hotfix-dsv4-issue27-partial-prefill-concurrency.py",
+                "hotfix-dsv4-issue43-decode-fairness-and-diag.py",
+                "hotfix-dsv4-issue26-hybrid-swa-min.py",
+                "hotfix-dsv4-issue133-triton-specialization.py",
+                "hotfix-dsv4-suppress-stops-in-reasoning.py",
+            ],
+        )
+        self.assertTrue(reached)
+
+    def test_issue138_enabled_failure_blocks_later_patchers_and_service_exec(self):
+        proc, invocations, reached = self._run_line(
+            self.issue138_line + "\n" + self.runtime_line,
+            fail_step="hotfix-vllm-issue138-responses-history.py",
+            env_extra={"DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT": "1"},
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(invocations, ["hotfix-vllm-issue138-responses-history.py"])
+        self.assertFalse(reached)
+
+    def test_launcher_enabled_missing_source_exits_before_side_effect(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            reached = root / "side-effect"
+            command = (
+                self.launcher_preflight
+                + f"\nprintf reached > '{reached}'\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", command],
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "SCRIPT_DIR": str(root),
+                    "DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT": "1",
+                    "DSPARK_ISSUE138_HOTFIX": "missing.py",
+                },
+                timeout=30,
+            )
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("patcher is missing", proc.stderr)
+            self.assertFalse(reached.exists())
+
+    def test_launcher_normalizes_flag_resolves_relative_path_and_reaches_when_present(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            patcher = root / "selected.py"
+            patcher.write_text("# fixture\n")
+            result = root / "result"
+            command = (
+                self.launcher_preflight
+                + "\nprintf '%s\\n%s\\n' "
+                + '"$DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT" '
+                + '"$DSPARK_ISSUE138_HOTFIX"'
+                + f" > '{result}'\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", command],
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "SCRIPT_DIR": str(root),
+                    "DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT": "true",
+                    "DSPARK_ISSUE138_HOTFIX": "selected.py",
+                },
+                timeout=30,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(result.read_text().splitlines(), ["0", str(patcher)])
+
+    def test_launcher_carries_normalized_flag_and_canonical_path_to_both_worker_commands(self):
+        source = START.read_text()
+        worker_env = (
+            "DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT="
+            "'$DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT' "
+            "DSPARK_ISSUE138_HOTFIX='./patches/"
+            "hotfix-vllm-issue138-responses-history.py'"
+        )
+        self.assertEqual(source.count(worker_env), 2)
+        self.assertIn(
+            'scp "$DSPARK_ISSUE138_HOTFIX" "${WORKER_HOST}:'
+            '${REMOTE_WORKER_DIR}/patches/'
+            'hotfix-vllm-issue138-responses-history.py"',
+            source,
+        )
 
     def test_runtime_line_runs_enabled_steps_in_order(self):
         proc, invocations, reached = self._run_line(self.runtime_line)
