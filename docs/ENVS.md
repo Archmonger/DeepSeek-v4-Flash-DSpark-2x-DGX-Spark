@@ -94,17 +94,11 @@ PY
 
 #### Issue #136 operator sequence
 
-Leave `DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX=0` on every other image. With
-the exact supported pin, `--check` accepts stock or post-patch bytes without
-writing; `--status` returns 0 only for `patched`, 1 for `stock-compatible`, and
-2 for incompatible. The commands are documented in
+Enable/`--check`/`--status` semantics and exit codes, the launcher's
+worker/head preflight order, the required live closure gate, and the
+two-node stop/removal rollback rule (a process or Docker restart is **not**
+rollback) are documented in
 [`PATCHES.md`](PATCHES.md#issue-136--xgrammar-accepts-speculative-tokens-after-termination).
-Set exact `1`, run a successful two-node stop/removal, then use the normal
-launcher; its worker/head preflights complete before the first `compose up`.
-The 145-request live verifier, both-rank log scan, health/restart/metrics gate,
-and redacted evidence are required before claiming closure. Rollback means set
-`0`, stop/remove **both** service containers, and start again—a process or
-Docker restart retains the writable patched layer.
 
 ### B. Stage-C / overlay-registered only (warn + no-op on Anemll 0.1.1)
 

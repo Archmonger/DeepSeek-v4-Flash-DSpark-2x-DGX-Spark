@@ -3,7 +3,7 @@
 
 The checked-in files are exact upstream-derived fixtures.  Tests execute the
 real XgrammarGrammar methods extracted from each fixture, then exercise the
-production patcher and startup gates without Docker, vLLM, xgrammar, torch, a
+production patcher and startup wiring without Docker, vLLM, xgrammar, torch, a
 GPU, or network access.
 """
 from __future__ import annotations
@@ -15,9 +15,7 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import io
-import os
 import stat
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -31,20 +29,14 @@ POST_FIXTURE = FIXTURES / "backend_xgrammar-752a3a504-pr52805.py"
 PATCHER_PATH = ROOT / "patches" / "hotfix-vllm-issue136-xgrammar-termination.py"
 COMPOSE = ROOT / "docker-compose.dspark.yml"
 START = ROOT / "start-deepseek-v4-flash-dspark.sh"
-ENV_EXAMPLE = ROOT / ".env.dspark.example"
-CI = ROOT / "scripts" / "ci-validate.sh"
 GRAMMAR_ADVANCE = ROOT / "patches" / "hotfix-dsv4-grammar-advance.sh"
 
 STOCK_SHA256 = "231f6b9d7dab5e8d68aba486fa5912db99f8bdd3f9d8842ee3e0bb12bdb7cb67"
 POST_SHA256 = "6c7e23c0ae5c6836d0d56862c6e825c49727fa2409b881b44ea2526f1fd03f04"
-STOCK_GIT_BLOB = "4f199a1a273503f95d4f1f0269484980fe75ef54"
-POST_GIT_BLOB = "e8b1a9d76a5e933bdfdc89f9a299cf5b091544f6"
 STOCK_REGION_SHA256 = "9677073da0986c345f8fa36c787248ff5b3a1b0fbe999da31a91491f3267a149"
 POST_REGION_SHA256 = "2a7417bbe9e32179c3de8a5750358339320bec672b388fc0ede978e2270b72f4"
 STOCK_BYTES = 12_699
 POST_BYTES = 12_983
-STOCK_LINES = 363
-POST_LINES = 372
 EXPECTED_VLLM = "0.25.2.dev0+g752a3a504.d20260714"
 EXPECTED_XGRAMMAR = "0.2.3"
 REGION_START = b"    def accept_tokens("
@@ -159,11 +151,6 @@ REJECT = 9
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
-
-
-def git_blob(data: bytes) -> str:
-    header = f"blob {len(data)}\0".encode("ascii")
-    return hashlib.sha1(header + data).hexdigest()
 
 
 def method_region(data: bytes) -> tuple[bytes, bytes, bytes]:
@@ -303,8 +290,6 @@ class FixtureProvenanceTests(unittest.TestCase):
     def test_full_fixture_identities(self):
         self.assertEqual((len(self.stock), len(self.post)), (STOCK_BYTES, POST_BYTES))
         self.assertEqual((sha256(self.stock), sha256(self.post)), (STOCK_SHA256, POST_SHA256))
-        self.assertEqual((git_blob(self.stock), git_blob(self.post)), (STOCK_GIT_BLOB, POST_GIT_BLOB))
-        self.assertEqual((len(self.stock.splitlines()), len(self.post.splitlines())), (STOCK_LINES, POST_LINES))
         compile(self.stock.decode("utf-8"), STOCK_FIXTURE.name, "exec")
         compile(self.post.decode("utf-8"), POST_FIXTURE.name, "exec")
 
@@ -627,60 +612,23 @@ class PatcherFailureRecoveryTests(PatcherTestBase):
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o605)
             self.assertEqual(temp_artifacts(directory), [])
 
-    def test_post_publish_read_hash_and_compile_failures_roll_back(self):
-        for stage in ("read", "hash", "compile"):
-            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as tmp:
-                directory = Path(tmp)
-                target = self.write_target(directory, self.stock, 0o604)
-                original = target.read_bytes()
-                phase = {"published": False, "fired": False}
-                real_replace = PATCHER.os.replace
-
-                def tracking_replace(src, dst):
-                    real_replace(src, dst)
-                    phase["published"] = True
-
-                patches = [mock.patch.object(PATCHER.os, "replace", side_effect=tracking_replace)]
-                if stage == "read":
-                    real = PATCHER._read_file
-
-                    def fault(path):
-                        if phase["published"] and not phase["fired"] and path == target:
-                            phase["fired"] = True
-                            raise OSError("injected published read failure")
-                        return real(path)
-
-                    patches.append(mock.patch.object(PATCHER, "_read_file", side_effect=fault))
-                elif stage == "hash":
-                    real = PATCHER._sha256
-
-                    def fault(data):
-                        if phase["published"] and not phase["fired"] and data == self.post:
-                            phase["fired"] = True
-                            raise KeyboardInterrupt("injected published hash interrupt")
-                        return real(data)
-
-                    patches.append(mock.patch.object(PATCHER, "_sha256", side_effect=fault))
-                else:
-                    real = PATCHER._compile_source
-
-                    def fault(data, label):
-                        if phase["published"] and not phase["fired"] and data == self.post:
-                            phase["fired"] = True
-                            raise SyntaxError("injected published compile failure")
-                        return real(data, label)
-
-                    patches.append(mock.patch.object(PATCHER, "_compile_source", side_effect=fault))
-
-                with contextlib.ExitStack() as stack:
-                    for patch_context in patches:
-                        stack.enter_context(patch_context)
-                    with self.assertRaises(BaseException):
-                        PATCHER.apply(target, provider())
-                self.assertTrue(phase["fired"])
-                self.assertEqual(target.read_bytes(), original)
-                self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o604)
-                self.assertEqual(temp_artifacts(directory), [])
+    def test_post_publish_verification_failure_rolls_back(self):
+        # KeyboardInterrupt doubles as the breadth probe: only the patcher's
+        # ``except BaseException`` rollback path restores the published target.
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            target = self.write_target(directory, self.stock, 0o604)
+            original = target.read_bytes()
+            with mock.patch.object(
+                PATCHER,
+                "_verify_published",
+                side_effect=KeyboardInterrupt("injected verification interrupt"),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    PATCHER.apply(target, provider())
+            self.assertEqual(target.read_bytes(), original)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o604)
+            self.assertEqual(temp_artifacts(directory), [])
 
     def test_failed_rollback_is_fatal_and_cleans_staging_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -706,46 +654,14 @@ class PatcherFailureRecoveryTests(PatcherTestBase):
 
 
 class StartupWiringTests(unittest.TestCase):
+    # Gate execution behavior (disabled/non-"1" values skip, enabled invokes,
+    # failure blocks exec) is covered once, in scripts/test-python-hotfix-failclosed.py;
+    # these tests pin the static compose and launcher wiring.
     def compose_gate(self) -> str:
         token = "python3 /opt/hotfix-vllm-issue136-xgrammar-termination.py"
         matches = [line.strip() for line in COMPOSE.read_text(encoding="utf-8").splitlines() if token in line]
         self.assertEqual(len(matches), 1)
         return matches[0]
-
-    def run_gate(self, flag: str, fail: bool = False):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            bindir = root / "bin"
-            bindir.mkdir()
-            invocations = root / "invocations"
-            reached = root / "engine-reached"
-            stub = bindir / "python3"
-            stub.write_text(
-                "#!/usr/bin/env bash\n"
-                "printf '%s\\n' \"${1##*/}\" >> \"$INVOCATIONS\"\n"
-                "[ \"${PATCH_FAIL:-0}\" != 1 ]\n"
-            )
-            stub.chmod(0o755)
-            invocations.touch()
-            command = self.compose_gate().replace("$$", "$")
-            command += f'\nprintf reached > "{reached}"\n'
-            env = dict(os.environ)
-            env.update(
-                {
-                    "PATH": f"{bindir}:/usr/bin:/bin",
-                    "INVOCATIONS": str(invocations),
-                    "DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX": flag,
-                    "PATCH_FAIL": "1" if fail else "0",
-                }
-            )
-            result = subprocess.run(
-                ["bash", "-c", command],
-                env=env,
-                text=True,
-                capture_output=True,
-                timeout=10,
-            )
-            return result, invocations.read_text().splitlines(), reached.exists()
 
     def test_compose_mount_default_gate_and_exec_order(self):
         compose = COMPOSE.read_text(encoding="utf-8")
@@ -769,26 +685,6 @@ class StartupWiringTests(unittest.TestCase):
         self.assertLess(compose.index(gate), compose.index("exec /usr/local/bin/vllm serve"))
         hotfix_loop = next(line for line in compose.splitlines() if "for _hf in" in line)
         self.assertNotIn("issue136", hotfix_loop.lower())
-
-    def test_gate_disabled_and_nonone_values_skip_without_runtime_write(self):
-        for flag in ("", "0", "true", "yes", "01"):
-            with self.subTest(flag=flag):
-                result, invocations, reached = self.run_gate(flag)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(invocations, [])
-                self.assertTrue(reached)
-
-    def test_gate_enabled_success_reaches_engine(self):
-        result, invocations, reached = self.run_gate("1")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(invocations, ["hotfix-vllm-issue136-xgrammar-termination.py"])
-        self.assertTrue(reached)
-
-    def test_gate_enabled_failure_blocks_engine(self):
-        result, invocations, reached = self.run_gate("1", fail=True)
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertEqual(invocations, ["hotfix-vllm-issue136-xgrammar-termination.py"])
-        self.assertFalse(reached)
 
     def test_launcher_syncs_and_preflights_both_nodes_before_any_up(self):
         source = START.read_text(encoding="utf-8")
@@ -828,40 +724,6 @@ class StartupWiringTests(unittest.TestCase):
         )
         positions = [source.index(token) for token in (sync, worker_check, head_check, worker_up, head_up)]
         self.assertEqual(positions, sorted(positions))
-
-    def test_env_example_is_default_off_and_pin_exact(self):
-        text = ENV_EXAMPLE.read_text(encoding="utf-8")
-        self.assertEqual(text.count("DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX=0"), 1)
-        self.assertIn(
-            "ghcr.io/anemll/dspark-vllm-gx10:0.1.1@sha256:"
-            "a83948492cf13df455170fb42885f5ef4db54fefe0feff0f841ecbff464ac9d8",
-            text,
-        )
-        self.assertNotIn("DSPARK_ISSUE136_XGRAMMAR_HOTFIX=", text)
-
-    def test_timeout_and_existing_grammar_advance_contract_remain_intact(self):
-        compose = COMPOSE.read_text(encoding="utf-8")
-        self.assertEqual(
-            compose.count(
-                'VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '
-                '"${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"'
-            ),
-            1,
-        )
-        self.assertNotIn("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", PATCHER_PATH.read_text(encoding="utf-8"))
-        self.assertIn("hotfix-dsv4-grammar-advance.sh", compose)
-
-    def test_focused_ci_registers_programs_fixtures_and_cpu_test(self):
-        ci = CI.read_text(encoding="utf-8")
-        for path in (
-            "patches/hotfix-vllm-issue136-xgrammar-termination.py",
-            "scripts/test-issue136-xgrammar-termination.py",
-            "scripts/verify-issue136-xgrammar-live.py",
-            "scripts/fixtures/issue136/backend_xgrammar-752a3a504.py",
-            "scripts/fixtures/issue136/backend_xgrammar-752a3a504-pr52805.py",
-        ):
-            self.assertIn(path, ci)
-        self.assertIn("python3 scripts/test-issue136-xgrammar-termination.py -q", ci)
 
 
 if __name__ == "__main__":

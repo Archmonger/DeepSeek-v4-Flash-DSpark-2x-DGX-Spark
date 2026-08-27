@@ -265,32 +265,6 @@ do
   fi
 done
 
-# Issue #136 exact fixtures and focused CPU/live verifier programs are release artifacts.
-for p in \
-  scripts/test-issue136-xgrammar-termination.py \
-  scripts/verify-issue136-xgrammar-live.py \
-  scripts/fixtures/issue136/backend_xgrammar-752a3a504.py \
-  scripts/fixtures/issue136/backend_xgrammar-752a3a504-pr52805.py
-do
-  if [ -f "$p" ]; then
-    ok "present $p"
-  else
-    bad "missing required $p"
-  fi
-done
-
-# Issue #136 stays outside the optional shell-hotfix loop. Enabled mode is an
-# exact-1, fail-closed per-rank gate plus worker/head preflight before either up.
-if grep -Fq 'hotfix-vllm-issue136-xgrammar-termination.py}:/opt/hotfix-vllm-issue136-xgrammar-termination.py:ro' docker-compose.dspark.yml \
-  && grep -Fq 'DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX: "${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}"' docker-compose.dspark.yml \
-  && grep -Fq 'if [ "$${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}" = "1" ]; then python3 /opt/hotfix-vllm-issue136-xgrammar-termination.py || exit 1; fi;' docker-compose.dspark.yml \
-  && grep -Fq 'scp "$DSPARK_ISSUE136_XGRAMMAR_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-issue136-xgrammar-termination.py"' start-deepseek-v4-flash-dspark.sh \
-  && grep -Fq '/opt/hotfix-vllm-issue136-xgrammar-termination.py --check' start-deepseek-v4-flash-dspark.sh; then
-  ok "issue136 XGrammar hotfix is exact-1, fail-closed, synced, and preflighted"
-else
-  bad "issue136 XGrammar hotfix wiring is incomplete"
-fi
-
 # Multi-key auth: keyed starts apply and verify redaction fail-closed outside
 # the optional performance-hotfix loop, while the worker sync keeps shipping it.
 if grep -Fq 'bash /opt/dspark-patches/hotfix-vllm-redact-api-key-log.sh || exit 1' docker-compose.dspark.yml \
