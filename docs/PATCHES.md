@@ -296,3 +296,127 @@ gated-ON/OFF boot proof on both ranks before relying on it in production.
 ```bash
 python3 scripts/test-assistant-final-continuation.py
 ```
+
+## Issue #136 — XGrammar accepts speculative tokens after termination
+
+### Symptom and source fix
+
+With DSpark MTP, `structural_tag` constraints, async scheduling, and TP=2,
+one accepted draft batch can contain a terminating token followed by speculative
+tokens. Pinned vLLM `752a3a504` passes those trailing tokens to an already
+terminated XGrammar matcher. The characteristic warning is `The matcher has
+terminated ... but is trying to accept new token`; the affected request can
+then stop making progress and eventually end in the generic 1,800-second
+`sample_tokens` RPC timeout. Raising or lowering that deadline does not repair
+the grammar state machine.
+
+`patches/hotfix-vllm-issue136-xgrammar-termination.py` backports only the three
+`XgrammarGrammar` method hunks from upstream vLLM PR
+[#52805](https://github.com/vllm-project/vllm/pull/52805), merge
+`12f64b39d29282437e35be9aa5db432fb2a1a6e6`:
+
+- `accept_tokens` stops at the terminating token, counts it, caches termination,
+  ignores the rest of that batch, and treats a later acceptance as a successful
+  no-op;
+- `validate_tokens` stops at termination, rolls back only the accepted prefix,
+  and returns no speculative drafts after cached termination;
+- `reset` clears the matcher, counter, and cached termination flag.
+
+This is disjoint from the existing #44993 grammar-advance backport:
+`hotfix-dsv4-grammar-advance.sh` changes only
+`v1/structured_output/__init__.py` and `v1/core/sched/scheduler.py`; issue #136
+changes only `v1/structured_output/backend_xgrammar.py`.
+
+### Compatibility and exact identities
+
+Enabled mode accepts only all of the following:
+
+- image `ghcr.io/anemll/dspark-vllm-gx10:0.1.1@sha256:a83948492cf13df455170fb42885f5ef4db54fefe0feff0f841ecbff464ac9d8`;
+- installed metadata `vllm==0.25.2.dev0+g752a3a504.d20260714` and
+  `xgrammar==0.2.3`;
+- stock target SHA-256
+  `231f6b9d7dab5e8d68aba486fa5912db99f8bdd3f9d8842ee3e0bb12bdb7cb67`
+  (12,699 bytes), or exact post-image SHA-256
+  `6c7e23c0ae5c6836d0d56862c6e825c49727fa2409b881b44ea2526f1fd03f04`
+  (12,983 bytes).
+
+Anything else—including another vLLM/xgrammar version, a symlink, partial
+application, or drift before/inside/after the method region—is incompatible.
+No source is written. An exact stock file is completely constructed and
+compiled in memory, staged beside the target, and published with one atomic
+rename. Mode/owner/group are retained and the file plus directory are fsynced.
+Any post-publication read/hash/metadata/compile failure atomically restores and
+verifies the original bytes. An exact post-image is reverified without a write.
+
+### Flag and status
+
+| value | behavior |
+|---|---|
+| `0` / unset / anything other than exact `1` | patcher is not invoked; installed vLLM bytes remain stock |
+| `1` | worker and head compatibility checks must both pass before either rank starts; each container then applies/reverifies fail-closed before `exec vllm` |
+
+The supported launcher syncs the patcher to the worker's canonical `patches/`
+path. Direct Compose starts retain the per-container fail-before-exec gate but
+do not provide the launcher's cluster-wide two-rank preflight.
+
+Nonmutating check (stock or patched exits 0; incompatible exits 2):
+
+```bash
+docker compose --env-file .env.dspark -f docker-compose.dspark.yml run \
+  --rm --no-deps --entrypoint python3 vllm-dspark \
+  /opt/hotfix-vllm-issue136-xgrammar-termination.py --check
+```
+
+Running-container status (`patched` exits 0, `stock-compatible` exits 1,
+`incompatible` exits 2):
+
+```bash
+docker compose --env-file .env.dspark -f docker-compose.dspark.yml exec \
+  vllm-dspark python3 \
+  /opt/hotfix-vllm-issue136-xgrammar-termination.py --status
+```
+
+### CPU and live acceptance
+
+The hermetic fixture/transaction/startup suite requires no vLLM, xgrammar,
+torch, Docker, GPU, or network:
+
+```bash
+python3 scripts/test-issue136-xgrammar-termination.py
+```
+
+Issue closure still requires a maintenance-window canary on the exact two-node
+async/TP=2/MTP5 lane. After enabling only
+`DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX=1` and recreating both ranks, run:
+
+```bash
+VLLM_API_KEY='...' python3 scripts/verify-issue136-xgrammar-live.py \
+  --base-url http://127.0.0.1:8888/v1 \
+  --model deepseek-v4-flash-dspark \
+  --output /tmp/issue136-xgrammar-live.json
+```
+
+The verifier uses a 120-second deadline per request and records no credentials,
+headers, request bodies, or response bodies. It runs 20 sequential strict tool
+requests; 100 at concurrency four alternating required/named tool choice; five
+bounded strict-JSON `ignore_eos` diagnostics; ten ordinary-tool controls; and
+ten plain-chat controls. Require all 145 cases plus pre/post `/health` to pass.
+From the same saved UTC start time, both rank logs must contain zero matcher
+termination warnings, `Failed to advance FSM`/`grammar rejected tokens`, shared
+memory broadcast-block waits, `sample_tokens` timeouts, and
+`EngineDeadError`/`EngineCore encountered an issue`; restart counts must remain
+unchanged and no request may remain running with frozen generation progress.
+The JSON request report alone is not the complete live gate.
+
+### Rollback and upgrade
+
+Changing the flag requires a real two-node stop/removal and start. To roll back,
+set the flag to `0`, require `stop-deepseek-v4-flash-dspark.sh` to remove both
+service containers, then start normally. `docker restart` or restarting the
+process reuses the patched writable layer and is **not** rollback. On an image
+upgrade, leave the flag off: enabled mode intentionally rejects even a newer
+upstream file. Once the image incorporates PR #52805, remove this patcher,
+flag, fixtures/tests, sync/preflight, and documentation together.
+
+Evidence currently checked in is CPU/source-exact only. Do not claim the live
+incident closed until the two-rank canary and log/health gate above pass.

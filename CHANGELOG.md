@@ -1,3 +1,9 @@
+## 2026-08-27
+
+### Fixed
+
+- **Opt-in, source-exact XGrammar termination backport for the issue #136 MTP lane**: pinned vLLM `752a3a504` can pass speculative tokens after a terminating token to an already-terminated XGrammar matcher, desynchronizing cached grammar state and preceding the reported zero-progress/`sample_tokens` timeout. `DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX=1` backports only the three `XgrammarGrammar` hunks from upstream vLLM PR #52805; the default remains `0` and does not mutate runtime source. The patcher accepts only Anemll 0.1.1's exact vLLM/xgrammar metadata and stock/post full-file identities, applies through one same-directory atomic rename, verifies the result, restores exact original bytes on any post-publish failure, and is no-write idempotent. The launcher syncs the canonical worker patcher and checks worker then head before either rank starts; each Compose entrypoint rechecks/applies fail-closed outside the optional hotfix loop. Exact pinned/post fixtures and hermetic behavior, drift, transaction, and startup controls are registered in CPU CI. This does **not** claim the live incident closed: the documented async/TP=2/MTP5 145-request canary and both-rank log/health gate remain required.
+
 ## 2026-08-25
 
 ### Added

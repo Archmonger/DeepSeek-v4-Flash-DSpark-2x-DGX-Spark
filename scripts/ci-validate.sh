@@ -50,6 +50,8 @@ py_files+=(
   scripts/test-redact-api-key-log.py
   scripts/test-hotfix-atomic-transaction.py
   scripts/test-python-hotfix-failclosed.py
+  scripts/test-issue136-xgrammar-termination.py
+  scripts/verify-issue136-xgrammar-live.py
   scripts/test-empty-encoder-output-hotfix.py
   scripts/ruler-lite.py
   scripts/verify-dsv4-027-equality-gate.py
@@ -91,6 +93,8 @@ python3 scripts/test-hotfix-atomic-transaction.py -q
 ok "test-hotfix-atomic-transaction"
 python3 scripts/test-python-hotfix-failclosed.py -q
 ok "test-python-hotfix-failclosed"
+python3 scripts/test-issue136-xgrammar-termination.py -q
+ok "test-issue136-xgrammar-termination"
 python3 scripts/test-empty-encoder-output-hotfix.py -q
 ok "test-empty-encoder-output-hotfix"
 python3 tests/test_issue27_inflight_cap.py -q
@@ -247,6 +251,7 @@ for p in \
   patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py \
   patches/hotfix-dsv4-issue133-triton-specialization.py \
   patches/hotfix-vllm-empty-encoder-output.py \
+  patches/hotfix-vllm-issue136-xgrammar-termination.py \
   patches/hotfix-nvfp4-ds-mla-issue22.sh \
   patches/hotfix-gb10-spin-wait.sh \
   patches/hotfix-dsv4-suppress-stops-in-reasoning.py \
@@ -259,6 +264,32 @@ do
     bad "missing required $p"
   fi
 done
+
+# Issue #136 exact fixtures and focused CPU/live verifier programs are release artifacts.
+for p in \
+  scripts/test-issue136-xgrammar-termination.py \
+  scripts/verify-issue136-xgrammar-live.py \
+  scripts/fixtures/issue136/backend_xgrammar-752a3a504.py \
+  scripts/fixtures/issue136/backend_xgrammar-752a3a504-pr52805.py
+do
+  if [ -f "$p" ]; then
+    ok "present $p"
+  else
+    bad "missing required $p"
+  fi
+done
+
+# Issue #136 stays outside the optional shell-hotfix loop. Enabled mode is an
+# exact-1, fail-closed per-rank gate plus worker/head preflight before either up.
+if grep -Fq 'hotfix-vllm-issue136-xgrammar-termination.py}:/opt/hotfix-vllm-issue136-xgrammar-termination.py:ro' docker-compose.dspark.yml \
+  && grep -Fq 'DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX: "${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}"' docker-compose.dspark.yml \
+  && grep -Fq 'if [ "$${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}" = "1" ]; then python3 /opt/hotfix-vllm-issue136-xgrammar-termination.py || exit 1; fi;' docker-compose.dspark.yml \
+  && grep -Fq 'scp "$DSPARK_ISSUE136_XGRAMMAR_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-issue136-xgrammar-termination.py"' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq '/opt/hotfix-vllm-issue136-xgrammar-termination.py --check' start-deepseek-v4-flash-dspark.sh; then
+  ok "issue136 XGrammar hotfix is exact-1, fail-closed, synced, and preflighted"
+else
+  bad "issue136 XGrammar hotfix wiring is incomplete"
+fi
 
 # Multi-key auth: keyed starts apply and verify redaction fail-closed outside
 # the optional performance-hotfix loop, while the worker sync keeps shipping it.
