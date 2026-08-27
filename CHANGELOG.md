@@ -1,3 +1,9 @@
+## 2026-08-27
+
+### Added
+
+- **Default-off, source-locked sparse-MLA decode chunking workaround for [Issue #141](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/141)**: setting exactly `DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK=1` patches only the pinned Anemll SM120 adapter before vLLM import, preserving the original one-call path at `<=64` rows and splitting larger calls into ordered, disjoint views capped at FlashInfer's fixed 64-row standalone-decode boundary. The six row-coupled tensors are sliced together; caches, workspace, sinks, scale, and the existing output allocation are shared unchanged. The complete adapter method plus pinned FlashInfer dispatch/bridge/mutation fragments are exact-locked, syntax is compiled before a mode-preserving same-directory atomic replace, idempotent boots reverify without writing, and post-publication failure atomically restores original bytes. Compose defaults to `0` (patcher not invoked, runtime bytes unchanged), mounts it read-only, normalizes the same exact-1 flag for both ranks, syncs the worker copy, and aborts before `exec vllm` on any enabled error. CPU coverage freezes independent source digests and checks apply/idempotence/drift/rollback, the 1–576 row call matrix, optional tensors, object identity, in-place ordered output, and fail-closed wiring. This is a **workaround, not a root-cause fix**: the failure is stochastic; the 64/65 evidence and long chunk-64 survival come from one pair, the second failing pair has not repeated that A/B, and SM121a numerical/CUDA-graph plus repeated two-rank soak validation remain outstanding. Flag changes and rollback require paired stop/start container recreation; restart alone retains patched writable-layer bytes.
+
 ## 2026-08-25
 
 ### Added
