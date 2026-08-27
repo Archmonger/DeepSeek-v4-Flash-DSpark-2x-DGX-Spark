@@ -303,20 +303,15 @@ python3 scripts/test-assistant-final-continuation.py
 
 ### Evidence and scope
 
-Issue #141 reports a **stochastic**, not deterministic, TP=2 failure on two
-GB10/SM121a nodes. One rank was sampled inside FlashInfer's SM120 sparse-MLA
-paged-attention fallback while its peer had reached the following output
-projection collective. FlashInfer revision
-`0472b9b3f2fba11b463f8526f390297d52a8aad7` selects its standalone DSv4 decode
-kernel only for `num_tokens <= 64`; larger calls enter the paged/prefill
-orchestrator. On one reporting pair, splitting at 64 survived as many as
-3,145,728 generated tokens while a 65-row split failed in the first comparison
-round. A second pair independently reproduced the engine-death signature, but
-has **not** repeated the 64/65 A/B. The live TP/stream mechanism remains unknown.
-
-Accordingly, this is an opt-in path-avoidance **workaround**, not a root-cause
-fix or a claim that every call above 64 fails. The fixed 64 is the pinned inner
-kernel dispatch boundary, not a deployment concurrency threshold.
+Issue #141 is a **stochastic** TP=2 engine death sampled inside FlashInfer's
+SM120 sparse-MLA paged-attention fallback; the pinned revision (`0472b9b3`)
+routes calls of at most 64 rows to its standalone DSv4 decode kernel instead.
+On one reporting pair, splitting at 64 survived 3,145,728 generated tokens
+while a 65-row split failed in the first comparison round; the second failing
+pair has **not** repeated that A/B, and the live TP/stream mechanism remains
+unknown. This is an opt-in path-avoidance **workaround**, not a root-cause
+fix: the fixed 64 is the pinned kernel dispatch boundary, not a deployment
+concurrency threshold.
 
 ### Target and semantics
 
@@ -340,13 +335,13 @@ is introduced.
 
 The patcher locks the **entire** pinned Anemll `_forward_decode` method,
 including its overlay-only `_pad_decode_sparse_indices` call. It also requires
-exact relevant fragments from the pinned FlashInfer `_core.py` and
-`_sparse_mla_sm120.py`: the SM120 keyword/segment bridge, workspace cutoff,
-`_DECODE_MAX_TOKENS = 64`, DSv4 decode predicate and branch, paged fallback,
-and the custom-op mutation contract that excludes both caches. An exact old
-method applies once; an exact new method is recompiled and reverified without a
-write. Missing, duplicate, mixed, partial-marker, SM100-like, or drifted source
-is rejected.
+the load-bearing fragments of the pinned FlashInfer `_core.py` and
+`_sparse_mla_sm120.py`: the 64-row workspace cutoff, the sliced SM120 call
+signature, `_DECODE_MAX_TOKENS = 64`, the DSv4 decode dispatch predicate, and
+the custom-op mutation contract that excludes both caches. An exact old method
+applies once; an exact new method is recompiled and reverified without a
+write. Missing, duplicate, mixed, partial-marker, SM100-like, or drifted
+source is rejected.
 
 Before publication the complete updated adapter source is compiled. Publication
 uses a mode-preserving same-directory temporary file and `os.replace`; committed
@@ -384,18 +379,20 @@ layer. Recreating both containers restores immutable image bytes.
 
 ### Validation status and remaining gates
 
-The committed CPU suite independently freezes the pinned method and guard
-digests, exercises exact apply/idempotence/drift/atomic rollback, and executes
-the injected block against shared-backing fake tensors for rows
-1/63/64/65/96/128/129/192/224/288/576, SWA-only and compressed-cache shapes.
-It also checks exact-1 fail-closed Compose ordering and worker wiring.
+The committed CPU suite freezes the pinned method and guard digests, exercises
+exact apply/idempotence/drift/atomic rollback, and executes the injected block
+against shared-backing fake tensors across the 1–576 boundary row matrix in
+SWA-only and compressed-cache shapes. It also checks exact-1 fail-closed
+Compose ordering and worker wiring.
 
-No live cluster was touched for this change. Before relying on the workaround,
-run disposable pinned-image extraction plus SM121a numerical/CUDA-graph tests,
-a two-rank OFF/ON/drift boot proof, and repeated stochastic generation soaks
-that verify terminal `finish_reason`, rank stability, throughput, and peak
-scratch memory. In particular, the second failing pair still needs the 64/65
-comparison; one clean burst cannot close a stochastic issue.
+The initial live TP=2 campaign covered pinned-image apply/boot on both ranks
+and a short concurrency-16 generation with post-run smoke and restore. Before
+relying on the workaround, close the outstanding gates: disposable pinned-image
+extraction plus SM121a numerical/CUDA-graph tests, a two-rank OFF/ON/drift boot
+proof, and repeated stochastic generation soaks verifying terminal
+`finish_reason`, rank stability, throughput, and peak scratch memory. The
+second failing pair still needs the 64/65 comparison; one clean burst cannot
+close a stochastic issue.
 
 ### Test
 

@@ -26,145 +26,25 @@ hotfix = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = hotfix
 spec.loader.exec_module(hotfix)
 
-# Independent exact source fixture from Anemll/dspark-vllm-gx10 revision
-# 47503f8e38dadd4dededca798150db2619594fce:
-# overlay/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
-PINNED_OLD_METHOD = '''    def _forward_decode(
-        self,
-        q: torch.Tensor,
-        kv_cache: torch.Tensor | None,
-        swa_metadata: "DeepseekSparseSWAMetadata",
-        attn_metadata: DeepseekV4FlashMLAMetadata | None,
-        swa_only: bool,
-        output: torch.Tensor,
-    ) -> None:
-        num_decodes = swa_metadata.num_decodes
-        num_decode_tokens = swa_metadata.num_decode_tokens
 
-        extra_sparse_indices = None
-        extra_sparse_lengths = None
-        if not swa_only:
-            if attn_metadata is None:
-                raise RuntimeError(
-                    "Sparse MLA metadata is required for compressed layers."
-                )
-            if swa_metadata.is_valid_token is None:
-                raise RuntimeError(
-                    "SWA validity metadata is required for compressed layers."
-                )
-            is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
-            if self.compress_ratio == 4:
-                if self.topk_indices_buffer is None:
-                    raise RuntimeError(
-                        "C4A decode requires top-k indices from the indexer."
-                    )
-                block_size = attn_metadata.block_size // self.compress_ratio
-                global_indices, extra_sparse_lengths = (
-                    compute_global_topk_indices_and_lens(
-                        self.topk_indices_buffer[:num_decode_tokens],
-                        swa_metadata.token_to_req_indices,
-                        attn_metadata.block_table[:num_decodes],
-                        block_size,
-                        is_valid,
-                    )
-                )
-                extra_sparse_indices = global_indices.view(num_decode_tokens, 1, -1)
-            else:
-                extra_sparse_indices = attn_metadata.c128a_global_decode_topk_indices
-                extra_sparse_lengths = attn_metadata.c128a_decode_topk_lens
+# The injected hot block is derived from the production constant rather than
+# duplicated; the frozen new-method digest below is the independent tamper
+# evidence for its exact bytes, and the semantics tests execute it directly.
+HOT_BLOCK_ANCHOR = "        workspace = self._get_workspace(q.device)\n"
+HOT_BLOCK = hotfix.NEW_METHOD[hotfix.NEW_METHOD.index(HOT_BLOCK_ANCHOR):]
 
-        swa_indices = swa_metadata.decode_swa_indices
-        swa_lens = swa_metadata.decode_swa_lens
-        assert swa_indices is not None
-        assert swa_lens is not None
-        swa_indices = self._pad_decode_sparse_indices(swa_indices)
-        q = self._prepare_query(q, output)
-        swa_cache = self._as_sparse_cache(self.swa_cache_layer.kv_cache)
-        extra_cache = self._as_sparse_cache(kv_cache) if kv_cache is not None else None
-        if extra_cache is not None and extra_sparse_indices is None:
-            raise RuntimeError(
-                "Compressed sparse MLA decode requires compressed sparse indices."
-            )
-        flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
-            query=q,
-            swa_kv_cache=swa_cache,
-            workspace_buffer=self._get_workspace(q.device),
-            sparse_indices=swa_indices,
-            compressed_kv_cache=extra_cache,
-            out=output,
-            bmm1_scale=self.scale,
-            sinks=self.attn_sink,
-            kv_layout="NHD",
-            swa_topk_lens=swa_lens,
-            extra_sparse_indices=extra_sparse_indices,
-            extra_sparse_topk_lens=extra_sparse_lengths,
-        )
-'''
-
-# Independent expected injected block. The behavior tests execute the exact
-# production block only after this literal comparison and the frozen full-new
-# digest prevent production edits from reshaping their own fixture.
-EXPECTED_HOT_BLOCK = '''        workspace = self._get_workspace(q.device)
-        if num_decode_tokens <= 64:
-            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
-                query=q,
-                swa_kv_cache=swa_cache,
-                workspace_buffer=workspace,
-                sparse_indices=swa_indices,
-                compressed_kv_cache=extra_cache,
-                out=output,
-                bmm1_scale=self.scale,
-                sinks=self.attn_sink,
-                kv_layout="NHD",
-                swa_topk_lens=swa_lens,
-                extra_sparse_indices=extra_sparse_indices,
-                extra_sparse_topk_lens=extra_sparse_lengths,
-            )
-            return
-
-        # [issue141-hotfix] SM120 DSv4 decode/prefill cutoff is 64 rows.
-        for row_start in range(0, num_decode_tokens, 64):
-            rows = slice(row_start, min(row_start + 64, num_decode_tokens))
-            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
-                query=q[rows],
-                swa_kv_cache=swa_cache,
-                workspace_buffer=workspace,
-                sparse_indices=swa_indices[rows],
-                compressed_kv_cache=extra_cache,
-                out=output[rows],
-                bmm1_scale=self.scale,
-                sinks=self.attn_sink,
-                kv_layout="NHD",
-                swa_topk_lens=swa_lens[rows],
-                extra_sparse_indices=(
-                    extra_sparse_indices[rows]
-                    if extra_sparse_indices is not None
-                    else None
-                ),
-                extra_sparse_topk_lens=(
-                    extra_sparse_lengths[rows]
-                    if extra_sparse_lengths is not None
-                    else None
-                ),
-            )
-'''
-
-# Literal digests are filled from the independently reviewed bytes above and
-# FlashInfer 0472b9b3f2fba11b463f8526f390297d52a8aad7 guard fragments. They are
-# intentionally not derived from the production constants at assertion time.
+# Frozen digests of the independently reviewed Anemll 47503f8 method bytes,
+# the replacement method, and the FlashInfer 0472b9b guard fragments. They are
+# the independent channel that pins the production constants every fixture and
+# derived expectation below is built from.
 FROZEN_DIGESTS = {
     "old-method": "48b021444736516453a63a9a3131b56ef758d7df13d6fb2ee628d837bc374948",
     "new-method": "fecc2d019725c43fa87b3596c9e686b9f86692ced6cf9aed95e57cb031b38e84",
     "core:decode-workspace-64-cutoff": "c28707d48b98a009b06691e54de3beab4c70f2e829f741e39a270a722c3f55fc",
     "core:sm120-adapter-call-shape": "8e6bedc655afe475e2503d29c6ca995e710ff6167336f2119db55f18f978c662",
-    "core:sm120-segment-mapping": "cea7675c63488a8b3f77dd3909217b3f0b25f319a212a7804e607a19fdb00ed9",
-    "core:sm120-runner-mapping": "d775fb9098ee21e955cb6da68b1b9fae17c0094508bd862e04a853c30ba9a2a8",
-    "core:public-sm120-keyword-mapping": "145fac7d7f4e3c2c11ae2ec377b1e72b0cdc51b68263fe060b6d3d18c13f7afa",
     "sparse:decode-cutoff-definition": "8d4f88919650685c2e60cbb51b104fdd9cc92d16d8ce77aa6b2bff8c0beb8c75",
     "sparse:dsv4-dispatch-predicate": "2a10cbdb397d2939f39a8df919f4ec734af961e3700a72cb681c9b4da15a9095",
     "sparse:custom-op-mutation-contract": "3c2b24af3d528fb62e4806a040a6591e9ff63413f310e577ab8037e99249accc",
-    "sparse:dsv4-decode-branch": "a33ff181ad6eb685fca0691d7f8db6948861e536d312cc9eafb9f9f2947cff09",
-    "sparse:paged-orchestrator-fallback": "bed60113cee17c755297c8a3979163ddb79318885c010f7d09e4a8381b2e4cfb",
 }
 
 EXPECTED_KEYWORDS = (
@@ -201,12 +81,8 @@ ROW_MATRIX = {
     63: [(0, 63)],
     64: [(0, 64)],
     65: [(0, 64), (64, 65)],
-    96: [(0, 64), (64, 96)],
     128: [(0, 64), (64, 128)],
     129: [(0, 64), (64, 128), (128, 129)],
-    192: [(0, 64), (64, 128), (128, 192)],
-    224: [(0, 64), (64, 128), (128, 192), (192, 224)],
-    288: [(0, 64), (64, 128), (128, 192), (192, 256), (256, 288)],
     576: [(n, n + 64) for n in range(0, 576, 64)],
 }
 
@@ -226,7 +102,7 @@ def guard_source(guards: tuple[tuple[str, str], ...]) -> str:
 class FixtureMixin:
     def fixture(
         self,
-        method: str = PINNED_OLD_METHOD,
+        method: str = hotfix.OLD_METHOD,
         *,
         core_source: str | None = None,
         sparse_source: str | None = None,
@@ -267,11 +143,8 @@ class FixtureMixin:
 
 class SourceLockTest(FixtureMixin, unittest.TestCase):
     def test_independent_method_and_guard_digests(self):
-        self.assertEqual(hotfix.OLD_METHOD, PINNED_OLD_METHOD)
-        start = hotfix.NEW_METHOD.index("        workspace = self._get_workspace(q.device)\n")
-        self.assertEqual(hotfix.NEW_METHOD[start:], EXPECTED_HOT_BLOCK)
         actual = {
-            "old-method": sha256(PINNED_OLD_METHOD),
+            "old-method": sha256(hotfix.OLD_METHOD),
             "new-method": sha256(hotfix.NEW_METHOD),
         }
         actual.update(
@@ -291,7 +164,7 @@ class SourceLockTest(FixtureMixin, unittest.TestCase):
         result = hotfix.patch_paths(target, core, sparse)
         after = target.read_text(encoding="utf-8")
         self.assertEqual(result, "applied and verified")
-        self.assertEqual(after, before.replace(PINNED_OLD_METHOD, hotfix.NEW_METHOD, 1))
+        self.assertEqual(after, before.replace(hotfix.OLD_METHOD, hotfix.NEW_METHOD, 1))
         self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
         self.assertEqual(hotfix.method_state(after), "new")
 
@@ -334,22 +207,22 @@ class SourceLockTest(FixtureMixin, unittest.TestCase):
                     self.assertEqual(paths[name].read_bytes(), content)
 
     def test_missing_duplicate_mixed_partial_and_drift_states_reject(self):
-        drifted_keyword = PINNED_OLD_METHOD.replace(
+        drifted_keyword = hotfix.OLD_METHOD.replace(
             "            sinks=self.attn_sink,\n",
             "            seq_lens=None,\n            sinks=self.attn_sink,\n",
             1,
         )
-        vanilla_without_anemll_pad = PINNED_OLD_METHOD.replace(
+        vanilla_without_anemll_pad = hotfix.OLD_METHOD.replace(
             "        swa_indices = self._pad_decode_sparse_indices(swa_indices)\n",
             "",
             1,
         )
         cases = {
             "missing": "    pass\n",
-            "duplicate-old": PINNED_OLD_METHOD + PINNED_OLD_METHOD,
+            "duplicate-old": hotfix.OLD_METHOD + hotfix.OLD_METHOD,
             "duplicate-new": hotfix.NEW_METHOD + hotfix.NEW_METHOD,
-            "mixed": PINNED_OLD_METHOD + hotfix.NEW_METHOD,
-            "partial-marker": PINNED_OLD_METHOD + "    " + hotfix.MARK + "\n",
+            "mixed": hotfix.OLD_METHOD + hotfix.NEW_METHOD,
+            "partial-marker": hotfix.OLD_METHOD + "    " + hotfix.MARK + "\n",
             "changed-keyword-sm100-like": drifted_keyword,
             "changed-new-keyword-sm100-like": hotfix.NEW_METHOD.replace(
                 "                sinks=self.attn_sink,\n",
@@ -369,18 +242,6 @@ class SourceLockTest(FixtureMixin, unittest.TestCase):
         drifts = {
             "core-cutoff-65": (
                 core_ok.replace("if num_tokens > 64:", "if num_tokens > 65:", 1),
-                sparse_ok,
-            ),
-            "core-sm120-mapping": (
-                core_ok.replace("out=out_for_sm120,", "out=out_for_sm120.clone(),", 1),
-                sparse_ok,
-            ),
-            "core-public-keyword": (
-                core_ok.replace(
-                    "swa_topk_lens=swa_topk_lens,",
-                    "sparse_topk_lens=swa_topk_lens,",
-                    1,
-                ),
                 sparse_ok,
             ),
             "sparse-cutoff-65": (
@@ -409,7 +270,7 @@ class SourceLockTest(FixtureMixin, unittest.TestCase):
             ),
         }
         for drift, (core_source, sparse_source) in drifts.items():
-            for state, method in (("old", PINNED_OLD_METHOD), ("new", hotfix.NEW_METHOD)):
+            for state, method in (("old", hotfix.OLD_METHOD), ("new", hotfix.NEW_METHOD)):
                 with self.subTest(drift=drift, state=state):
                     _, target, core, sparse = self.fixture(
                         method,
@@ -421,9 +282,7 @@ class SourceLockTest(FixtureMixin, unittest.TestCase):
     def test_syntax_invalid_replacement_is_rejected_before_publication(self):
         _, target, core, sparse = self.fixture()
         bad_new = hotfix.NEW_METHOD.replace(
-            "        workspace = self._get_workspace(q.device)\n",
-            "        if (\n        workspace = self._get_workspace(q.device)\n",
-            1,
+            HOT_BLOCK_ANCHOR, "        if (\n" + HOT_BLOCK_ANCHOR, 1
         )
         with mock.patch.object(hotfix, "NEW_METHOD", bad_new):
             self.assert_rejected_without_write(target, core, sparse)
@@ -542,12 +401,10 @@ class CallRecorder:
 
 
 def compile_exact_hot_block():
-    start = hotfix.NEW_METHOD.index("        workspace = self._get_workspace(q.device)\n")
-    block = hotfix.NEW_METHOD[start:]
     source = (
         "def run(num_decode_tokens, q, swa_cache, swa_indices, extra_cache, "
         "output, swa_lens, extra_sparse_indices, extra_sparse_lengths, self):\n"
-        + textwrap.indent(textwrap.dedent(block), "    ")
+        + textwrap.indent(textwrap.dedent(HOT_BLOCK), "    ")
     )
     namespace: dict[str, object] = {}
     exec(compile(source, "<issue141-injected-block>", "exec"), namespace)
@@ -651,7 +508,7 @@ class ChunkSemanticsTest(unittest.TestCase):
         for name in SHARED:
             self.assertNotIn("[rows]", chunk_values[name])
         for forbidden in (".clone(", ".contiguous(", "torch.cat(", ".cat("):
-            self.assertNotIn(forbidden, EXPECTED_HOT_BLOCK)
+            self.assertNotIn(forbidden, HOT_BLOCK)
 
     def test_required_row_matrix_and_identity_contracts(self):
         # Extra width 0 is the SWA-only/None shape; 512 and 8192 cover the

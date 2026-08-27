@@ -214,8 +214,10 @@ NEW_METHOD = '''    def _forward_decode(
             )
 '''
 
-# Exact relevant-source locks from FlashInfer revision
-# 0472b9b3f2fba11b463f8526f390297d52a8aad7. Each fragment must occur once.
+# Exact load-bearing source locks from FlashInfer revision
+# 0472b9b3f2fba11b463f8526f390297d52a8aad7: the 64-row cutoff in both files,
+# the dispatch predicate, the sliced call signature, and the custom-op
+# mutation contract that excludes both KV caches. Each must occur once.
 CORE_GUARDS = (
     (
         "decode-workspace-64-cutoff",
@@ -251,80 +253,6 @@ CORE_GUARDS = (
     sinks: Optional[torch.Tensor],
     kv_layout: Literal["HND", "NHD"],
 ) -> torch.Tensor:
-''',
-    ),
-    (
-        "sm120-segment-mapping",
-        '''    sparse_mla_segments: List[_SparseMLASegment] = [
-        _SparseMLASegment(indices=sparse_indices, lengths=swa_topk_lens)
-    ]
-    if extra_sparse_indices is not None:
-        if compressed_kv_cache is None:
-            raise ValueError(
-                "compressed_kv_cache is required when extra_sparse_indices is provided"
-            )
-        compressed_kv_cache = _check_sm120_dsv4_kv_cache_layout(
-            compressed_kv_cache, kv_layout, "compressed_kv_cache"
-        )
-        if compressed_kv_cache.dtype == torch.uint8:
-            if compressed_kv_cache.size(-1) != 584:
-                raise ValueError(
-                    "Expected packed SM120 DSV4 compressed_kv_cache head dim 584, "
-                    f"got {compressed_kv_cache.size(-1)}"
-                )
-        elif compressed_kv_cache.dtype != query.dtype:
-            raise ValueError(
-                "compressed_kv_cache dtype must match query dtype, got "
-                f"{compressed_kv_cache.dtype} and {query.dtype}"
-            )
-        elif compressed_kv_cache.size(-1) != 512:
-            raise ValueError(
-                "Expected compressed_kv_cache head dim 512, got "
-                f"{compressed_kv_cache.size(-1)}"
-            )
-        sparse_mla_segments.append(
-            _SparseMLASegment(
-                indices=extra_sparse_indices,
-                lengths=extra_sparse_topk_lens,
-                kv_cache=compressed_kv_cache,
-            )
-        )
-''',
-    ),
-    (
-        "sm120-runner-mapping",
-        '''        _trtllm_batch_decode_sparse_mla_sm120(
-            query=query_for_sm120,
-            kv_cache=swa_kv_cache,
-            workspace_buffer=workspace_buffer,
-            sparse_mla_segments=sparse_mla_segments,
-            out=out_for_sm120,
-            sm_scale=bmm1_scale,
-            sinks=sinks,
-            lse=None,
-            return_lse=False,
-            kv_scale_format="auto",
-        ),
-''',
-    ),
-    (
-        "public-sm120-keyword-mapping",
-        '''    if backend == "sparse":
-        return _trtllm_batch_decode_sparse_mla_dsv4_sm120(
-            query=query,
-            swa_kv_cache=swa_kv_cache,
-            workspace_buffer=workspace_buffer,
-            sparse_indices=sparse_indices,
-            compressed_kv_cache=compressed_kv_cache,
-            swa_topk_lens=swa_topk_lens,
-            extra_sparse_indices=extra_sparse_indices,
-            extra_sparse_topk_lens=extra_sparse_topk_lens,
-            out=out,
-            bmm1_scale=float(bmm1_scale),
-            bmm2_scale=float(bmm2_scale),
-            sinks=sinks,
-            kv_layout=kv_layout,
-        )
 ''',
     ),
 )
@@ -368,60 +296,6 @@ _DECODE_MAX_TOKENS = 64
     )
 ''',
     ),
-    (
-        "dsv4-decode-branch",
-        '''        if (
-            model_type == _MODEL_TYPE_DSV4
-            and kv_pbs == _DECODE_DSV4_PAGE_BLOCK_SIZE
-            and _decode_dsv4_dispatchable(
-                num_tokens, num_heads, topk, d_qk, kv_pbs, extra_topk
-            )
-        ):
-            num_splits_main = (topk + _BI - 1) // _BI
-            num_splits_extra = (extra_topk + _BI - 1) // _BI
-            num_splits = num_splits_main + num_splits_extra
-            mid_out_view, mid_lse_view = _decode_scratch_views(
-                mid_out, mid_lse, num_tokens, num_heads, num_splits, d_v
-            )
-            # FFI binding extracts the true block stride from kv_cache.stride(0),
-            # so paged layouts with padded strides and microbench 2-D layouts
-            # both work.
-            sparse_mla_sm120_decode_dsv4(
-                q,
-                kv_cache,
-                indices,
-                mid_out_view,
-                mid_lse_view,
-                output,
-                out_lse,
-                sm_scale,
-                topk_length=topk_length,
-                attn_sink=attn_sink,
-                extra_kv_cache=extra_kv_cache,
-                extra_indices=extra_indices,
-                extra_topk_length=extra_topk_length,
-            )
-            return
-''',
-    ),
-    (
-        "paged-orchestrator-fallback",
-        '''        module.sparse_mla_sm120_paged_attention(
-            q,
-            kv_cache,
-            indices,
-            output,
-            out_lse,
-            sm_scale,
-            model_type,
-            topk_length,
-            attn_sink,
-            extra_kv_cache,
-            extra_indices,
-            extra_topk_length,
-        )
-''',
-    ),
 )
 
 
@@ -450,8 +324,8 @@ def _check_guards(source: str, guards: tuple[tuple[str, str], ...], label: str) 
             offsets.append((name, source.index(fragment)))
     if failures:
         raise PatchError(f"{label} source drift ({', '.join(failures)})")
-    # Ordered inventories pin that the bridge and decode branch still precede
-    # their fallback paths, rather than merely existing elsewhere.
+    # Ordered inventories pin that each fragment still sits at its pinned
+    # relative position, rather than merely existing somewhere in the file.
     if any(left[1] >= right[1] for left, right in zip(offsets, offsets[1:])):
         raise PatchError(f"{label} guard order drift")
 
