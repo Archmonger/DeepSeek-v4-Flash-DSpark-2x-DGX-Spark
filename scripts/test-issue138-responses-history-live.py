@@ -187,6 +187,7 @@ class Issue138LiveVerifierTests(unittest.TestCase):
         for body in client.calls:
             self.assertIs(body["store"], False)
             self.assertEqual(body["model"], "deepseek-v4-flash-0731")
+            self.assertEqual(body["max_output_tokens"], 256)
             self.assertEqual(body["reasoning"], {"effort": "none"})
             self.assertEqual(body["temperature"], 0)
 

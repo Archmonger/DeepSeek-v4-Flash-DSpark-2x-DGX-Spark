@@ -164,7 +164,7 @@ def request_body(model: str, input_items: list[dict[str, Any]]) -> dict[str, Any
     return {
         "model": model,
         "input": input_items,
-        "max_output_tokens": 64,
+        "max_output_tokens": 256,
         "temperature": 0,
         "reasoning": {"effort": "none"},
         "store": False,
