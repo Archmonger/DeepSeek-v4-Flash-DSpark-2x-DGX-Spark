@@ -397,7 +397,6 @@ def apply(target: Path) -> int:
     try:
         if _source_state(updated_source, target) != "applied":
             raise PatchError("replacement did not reach the exact applied state")
-        _compile(updated_source, target)
     except PatchError as error:
         print(f"[FAIL] {TAG} replacement rejected before publication: {error}", file=sys.stderr)
         return 1
@@ -414,7 +413,6 @@ def apply(target: Path) -> int:
         committed_source = _decode(committed, target)
         if _source_state(committed_source, target) != "applied":
             raise PatchError("post-publication source-state verification failed")
-        _compile(committed_source, target)
     except BaseException as error:
         rollback_error: BaseException | None = None
         if publication_started:

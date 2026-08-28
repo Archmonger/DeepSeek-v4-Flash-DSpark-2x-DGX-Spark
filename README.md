@@ -512,15 +512,8 @@ python3 scripts/verify-issue138-responses-history-live.py \
 To test compatibility mode, set
 `DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT=1` in `.env.dspark`, stop and
 start the pair so both containers are recreated, then require the same replay
-to succeed:
-
-```bash
-python3 scripts/verify-issue138-responses-history-live.py \
-  --base-url http://127.0.0.1:8888/v1 \
-  --model deepseek-v4-flash-0731 \
-  --expect-legacy accepted \
-  --output results/issue138-enabled.json
-```
+to succeed by rerunning the command above with `--expect-legacy accepted` and
+`--output results/issue138-enabled.json`.
 
 The enabled run also checks assistant semantic continuity, the exact reported
 four-item payload, six malformed/ambiguous neighbors that must remain HTTP 400,

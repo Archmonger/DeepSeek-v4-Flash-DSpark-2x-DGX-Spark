@@ -94,23 +94,6 @@ PY
 | `DSPARK_API_KEYS` | **Optional multi-key auth**, enforced by vLLM itself. Single-line keys use literal space/tab separators and are flattened into **one** `--api-key` flag (nargs list; repeating the flag would overwrite). Empty or space/tab-only (default) adds no flag, preserving stock behavior. Parsing trims/collapses separators, preserves order, allows duplicates, rejects CR/LF/VT/FF before empty classification, rejects backslashes, and rejects tokens starting with `-` without echoing token bytes (exit 2); it must be set in `.env.dspark`, not the shell. **Mutually exclusive with `VLLM_API_KEY`**: if both are meaningful, the entrypoint and `start-`/`smoke-`/`status-*.sh` scripts exit 2 before patch/install work. Every route outside the guarded prefixes `/v1`, `/v2`, `/inference` is keyless. On the pinned runtime that includes `POST /invocations` and `POST /generative_scoring` (both run inference unauthenticated) and the `/tokenize` / `/detokenize` utility routes, besides `/health`, `/metrics`, `/version`, `/ping`; a keyed deployment still needs network-level access control on the server port. Keys remain container argv/env, so rotation needs a stop/start; vLLM provides revocation rather than per-key request attribution. |
 | `patches/hotfix-vllm-redact-api-key-log.sh` | Key-log redaction hotfix, required whenever either key variable is configured; apply + `--status` must succeed or the entrypoint fails the container before exec vllm, and `--status` exits nonzero unless every check passes. Upstream `log_non_default_args()` prints every `--api-key` value verbatim; the patch redacts that logger for both entrypoints while preserving the count as `'api_key': ['<redacted:N value(s)>']`. This closes the log channel only; keys remain visible through `docker inspect` / host `ps`. |
 
-#### Issue #138 boot states
-
-| Effective flag / installed source | Result |
-|---|---|
-| unset, `0`, `true`, `yes`, or anything other than exact `1` | Stock bytes and stock validation; the patcher is not invoked. |
-| exact `1`, complete pinned preimage | Atomically patch and verify on each TP rank, then start vLLM. |
-| exact `1`, complete postimage | Verify without rewriting (idempotent), then start vLLM. |
-| exact `1`, missing file, source drift/duplication/partial marker, compile, publish, or post-check failure | Exit nonzero before vLLM exec on that rank; a publication failure restores the exact original bytes and mode. |
-
-The switch affects only `/v1/responses` **full-history request validation**. It
-does not retain responses, configure `VLLM_ENABLE_RESPONSES_API_STORE`, or alter
-`previous_response_id`. `DSPARK_ISSUE138_HOTFIX` may select a different local
-bind source; the launcher resolves relative values from the checkout and copies
-the selected bytes to the worker's canonical `patches/` path. Change either
-direction with container recreation (`stop` then `start`), not `docker compose
-restart`: turning the flag off cannot unpatch an existing container writable
-layer.
 #### Issue #136 operator sequence
 
 Enable/`--check`/`--status` semantics and exit codes, the launcher's

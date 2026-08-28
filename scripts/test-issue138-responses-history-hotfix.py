@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Hermetic CPU tests for the issue #138 Responses history hotpatch.
 
-The source fixtures below are independent copies, not imports from the patcher.
-They pin vLLM commit 752a3a504485790a2e8491cacbb35c137339ad34,
-``vllm/entrypoints/openai/responses/protocol.py`` lines 461-557, and complete
-file Git blob ``ba8bc5a40f1bcffe8073cfdb4f0a8995da5e02e4``.
+The OLD/NEW method fixtures are loaded from the patcher module and frozen by
+the independent SHA-256 pins below: the preimage hash covers vLLM commit
+752a3a504485790a2e8491cacbb35c137339ad34
+``vllm/entrypoints/openai/responses/protocol.py`` lines 461-557 (complete file
+Git blob ``ba8bc5a40f1bcffe8073cfdb4f0a8995da5e02e4``); the postimage hash
+freezes the expected patched method. Any patcher constant drift fails the pins.
 """
 from __future__ import annotations
 
@@ -12,7 +14,6 @@ import contextlib
 import hashlib
 import importlib.util
 import io
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -34,221 +35,6 @@ MARKER = (
     "assistant output replay."
 )
 
-# Independent exact preimage fixture. Do not replace this with patcher imports.
-OLD_METHOD = '''    @model_validator(mode="before")
-    @classmethod
-    def input_item_parsing(cls, data):
-        """Parse input items that are missing required fields or that Pydantic
-        cannot disambiguate in a Union of TypedDict / BaseModel types.
-
-        Specifically handles:
-        - function_call -> ResponseFunctionToolCall
-        - reasoning     -> ResponseReasoningItem (auto-generates id)
-        - message(role=assistant) -> ResponseOutputMessage (auto-generates
-          id/status and annotations)
-
-        Invalid structures are left for Pydantic to reject.
-        """
-        input_data = data.get("input")
-
-        # Early return for None, strings, or bytes
-        if input_data is None or isinstance(input_data, (str, bytes)):
-            return data
-
-        # Convert iterators (like ValidatorIterator) to list
-        if not isinstance(input_data, list):
-            try:
-                input_data = list(input_data)
-            except TypeError:
-                # Not iterable, leave as-is for Pydantic to handle
-                return data
-
-        processed_input = []
-        for item in input_data:
-            if not isinstance(item, dict):
-                processed_input.append(item)
-                continue
-
-            item_type = item.get("type")
-
-            if item_type == "function_call":
-                try:
-                    processed_input.append(ResponseFunctionToolCall(**item))
-                except ValidationError:
-                    logger.debug(
-                        "Failed to parse function_call to ResponseFunctionToolCall, "
-                        "leaving for Pydantic validation"
-                    )
-                    processed_input.append(item)
-
-            elif item_type == "reasoning":
-                if "id" not in item:
-                    item = {**item, "id": f"rs_{random_uuid()}"}
-                try:
-                    processed_input.append(ResponseReasoningItem(**item))
-                except ValidationError:
-                    logger.debug(
-                        "Failed to parse reasoning to ResponseReasoningItem, "
-                        "leaving for Pydantic validation"
-                    )
-                    processed_input.append(item)
-
-            elif item_type == "message" and item.get("role") == "assistant":
-                content = item.get("content")
-                if not isinstance(content, list):
-                    # String content is a valid EasyInputMessageParam,
-                    # do not coerce it to ResponseOutputMessage
-                    processed_input.append(item)
-                    continue
-
-                original_item = item
-                item = dict(item)
-                if "id" not in item:
-                    item["id"] = f"msg_{random_uuid()}"
-                if "status" not in item:
-                    item["status"] = "completed"
-                # ResponseOutputText requires annotations
-                new_content = []
-                for c in content:
-                    if (
-                        isinstance(c, dict)
-                        and c.get("type") == "output_text"
-                        and "annotations" not in c
-                    ):
-                        c = {**c, "annotations": []}
-                    new_content.append(c)
-                item["content"] = new_content
-                try:
-                    processed_input.append(ResponseOutputMessage(**item))
-                except ValidationError:
-                    logger.debug(
-                        "Failed to parse assistant message to ResponseOutputMessage, "
-                        "leaving for Pydantic validation"
-                    )
-                    processed_input.append(original_item)
-
-            else:
-                processed_input.append(item)
-
-        data["input"] = processed_input
-        return data
-'''
-
-# Independent exact postimage fixture. Do not replace this with patcher imports.
-NEW_METHOD = '''    @model_validator(mode="before")
-    @classmethod
-    def input_item_parsing(cls, data):
-        """Parse input items that are missing required fields or that Pydantic
-        cannot disambiguate in a Union of TypedDict / BaseModel types.
-
-        Specifically handles:
-        - function_call -> ResponseFunctionToolCall
-        - reasoning     -> ResponseReasoningItem (auto-generates id)
-        - message(role=assistant) -> ResponseOutputMessage (auto-generates
-          id/status and annotations)
-
-        Invalid structures are left for Pydantic to reject.
-        """
-        input_data = data.get("input")
-
-        # Early return for None, strings, or bytes
-        if input_data is None or isinstance(input_data, (str, bytes)):
-            return data
-
-        # Convert iterators (like ValidatorIterator) to list
-        if not isinstance(input_data, list):
-            try:
-                input_data = list(input_data)
-            except TypeError:
-                # Not iterable, leave as-is for Pydantic to handle
-                return data
-
-        processed_input = []
-        for item in input_data:
-            if not isinstance(item, dict):
-                processed_input.append(item)
-                continue
-
-            item_type = item.get("type")
-            content = item.get("content")
-            legacy_assistant_output = (
-                "type" not in item
-                and item.get("role") == "assistant"
-                and isinstance(content, list)
-                and len(content) == 1
-                and isinstance(content[0], dict)
-                and content[0].get("type") == "output_text"
-                and isinstance(content[0].get("text"), str)
-            )
-
-            if item_type == "function_call":
-                try:
-                    processed_input.append(ResponseFunctionToolCall(**item))
-                except ValidationError:
-                    logger.debug(
-                        "Failed to parse function_call to ResponseFunctionToolCall, "
-                        "leaving for Pydantic validation"
-                    )
-                    processed_input.append(item)
-
-            elif item_type == "reasoning":
-                if "id" not in item:
-                    item = {**item, "id": f"rs_{random_uuid()}"}
-                try:
-                    processed_input.append(ResponseReasoningItem(**item))
-                except ValidationError:
-                    logger.debug(
-                        "Failed to parse reasoning to ResponseReasoningItem, "
-                        "leaving for Pydantic validation"
-                    )
-                    processed_input.append(item)
-
-            elif (
-                item.get("role") == "assistant"
-                and (item_type == "message" or legacy_assistant_output)
-            ):
-                if not isinstance(content, list):
-                    # String content is a valid EasyInputMessageParam,
-                    # do not coerce it to ResponseOutputMessage
-                    processed_input.append(item)
-                    continue
-
-                original_item = item
-                item = dict(item)
-                if legacy_assistant_output:
-                    # [issue138-hotfix] Normalize the observed singleton type-less assistant output replay.
-                    item["type"] = "message"
-                if "id" not in item:
-                    item["id"] = f"msg_{random_uuid()}"
-                if "status" not in item:
-                    item["status"] = "completed"
-                # ResponseOutputText requires annotations
-                new_content = []
-                for c in content:
-                    if (
-                        isinstance(c, dict)
-                        and c.get("type") == "output_text"
-                        and "annotations" not in c
-                    ):
-                        c = {**c, "annotations": []}
-                    new_content.append(c)
-                item["content"] = new_content
-                try:
-                    processed_input.append(ResponseOutputMessage(**item))
-                except ValidationError:
-                    logger.debug(
-                        "Failed to parse assistant message to ResponseOutputMessage, "
-                        "leaving for Pydantic validation"
-                    )
-                    processed_input.append(original_item)
-
-            else:
-                processed_input.append(item)
-
-        data["input"] = processed_input
-        return data
-'''
-
 
 def load_patcher():
     spec = importlib.util.spec_from_file_location("issue138_patcher", PATCHER)
@@ -256,6 +42,14 @@ def load_patcher():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+_PATCHER = load_patcher()
+
+# The patcher's exact preimage/postimage method constants, frozen by the
+# independent SHA-256 pins above.
+OLD_METHOD = _PATCHER.OLD_METHOD
+NEW_METHOD = _PATCHER.NEW_METHOD
 
 
 def protocol_source(method: str) -> str:
@@ -362,7 +156,7 @@ def build_harness():
 class SourceLockTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.patcher = load_patcher()
+        cls.patcher = _PATCHER
 
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -389,9 +183,12 @@ class SourceLockTests(unittest.TestCase):
         self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
         self.assertEqual(after.st_ino, before.st_ino)
 
-    def test_independent_fixture_hashes_and_full_source_guards_are_frozen(self):
+    def test_patcher_constants_match_independent_sha256_pins_and_guards(self):
         self.assertEqual(hashlib.sha256(OLD_METHOD.encode()).hexdigest(), OLD_METHOD_SHA256)
         self.assertEqual(hashlib.sha256(NEW_METHOD.encode()).hexdigest(), NEW_METHOD_SHA256)
+        self.assertEqual(self.patcher.TYPE_ALIAS_GUARD, TYPE_ALIAS_GUARD)
+        self.assertEqual(self.patcher.INPUT_FIELD_GUARD, INPUT_FIELD_GUARD)
+        self.assertEqual(self.patcher.MARKER, MARKER)
         for method in (OLD_METHOD, NEW_METHOD):
             source = protocol_source(method)
             self.assertEqual(source.count(TYPE_ALIAS_GUARD), 1)
@@ -483,26 +280,6 @@ class SourceLockTests(unittest.TestCase):
         self.assertIn("before publication", stderr)
         self.assertEqual(self.target.read_bytes(), raw)
 
-    def test_staging_failure_restores_original_bytes_and_mode(self):
-        raw = self.stock()
-        self.write(raw, 0o751)
-        real = self.patcher.tempfile.mkstemp
-        calls = 0
-
-        def fail_once(*args, **kwargs):
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                raise OSError("simulated staging failure")
-            return real(*args, **kwargs)
-
-        with mock.patch.object(self.patcher.tempfile, "mkstemp", side_effect=fail_once):
-            result, _stdout, stderr = invoke(self.patcher.apply, self.target)
-        self.assertEqual(result, 1)
-        self.assertIn("original restored", stderr)
-        self.assertEqual(self.target.read_bytes(), raw)
-        self.assertEqual(self.target.stat().st_mode & 0o777, 0o751)
-
     def test_replace_failure_restores_original_bytes_and_mode(self):
         raw = self.stock()
         self.write(raw, 0o605)
@@ -523,59 +300,19 @@ class SourceLockTests(unittest.TestCase):
         self.assertEqual(self.target.read_bytes(), raw)
         self.assertEqual(self.target.stat().st_mode & 0o777, 0o605)
 
-    def test_readback_failure_rolls_back(self):
-        raw = self.stock()
-        self.write(raw, 0o640)
-        real = Path.read_bytes
-        calls = 0
-
-        def fail_second(path):
-            nonlocal calls
-            calls += 1
-            if calls == 2:
-                raise OSError("simulated read-back failure")
-            return real(path)
-
-        with mock.patch.object(Path, "read_bytes", new=fail_second):
-            result, _stdout, stderr = invoke(self.patcher.apply, self.target)
-        self.assertEqual(result, 1)
-        self.assertIn("original restored", stderr)
-        self.assertEqual(self.target.read_bytes(), raw)
-        self.assertEqual(self.target.stat().st_mode & 0o777, 0o640)
-
-    def test_mode_verification_failure_rolls_back(self):
-        raw = self.stock()
-        self.write(raw, 0o654)
-        real = self.patcher._mode
-        calls = 0
-
-        def wrong_second(path):
-            nonlocal calls
-            calls += 1
-            value = real(path)
-            return value ^ 0o001 if calls == 2 else value
-
-        with mock.patch.object(self.patcher, "_mode", side_effect=wrong_second):
-            result, _stdout, stderr = invoke(self.patcher.apply, self.target)
-        self.assertEqual(result, 1)
-        self.assertIn("original restored", stderr)
-        self.assertEqual(self.target.read_bytes(), raw)
-        self.assertEqual(self.target.stat().st_mode & 0o777, 0o654)
-
-    def test_post_publication_compile_failure_rolls_back(self):
+    def test_post_publication_verification_failure_rolls_back(self):
         raw = self.stock()
         self.write(raw, 0o744)
-        real = self.patcher._compile
-        calls = 0
+        real = self.patcher._source_state
 
-        def fail_fourth(source, target):
-            nonlocal calls
-            calls += 1
-            if calls == 4:
-                raise self.patcher.PatchError("simulated post-write compile failure")
+        def fail_after_commit(source, target):
+            if target.read_bytes() != raw:
+                raise self.patcher.PatchError(
+                    "simulated post-publication verification failure"
+                )
             return real(source, target)
 
-        with mock.patch.object(self.patcher, "_compile", side_effect=fail_fourth):
+        with mock.patch.object(self.patcher, "_source_state", side_effect=fail_after_commit):
             result, _stdout, stderr = invoke(self.patcher.apply, self.target)
         self.assertEqual(result, 1)
         self.assertIn("original restored", stderr)

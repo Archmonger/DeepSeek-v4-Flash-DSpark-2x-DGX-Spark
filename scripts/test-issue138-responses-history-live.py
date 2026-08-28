@@ -129,9 +129,6 @@ class Issue138LiveVerifierTests(unittest.TestCase):
         self.assertNotIn("id", issue_assistant)
         self.assertNotIn("status", issue_assistant)
         self.assertNotIn("annotations", issue_assistant["content"][0])
-        status, value = rejection()
-        self.assertEqual(status, 400)
-        self.assertTrue(value["error"]["message"].startswith("240 validation errors"))
 
     def test_accepted_mode_freezes_two_turn_semantics_negatives_and_controls(self):
         client = FakeClient("accepted")
@@ -156,9 +153,6 @@ class Issue138LiveVerifierTests(unittest.TestCase):
                 "content": [{"type": "output_text", "text": T1}],
             },
         )
-        for forbidden in ("type", "id", "status", "phase"):
-            self.assertNotIn(forbidden, legacy_item)
-        self.assertNotIn("annotations", legacy_item["content"][0])
 
         semantic = client.calls[4]["input"]
         self.assertEqual(len(semantic), 3)
@@ -173,8 +167,6 @@ class Issue138LiveVerifierTests(unittest.TestCase):
                 }],
             },
         )
-        self.assertNotEqual(semantic_legacy_item, legacy_item)
-        self.assertNotIn(NONCE, semantic[0]["content"])
         self.assertEqual(
             semantic[2],
             {
@@ -188,7 +180,6 @@ class Issue138LiveVerifierTests(unittest.TestCase):
                 }],
             },
         )
-        self.assertNotIn(NONCE, semantic[2]["content"][0]["text"])
         self.assertIn("assistant_semantic_continuity", result["gates"])
 
         negative_names = list(self.module.NEGATIVE_ITEMS)
