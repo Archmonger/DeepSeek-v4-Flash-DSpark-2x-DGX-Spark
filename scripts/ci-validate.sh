@@ -53,6 +53,9 @@ py_files+=(
   scripts/test-redact-api-key-log.py
   scripts/test-hotfix-atomic-transaction.py
   scripts/test-python-hotfix-failclosed.py
+  scripts/test-issue141-sparse-mla-decode-chunk.py
+  scripts/test-issue136-xgrammar-termination.py
+  scripts/verify-issue136-xgrammar-live.py
   scripts/test-empty-encoder-output-hotfix.py
   scripts/ruler-lite.py
   scripts/verify-dsv4-027-equality-gate.py
@@ -98,6 +101,10 @@ python3 scripts/test-hotfix-atomic-transaction.py -q
 ok "test-hotfix-atomic-transaction"
 python3 scripts/test-python-hotfix-failclosed.py -q
 ok "test-python-hotfix-failclosed"
+python3 scripts/test-issue141-sparse-mla-decode-chunk.py -q
+ok "test-issue141-sparse-mla-decode-chunk"
+python3 scripts/test-issue136-xgrammar-termination.py -q
+ok "test-issue136-xgrammar-termination"
 python3 scripts/test-empty-encoder-output-hotfix.py -q
 ok "test-empty-encoder-output-hotfix"
 python3 tests/test_issue27_inflight_cap.py -q
@@ -192,6 +199,20 @@ if grep -Fq 'hotfix-dsv4-issue133-triton-specialization.py}:/opt/hotfix-dsv4-iss
 else
   bad "issue133 hotfix wiring is incomplete"
 fi
+# Issue #141: default OFF; exact 1 mounts and runs the source-locked
+# fixed-64 workaround fail-closed on both identically synced ranks.
+if grep -Fq 'hotfix-dsv4-issue141-sparse-mla-decode-chunk.py}:/opt/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py:ro' docker-compose.dspark.yml \
+  && grep -Fq 'DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK: "${DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK:-0}"' docker-compose.dspark.yml \
+  && grep -Fq 'if [ "$${DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py || exit 1; fi;' docker-compose.dspark.yml \
+  && grep -Fq 'if [ ! -f "$DSPARK_ISSUE141_HOTFIX" ]; then' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'issue141 sparse-MLA fixed-64 workaround: $DSPARK_ISSUE141_EFFECTIVE' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq "DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK='\$DSPARK_ISSUE141_EFFECTIVE'" start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq "DSPARK_ISSUE141_HOTFIX='./patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py'" start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'scp "$DSPARK_ISSUE141_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py"' start-deepseek-v4-flash-dspark.sh; then
+  ok "issue141 workaround is default-off, exact-1, fail-closed, preflighted, reported, and worker-synced"
+else
+  bad "issue141 sparse-MLA workaround wiring is incomplete"
+fi
 if grep -Fq 'python3 /opt/hotfix-dsv4-suppress-stops-in-reasoning.py || exit 1' docker-compose.dspark.yml; then
   ok "compose applies suppress-stops-in-reasoning fail-closed"
 else
@@ -269,7 +290,9 @@ for p in \
   patches/hotfix-dsv4-issue26-hybrid-swa-min.py \
   patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py \
   patches/hotfix-dsv4-issue133-triton-specialization.py \
+  patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py \
   patches/hotfix-vllm-empty-encoder-output.py \
+  patches/hotfix-vllm-issue136-xgrammar-termination.py \
   patches/hotfix-nvfp4-ds-mla-issue22.sh \
   patches/hotfix-gb10-spin-wait.sh \
   patches/hotfix-dsv4-suppress-stops-in-reasoning.py \

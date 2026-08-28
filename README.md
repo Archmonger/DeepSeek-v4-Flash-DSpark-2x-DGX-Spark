@@ -347,34 +347,34 @@ curl :8888/v1/chat/completions -H 'Content-Type: application/json' -d '{
 }'
 ```
 
-**pi** — set a reasoning budget in the model entry, and pi sends the field
-for you on every request where you enable thinking. Copy
-[`pi-models.dspark.example.json`](pi-models.dspark.example.json) to
-`~/.pi/agent/models.json`, then add a `thinkingTokenBudget` (in tokens) to the
-`deepseek-v4-flash-0731` model:
+**pi** — the budget needs the boot flag **and** the pi model entry, so
+[`pi-models.dspark.example.json`](pi-models.dspark.example.json) ships
+`supportsThinkingTokenBudget: false` to match the server default
+(`DSPARK_ENABLE_ISSUE31_GPU_HOTFIX=0`). Copy it to `~/.pi/agent/models.json`;
+once the boot flag is `1`, flip the capability on the `deepseek-v4-flash-0731`
+model and pi attaches a `thinking_token_budget` whenever thinking is enabled:
 
 ```json
 {
   "id": "deepseek-v4-flash-0731",
   "reasoning": true,
-  "thinkingTokenBudget": 1024,
   "compat": {
     "supportsThinkingTokenBudget": true,
     "thinkingFormat": "chat-template",
     "chatTemplateKwargs": {
       "thinking":       { "$var": "thinking.enabled" },
-      "reasoning_effort": { "$var": "thinking.effort", "omitWhenOff": true },
-      "thinking_token_budget": { "$var": "model.thinkingTokenBudget", "omitWhenUnset": true }
+      "reasoning_effort": { "$var": "thinking.effort", "omitWhenOff": true }
     }
   }
 }
 ```
 
-`supportsThinkingTokenBudget: true` advertises the capability so pi will send
-the field; `"$var": "model.thinkingTokenBudget"` with `omitWhenUnset: true`
-means the budget is only attached when you set one in the model — otherwise the
-stock fast path runs. Remove the `thinkingTokenBudget` line (or set it to `0`)
-to let the model reason freely again.
+pi sizes the budget from per-level defaults (`minimal` 1024 / `low` 2048 /
+`medium` 8192 / `high` 16384), always leaving room for the answer; override
+values with the pi `thinkingBudgets` setting. If the capability is `true` while
+the boot flag is `0`, every pi request fails with `thinking_token_budget is not
+yet supported by the V2 model runner` — so keep the capability `false` unless
+`DSPARK_ENABLE_ISSUE31_GPU_HOTFIX=1`.
 
 ---
 
