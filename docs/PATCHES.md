@@ -297,6 +297,112 @@ gated-ON/OFF boot proof on both ranks before relying on it in production.
 python3 scripts/test-assistant-final-continuation.py
 ```
 
+---
+
+## Issue #141 — sparse-MLA verify-decode chunking workaround (default OFF)
+
+### Evidence and scope
+
+Issue #141 is a **stochastic** TP=2 engine death sampled inside FlashInfer's
+SM120 sparse-MLA paged-attention fallback; the pinned revision (`0472b9b3`)
+routes calls of at most 64 rows to its standalone DSv4 decode kernel instead.
+On one reporting pair, splitting at 64 survived 3,145,728 generated tokens
+while a 65-row split failed in the first comparison round; the second failing
+pair has **not** repeated that A/B, and the live TP/stream mechanism remains
+unknown. This is an opt-in path-avoidance **workaround**, not a root-cause
+fix: the fixed 64 is the pinned kernel dispatch boundary, not a deployment
+concurrency threshold.
+
+### Target and semantics
+
+`patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py` runs before vLLM is
+imported and edits only the installed Anemll adapter method:
+
+```
+/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
+DeepseekV4FlashInferSM120Attention._forward_decode
+```
+
+Calls with at most 64 rows retain one call with the original unsliced objects.
+Larger calls run sequential, monotonically increasing `slice` views of at most
+64 rows. Exactly six row-coupled arguments are sliced together: `query`,
+`sparse_indices`, `out`, `swa_topk_lens`, and the optional
+`extra_sparse_indices` / `extra_sparse_topk_lens`. Both KV-cache objects,
+workspace, sinks, scale, and layout remain shared by identity. Each inner call
+writes a disjoint view of the existing output; no `clone`, `cat`, contiguous
+copy, output replacement, retry, stream change, or generic FlashInfer wrapper
+is introduced.
+
+The patcher locks the **entire** pinned Anemll `_forward_decode` method,
+including its overlay-only `_pad_decode_sparse_indices` call. It also requires
+the load-bearing fragments of the pinned FlashInfer `_core.py` and
+`_sparse_mla_sm120.py`: the 64-row workspace cutoff, the sliced SM120 call
+signature, `_DECODE_MAX_TOKENS = 64`, the DSv4 decode dispatch predicate, and
+the custom-op mutation contract that excludes both caches. An exact old method
+applies once; an exact new method is recompiled and reverified without a
+write. Missing, duplicate, mixed, partial-marker, SM100-like, or drifted
+source is rejected.
+
+Before publication the complete updated adapter source is compiled. Publication
+uses a mode-preserving same-directory temporary file and `os.replace`; committed
+bytes, mode, marker state, and syntax are checked afterward. Any failure after
+the rename atomically restores and verifies the original bytes before returning
+nonzero. The enabled Compose gate is chained with `|| exit 1`, so incompatible
+source never reaches `exec vllm`.
+
+### Enablement and rollback
+
+| value | behavior |
+|---|---|
+| unset, `0`, or anything other than exact `1` | patcher is not invoked; installed adapter bytes remain stock |
+| exact `1` | validate pinned sources, atomically apply or reverify, and fail boot closed on any error |
+
+Enable in the authoritative `.env.dspark`:
+
+```bash
+DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK=1
+./stop-deepseek-v4-flash-dspark.sh
+./start-deepseek-v4-flash-dspark.sh
+```
+
+The launcher reports the resolved 0/1 state and syncs the selected patch source
+to the worker; both rank entrypoints receive the same normalized flag and run
+the same source preflight. Check both rank logs for `applied and verified` (or
+`already applied and verified`) and then make a real generation request with a
+terminal `finish_reason`. `/health` alone is insufficient: it remained 200 in
+reported stalled/silently truncated incidents.
+
+Rollback by setting `0` (or removing the variable), then run the same paired
+stop/start flow. A process restart or `docker compose restart` is **not** a
+rollback: the modified site-packages file remains in that container's writable
+layer. Recreating both containers restores immutable image bytes.
+
+### Validation status and remaining gates
+
+The committed CPU suite freezes the pinned method and guard digests, exercises
+exact apply/idempotence/drift/atomic rollback, and executes the injected block
+against shared-backing fake tensors across the 1–576 boundary row matrix in
+SWA-only and compressed-cache shapes. It also checks exact-1 fail-closed
+Compose ordering and worker wiring.
+
+The initial live TP=2 campaign at pre-trim head `890d9de` covered
+pinned-image apply/boot on both ranks, short concurrency-16 generation, and
+post-run smoke and restore. Before relying on the workaround, close the
+outstanding gates: disposable pinned-image
+extraction plus SM121a numerical/CUDA-graph tests, a two-rank OFF/ON/drift boot
+proof, and repeated stochastic generation soaks verifying terminal
+`finish_reason`, rank stability, throughput, and peak scratch memory. The
+second failing pair still needs the 64/65 comparison; one clean burst cannot
+close a stochastic issue.
+
+### Test
+
+```bash
+python3 scripts/test-issue141-sparse-mla-decode-chunk.py
+```
+
+---
+
 ## Issue #136 — XGrammar accepts speculative tokens after termination
 
 ### Symptom and source fix

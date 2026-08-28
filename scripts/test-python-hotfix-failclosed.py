@@ -92,6 +92,7 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
                     "DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX": "0",
                 }
             )
+            env.pop("DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK", None)
             if fail_step is not None:
                 env["FAIL_STEP"] = fail_step
                 env["FAIL_CODE"] = "7"
@@ -221,6 +222,65 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
                 self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
                 self.assertEqual(invocations, order[: order.index(step) + 1])
                 self.assertFalse(reached)
+
+    def test_issue141_unset_zero_and_nonone_are_byte_neutral(self):
+        expected = [
+            "hotfix-vllm-empty-encoder-output.py",
+            "hotfix-dsv4-issue27-partial-prefill-concurrency.py",
+            "hotfix-dsv4-issue43-decode-fairness-and-diag.py",
+            "hotfix-dsv4-issue26-hybrid-swa-min.py",
+            "hotfix-dsv4-issue133-triton-specialization.py",
+            "hotfix-dsv4-suppress-stops-in-reasoning.py",
+        ]
+        for value in (None, "0", "2", "true"):
+            with self.subTest(value=value):
+                env_extra = {}
+                if value is not None:
+                    env_extra["DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK"] = value
+                proc, invocations, reached = self._run_line(
+                    self.runtime_line,
+                    env_extra=env_extra,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(invocations, expected)
+                self.assertNotIn(
+                    "hotfix-dsv4-issue141-sparse-mla-decode-chunk.py",
+                    invocations,
+                )
+                self.assertTrue(reached)
+
+    def test_issue141_exact_one_runs_first_then_service_chain(self):
+        proc, invocations, reached = self._run_line(
+            self.runtime_line,
+            env_extra={"DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK": "1"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(
+            invocations,
+            [
+                "hotfix-dsv4-issue141-sparse-mla-decode-chunk.py",
+                "hotfix-vllm-empty-encoder-output.py",
+                "hotfix-dsv4-issue27-partial-prefill-concurrency.py",
+                "hotfix-dsv4-issue43-decode-fairness-and-diag.py",
+                "hotfix-dsv4-issue26-hybrid-swa-min.py",
+                "hotfix-dsv4-issue133-triton-specialization.py",
+                "hotfix-dsv4-suppress-stops-in-reasoning.py",
+            ],
+        )
+        self.assertTrue(reached)
+
+    def test_issue141_enabled_failure_blocks_every_later_step_and_service_exec(self):
+        proc, invocations, reached = self._run_line(
+            self.runtime_line,
+            fail_step="hotfix-dsv4-issue141-sparse-mla-decode-chunk.py",
+            env_extra={"DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK": "1"},
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(
+            invocations,
+            ["hotfix-dsv4-issue141-sparse-mla-decode-chunk.py"],
+        )
+        self.assertFalse(reached)
 
     def test_suppress_stops_skip_switch_keeps_other_patchers_fail_closed(self):
         proc, invocations, reached = self._run_line(
