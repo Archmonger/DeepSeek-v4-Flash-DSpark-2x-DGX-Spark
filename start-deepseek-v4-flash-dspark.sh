@@ -228,8 +228,8 @@ fi
 
 # Issue #138 Responses history compatibility pre-flight (begin).
 # Only the literal 1 enables it; normalize every other spelling to 0 before
-# either Compose rank
-# sees the flag. Relative path overrides are rooted at this checkout.
+# either Compose rank sees the flag. Relative path overrides are rooted at
+# this checkout.
 case "${DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT:-0}" in
   1) DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT=1 ;;
   *) DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT=0 ;;

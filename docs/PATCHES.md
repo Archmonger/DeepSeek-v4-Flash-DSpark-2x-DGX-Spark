@@ -384,6 +384,7 @@ python3 scripts/test-issue138-responses-history-live.py
 
 Live stock/enabled commands are in the README. No live A/B result is claimed by
 this implementation commit; the mode-strict two-turn run is the release gate.
+
 ---
 
 ## Issue #141 — sparse-MLA verify-decode chunking workaround (default OFF)
