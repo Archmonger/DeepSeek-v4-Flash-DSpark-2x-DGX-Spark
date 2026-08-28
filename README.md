@@ -495,9 +495,36 @@ python3 scripts/verify-responses-api-live.py \
   --output results/responses-api-live.json
 ```
 
-The full run intentionally creates a ~21K-token appended conversation and a
-forced client disconnect. Use `--skip-multiturn` or `--skip-disconnect` only
-when the corresponding live behavior is outside the test scope.
+The verifier above is the store/tool/cache and broad no-regression gate. Issue
+#138 has a separate mode-strict verifier for stateless **full-history replay**;
+it always sends `store: false` and never uses `previous_response_id`. On stock
+(default flag `0`), recreate the containers and pin the reported legacy item to
+HTTP 400 while the complete canonical output replay remains HTTP 200:
+
+```bash
+python3 scripts/verify-issue138-responses-history-live.py \
+  --base-url http://127.0.0.1:8888/v1 \
+  --model deepseek-v4-flash-0731 \
+  --expect-legacy rejected \
+  --output results/issue138-stock.json
+```
+
+To test compatibility mode, set
+`DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT=1` in `.env.dspark`, stop and
+start the pair so both containers are recreated, then require the same replay
+to succeed by rerunning the command above with `--expect-legacy accepted` and
+`--output results/issue138-enabled.json`.
+
+The enabled run also checks assistant semantic continuity, the exact reported
+four-item payload, six malformed/ambiguous neighbors that must remain HTTP 400,
+and valid easy/canonical controls. Neither expected mode accepts the opposite
+outcome. Changing the flag in either direction requires recreation, not
+`docker compose restart`, because disabling it cannot undo bytes already
+patched in a container writable layer.
+
+The broad verifier run intentionally creates a ~21K-token appended conversation
+and a forced client disconnect. Use `--skip-multiturn` or `--skip-disconnect`
+only when the corresponding live behavior is outside the test scope.
 
 ---
 
@@ -512,6 +539,7 @@ when the corresponding live behavior is outside the test scope.
 | `prepare-dspark-model-cache.sh` | 0731 (and optional VL) on head **and** worker |
 | `scripts/benchmark-0731.py` | Prompt × concurrency sweep |
 | `scripts/verify-responses-api-live.py` | Strict Responses, multi-turn cache, and disconnect gates |
+| `scripts/verify-issue138-responses-history-live.py` | Mode-strict stock/enabled full-history replay gate |
 | [docs/ENVS.md](docs/ENVS.md) | Anemll vs Stage-C env matrix |
 | [docs/PATCHES.md](docs/PATCHES.md) | Keys / #27 / #22 notes |
 | `patches/` | Issue hotfixes applied at container start |
