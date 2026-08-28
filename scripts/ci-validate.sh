@@ -51,6 +51,8 @@ py_files+=(
   scripts/test-hotfix-atomic-transaction.py
   scripts/test-python-hotfix-failclosed.py
   scripts/test-issue141-sparse-mla-decode-chunk.py
+  scripts/test-issue136-xgrammar-termination.py
+  scripts/verify-issue136-xgrammar-live.py
   scripts/test-empty-encoder-output-hotfix.py
   scripts/ruler-lite.py
   scripts/verify-dsv4-027-equality-gate.py
@@ -94,6 +96,8 @@ python3 scripts/test-python-hotfix-failclosed.py -q
 ok "test-python-hotfix-failclosed"
 python3 scripts/test-issue141-sparse-mla-decode-chunk.py -q
 ok "test-issue141-sparse-mla-decode-chunk"
+python3 scripts/test-issue136-xgrammar-termination.py -q
+ok "test-issue136-xgrammar-termination"
 python3 scripts/test-empty-encoder-output-hotfix.py -q
 ok "test-empty-encoder-output-hotfix"
 python3 tests/test_issue27_inflight_cap.py -q
@@ -265,6 +269,7 @@ for p in \
   patches/hotfix-dsv4-issue133-triton-specialization.py \
   patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py \
   patches/hotfix-vllm-empty-encoder-output.py \
+  patches/hotfix-vllm-issue136-xgrammar-termination.py \
   patches/hotfix-nvfp4-ds-mla-issue22.sh \
   patches/hotfix-gb10-spin-wait.sh \
   patches/hotfix-dsv4-suppress-stops-in-reasoning.py \

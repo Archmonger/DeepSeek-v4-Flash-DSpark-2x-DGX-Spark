@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ROOT / "docker-compose.dspark.yml"
 ENCODING_TOKEN = "python3 /opt/hotfix-encoding-dsv4-issue21.py"
 RUNTIME_TOKEN = "python3 /opt/hotfix-dsv4-issue27-partial-prefill-concurrency.py"
+ISSUE136_TOKEN = "python3 /opt/hotfix-vllm-issue136-xgrammar-termination.py"
 
 PYTHON_STUB = """#!/usr/bin/env bash
 case "${1:-}" in
@@ -52,6 +53,7 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
     def setUpClass(cls):
         cls.encoding_line = _compose_line(ENCODING_TOKEN)
         cls.runtime_line = _compose_line(RUNTIME_TOKEN)
+        cls.issue136_line = _compose_line(ISSUE136_TOKEN)
 
     def _run_line(
         self,
@@ -86,6 +88,7 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
                     "INVOCATIONS": str(invocations),
                     "ENCODING_SOURCE": str(encoding),
                     "DSPARK_ENABLE_ISSUE31_GPU_HOTFIX": "0",
+                    "DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX": "0",
                     "DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX": "0",
                 }
             )
@@ -296,6 +299,40 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
             ],
         )
         self.assertTrue(reached)
+
+    def test_issue136_default_off_and_nonone_values_skip_patcher(self):
+        for value in ("", "0", "true", "01"):
+            with self.subTest(value=value):
+                proc, invocations, reached = self._run_line(
+                    self.issue136_line,
+                    env_extra={"DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX": value},
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(invocations, [])
+                self.assertTrue(reached)
+
+    def test_issue136_enabled_success_reaches_service_exec(self):
+        proc, invocations, reached = self._run_line(
+            self.issue136_line,
+            env_extra={"DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX": "1"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(
+            invocations, ["hotfix-vllm-issue136-xgrammar-termination.py"]
+        )
+        self.assertTrue(reached)
+
+    def test_issue136_enabled_failure_blocks_service_exec(self):
+        proc, invocations, reached = self._run_line(
+            self.issue136_line,
+            fail_step="hotfix-vllm-issue136-xgrammar-termination.py",
+            env_extra={"DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX": "1"},
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(
+            invocations, ["hotfix-vllm-issue136-xgrammar-termination.py"]
+        )
+        self.assertFalse(reached)
 
 
 if __name__ == "__main__":
