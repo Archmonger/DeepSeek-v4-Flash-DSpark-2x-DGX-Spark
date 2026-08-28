@@ -38,13 +38,47 @@ docker run --rm --entrypoint python3 "$IMAGE" -c 'import cupy, lmcache' >/dev/nu
 mkdir -p "$DISK" || die "cannot create L2 dir $DISK"
 [ -w "$DISK" ] || die "L2 dir $DISK is not writable"
 
-# Replacing a LIVE server is the documented wedge condition: the replacement
-# comes up with no GPU contexts and the engine parks every lookup hit forever.
-if [ -n "$(docker ps -q -f name="^lmcache-server$")" ]; then
+# Replacing a cache server under a LIVE engine is the documented wedge
+# condition, so two guards stand between here and the docker rm below:
+#
+# Guard 1 — the model container. The real-world failure mode is a DEAD server
+# under a LIVE (wedged) engine (README 'Operational risk' 2+3); proceeding
+# there would rm + recreate an EMPTY server against that engine — the wedge
+# itself. So this refusal has NO override: LMCACHE_FORCE_REPLACE is documented
+# to mean "the pair is already down", and a live model container falsifies
+# that claim. Stop the pair first; the recovery is a full-pair restart.
+# Fail CLOSED: a docker-ps failure here must not be read as "nothing is
+# running" — that would take the guard down exactly when the host is sick.
+if ! model_ps_a="$(docker ps -q -f 'name=vllm-dspark' 2>&1)"; then
+  die "docker ps (name filter) failed — refusing to recreate the cache server without trustworthy state: $model_ps_a"
+fi
+if ! model_ps_b="$(docker ps -q -f 'label=com.docker.compose.service=vllm-dspark' 2>&1)"; then
+  die "docker ps (compose service label filter) failed — refusing to recreate the cache server without trustworthy state: $model_ps_b"
+fi
+# NOTE: the name filter is a substring match on purpose. It is strictly
+# over-eager (any container whose name contains vllm-dspark) and it also
+# catches hand-run engine containers that carry no compose labels. Refusing
+# too hard is the safe side of the wedge; the label filter covers the
+# compose-managed case precisely.
+if [ -n "$model_ps_a" ] || [ -n "$model_ps_b" ]; then
+  die "a model (vllm-dspark) container is RUNNING. Recreating the lmcache server
+       under a live engine is the documented wedge (README 'Operational risk'):
+       the fresh server has no GPU contexts and the engine parks every lookup
+       hit forever. Stop the whole pair first
+       (./stop-deepseek-v4-flash-dspark.sh), then re-run this script.
+       LMCACHE_FORCE_REPLACE does NOT bypass this guard."
+fi
+
+# Guard 2 — a still-running (possibly poisoned) server. Overridable only for
+# the legitimate pair-is-down case: stale/empty server, no engine running.
+if ! server_ps="$(docker ps -q -f 'name=^lmcache-server$' 2>&1)"; then
+  die "docker ps (server filter) failed — refusing to recreate the cache server without trustworthy state: $server_ps"
+fi
+if [ -n "$server_ps" ]; then
   [ "${LMCACHE_FORCE_REPLACE:-0}" = "1" ] \
-    || die "lmcache-server is already RUNNING. Replacing it wedges a live engine
-       (see README, 'Operational risk'). Stop the pair first, or re-run with
-       LMCACHE_FORCE_REPLACE=1 if the pair is already down."
+    || die "lmcache-server is already RUNNING and no model container is up.
+       Only re-create it with LMCACHE_FORCE_REPLACE=1 if the pair is already
+       down (e.g. stale server from an aborted boot)."
 fi
 docker rm -f lmcache-server >/dev/null 2>&1 || true
 

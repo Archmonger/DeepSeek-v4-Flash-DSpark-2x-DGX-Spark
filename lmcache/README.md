@@ -51,7 +51,9 @@ crash and does not fall back to re-prefill, so an operator watching only for
 container exits sees a healthy pair serving nothing. The only reliable signal
 is the server's own exit plus `No GPU context found` in its log — which is why
 the launcher uses `--restart no` (a dead server must stay dead and visible)
-and refuses to replace a running server unless `LMCACHE_FORCE_REPLACE=1`.
+and will not recreate the server at all while a `vllm-dspark` model container
+is running: the fresh-server-under-live-engine case IS this wedge, so the only
+supported recovery is a full-pair restart (servers first, then the engine).
 Once LMCache PR #4764 lands the parks become graceful degradation; until then,
 **the blast radius of a dead cache server is the model service.**
 
@@ -73,7 +75,8 @@ the upstream heartbeat fix lands.
   and `unset PYTORCH_CUDA_ALLOC_CONF` (vLLM rejects KV connectors alongside
   `expandable_segments:True`). The stock `PYTORCH_CUDA_ALLOC_CONF` service
   env entry is left untouched and no `PYTHONHASHSEED` env entry is added, so
-  with the flag off the engine process gets stock env and stock argv.
+  with the flag off the engine keeps stock allocator/hash behaviour and stock
+  argv; the config still differs from stock by the two inert deltas below.
 - Launch with
   `COMPOSE_FILE=$PWD/docker-compose.lmcache.yml ./start-deepseek-v4-flash-dspark.sh`.
 
@@ -146,8 +149,13 @@ COMPOSE_FILE=$PWD/docker-compose.lmcache.yml ./start-deepseek-v4-flash-dspark.sh
 
 Knobs on `run-lmcache-server.sh`: `LMCACHE_DISK_DIR`, `LMCACHE_L1_GB`,
 `LMCACHE_PORT`, `LMCACHE_OOM_SCORE_ADJ` (default `0`), and
-`LMCACHE_FORCE_REPLACE=1` to override the guard that refuses to replace a
-server that is currently running.
+`LMCACHE_FORCE_REPLACE=1` to override the guard against re-creating a
+currently-running server. It applies only when the pair is actually down:
+while any model container is live, server re-creation is refused
+unconditionally (see Operational risk 3). "Model container" means either a
+compose container labelled `com.docker.compose.service=vllm-dspark` or any
+container whose name contains `vllm-dspark` (deliberately over-eager —
+refusing too hard is the safe side of the wedge).
 
 With `DSPARK_ENABLE_LMCACHE` unset, `0`, or anything other than exactly `1`,
 the generated compose boots the stock recipe unchanged — every LMCache change
@@ -161,9 +169,12 @@ diff <(docker compose -f docker-compose.dspark.yml config) \
 
 with the flag unset, the only deltas are inert: an added
 `DSPARK_ENABLE_LMCACHE: "0"` pass-through, the `KVT_ARGS=""` gate, and an
-empty `$${KVT_ARGS}` expansion in the serve argv. `PYTORCH_CUDA_ALLOC_CONF`
-still renders as `expandable_segments:True` and `PYTHONHASHSEED` is absent,
-exactly as on stock.
+empty `$${KVT_ARGS}` expansion in the serve argv (an empty unquoted expansion
+adds no argument, so the exec'd argv is unchanged). The env is therefore not
+literally byte-identical to stock — the inert `DSPARK_ENABLE_LMCACHE=0`
+variable is added — but no stock behaviour depends on it.
+`PYTORCH_CUDA_ALLOC_CONF` still renders as `expandable_segments:True` and
+`PYTHONHASHSEED` is absent from the service env, exactly as on stock.
 
 To verify it's working: the head engine log shows `LMCacheMPConnector`
 at startup, and a repeated long-context request logs a lookup hit with TTFT
