@@ -347,34 +347,34 @@ curl :8888/v1/chat/completions -H 'Content-Type: application/json' -d '{
 }'
 ```
 
-**pi** — set a reasoning budget in the model entry, and pi sends the field
-for you on every request where you enable thinking. Copy
-[`pi-models.dspark.example.json`](pi-models.dspark.example.json) to
-`~/.pi/agent/models.json`, then add a `thinkingTokenBudget` (in tokens) to the
-`deepseek-v4-flash-0731` model:
+**pi** — the budget needs the boot flag **and** the pi model entry, so
+[`pi-models.dspark.example.json`](pi-models.dspark.example.json) ships
+`supportsThinkingTokenBudget: false` to match the server default
+(`DSPARK_ENABLE_ISSUE31_GPU_HOTFIX=0`). Copy it to `~/.pi/agent/models.json`;
+once the boot flag is `1`, flip the capability on the `deepseek-v4-flash-0731`
+model and pi attaches a `thinking_token_budget` whenever thinking is enabled:
 
 ```json
 {
   "id": "deepseek-v4-flash-0731",
   "reasoning": true,
-  "thinkingTokenBudget": 1024,
   "compat": {
     "supportsThinkingTokenBudget": true,
     "thinkingFormat": "chat-template",
     "chatTemplateKwargs": {
       "thinking":       { "$var": "thinking.enabled" },
-      "reasoning_effort": { "$var": "thinking.effort", "omitWhenOff": true },
-      "thinking_token_budget": { "$var": "model.thinkingTokenBudget", "omitWhenUnset": true }
+      "reasoning_effort": { "$var": "thinking.effort", "omitWhenOff": true }
     }
   }
 }
 ```
 
-`supportsThinkingTokenBudget: true` advertises the capability so pi will send
-the field; `"$var": "model.thinkingTokenBudget"` with `omitWhenUnset: true`
-means the budget is only attached when you set one in the model — otherwise the
-stock fast path runs. Remove the `thinkingTokenBudget` line (or set it to `0`)
-to let the model reason freely again.
+pi sizes the budget from per-level defaults (`minimal` 1024 / `low` 2048 /
+`medium` 8192 / `high` 16384), always leaving room for the answer; override
+values with the pi `thinkingBudgets` setting. If the capability is `true` while
+the boot flag is `0`, every pi request fails with `thinking_token_budget is not
+yet supported by the V2 model runner` — so keep the capability `false` unless
+`DSPARK_ENABLE_ISSUE31_GPU_HOTFIX=1`.
 
 ---
 
@@ -495,9 +495,36 @@ python3 scripts/verify-responses-api-live.py \
   --output results/responses-api-live.json
 ```
 
-The full run intentionally creates a ~21K-token appended conversation and a
-forced client disconnect. Use `--skip-multiturn` or `--skip-disconnect` only
-when the corresponding live behavior is outside the test scope.
+The verifier above is the store/tool/cache and broad no-regression gate. Issue
+#138 has a separate mode-strict verifier for stateless **full-history replay**;
+it always sends `store: false` and never uses `previous_response_id`. On stock
+(default flag `0`), recreate the containers and pin the reported legacy item to
+HTTP 400 while the complete canonical output replay remains HTTP 200:
+
+```bash
+python3 scripts/verify-issue138-responses-history-live.py \
+  --base-url http://127.0.0.1:8888/v1 \
+  --model deepseek-v4-flash-0731 \
+  --expect-legacy rejected \
+  --output results/issue138-stock.json
+```
+
+To test compatibility mode, set
+`DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT=1` in `.env.dspark`, stop and
+start the pair so both containers are recreated, then require the same replay
+to succeed by rerunning the command above with `--expect-legacy accepted` and
+`--output results/issue138-enabled.json`.
+
+The enabled run also checks assistant semantic continuity, the exact reported
+four-item payload, six malformed/ambiguous neighbors that must remain HTTP 400,
+and valid easy/canonical controls. Neither expected mode accepts the opposite
+outcome. Changing the flag in either direction requires recreation, not
+`docker compose restart`, because disabling it cannot undo bytes already
+patched in a container writable layer.
+
+The broad verifier run intentionally creates a ~21K-token appended conversation
+and a forced client disconnect. Use `--skip-multiturn` or `--skip-disconnect`
+only when the corresponding live behavior is outside the test scope.
 
 ---
 
@@ -512,6 +539,7 @@ when the corresponding live behavior is outside the test scope.
 | `prepare-dspark-model-cache.sh` | 0731 (and optional VL) on head **and** worker |
 | `scripts/benchmark-0731.py` | Prompt × concurrency sweep |
 | `scripts/verify-responses-api-live.py` | Strict Responses, multi-turn cache, and disconnect gates |
+| `scripts/verify-issue138-responses-history-live.py` | Mode-strict stock/enabled full-history replay gate |
 | [docs/ENVS.md](docs/ENVS.md) | Anemll vs Stage-C env matrix |
 | [docs/PATCHES.md](docs/PATCHES.md) | Keys / #27 / #22 notes |
 | `patches/` | Issue hotfixes applied at container start |
