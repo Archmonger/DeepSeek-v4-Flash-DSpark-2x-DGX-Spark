@@ -1,3 +1,9 @@
+## 2026-08-28
+
+### Fixed
+
+- **Restored the safe single-prefill default after the Issue #27 concurrency opt-in regressed mixed-request fairness ([Issue #154](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/154))**: `DSPARK_MAX_INFLIGHT_PREFILLS` now defaults to `1` in both `.env.dspark.example` and the Compose fallback; values `2-3` remain explicit operator overrides. Same-code fresh-boot A/B at merge `195744887` isolated the knob: three four-lane 8K waves at `2` had fairness spreads `3.72x`, `5.14x`, and `4.94x`, while `1` produced `2.04x`, `1.68x`, and `1.69x`; the frozen full Gate26 passed at `1` with `1.71x` spread and zero preemptions. CI now locks both shipped defaults together.
+
 ## 2026-08-27
 
 ### Added
