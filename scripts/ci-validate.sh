@@ -25,6 +25,8 @@ for f in \
   scripts/test-nccl-ib-hca-gid-resolve.sh \
   scripts/boot-shape-warmup.sh \
   scripts/test-boot-shape-warmup.sh \
+  lmcache/run-lmcache-server.sh \
+  scripts/test-lmcache-compose-gate.sh \
   patches/*.sh
 do
   [ -e "$f" ] || continue
@@ -62,6 +64,7 @@ py_files+=(
   scripts/ab-issue133-triton-specialization.py
   tests/test_dspark_stacked_mapping.py
   tests/test_issue133_triton_specialization.py
+  lmcache/patch-compose-lmcache.py
 )
 python3 -m py_compile "${py_files[@]}"
 ok "py_compile ${#py_files[@]} files"
@@ -125,6 +128,8 @@ bash scripts/test-boot-shape-warmup.sh -q
 ok "test-boot-shape-warmup"
 bash scripts/test-nccl-ib-hca-gid-resolve.sh -q
 ok "test-nccl-ib-hca-gid-resolve"
+bash scripts/test-lmcache-compose-gate.sh -q
+ok "test-lmcache-compose-gate"
 
 echo "== recipe guards (do not re-ship known regressions) =="
 
