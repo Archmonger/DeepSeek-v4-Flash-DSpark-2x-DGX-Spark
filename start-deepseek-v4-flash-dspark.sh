@@ -1181,17 +1181,23 @@ for _ in $(seq 1 "$WAIT_ATTEMPTS"); do
         remote_compose "docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.vl-sidecar.yml logs --tail=80" >&2 || true
       fi
     fi
+    # Probe/warmup model selection (begin).
+    # vLLM accepts one served alias per request. SERVED_MODEL_NAME may contain
+    # multiple space-separated aliases, so use the first advertised name.
+    read -r PROBE_MODEL _ <<< "${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"
+    PROBE_MODEL="${PROBE_MODEL:-deepseek-v4-flash-dspark}"
+    # Probe/warmup model selection (end).
     if [ "${DSPARK_ENABLE_ISSUE31_GPU_HOTFIX:-0}" = "1" ]; then
       echo "Running minimal OpenAI-compatible thinking-budget chat request..."
       curl -fsS --max-time 60 "${AUTH_HEADER_ARGS[@]}" "$CHAT_URL" \
         -H "Content-Type: application/json" \
-        -d '{"model":"'"${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"'","messages":[{"role":"user","content":"Reply with OK."}],"max_tokens":32,"temperature":0.6,"top_p":0.95,"thinking_token_budget":1,"chat_template_kwargs":{"thinking":true,"reasoning_effort":"low"}}' >/dev/null
+        -d '{"model":"'"${PROBE_MODEL}"'","messages":[{"role":"user","content":"Reply with OK."}],"max_tokens":32,"temperature":0.6,"top_p":0.95,"thinking_token_budget":1,"chat_template_kwargs":{"thinking":true,"reasoning_effort":"low"}}' >/dev/null
       echo "Minimal thinking-budget chat request succeeded."
     else
       echo "Running minimal OpenAI-compatible chat request (stock V2; no thinking_token_budget)..."
       curl -fsS --max-time 60 "${AUTH_HEADER_ARGS[@]}" "$CHAT_URL" \
         -H "Content-Type: application/json" \
-        -d '{"model":"'"${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"'","messages":[{"role":"user","content":"Reply with OK."}],"max_tokens":32,"temperature":0.6,"top_p":0.95,"chat_template_kwargs":{"thinking":true,"reasoning_effort":"low"}}' >/dev/null
+        -d '{"model":"'"${PROBE_MODEL}"'","messages":[{"role":"user","content":"Reply with OK."}],"max_tokens":32,"temperature":0.6,"top_p":0.95,"chat_template_kwargs":{"thinking":true,"reasoning_effort":"low"}}' >/dev/null
       echo "Minimal chat request succeeded."
     fi
     # Issue #117: burn the spec-decode/prefill Triton shape buckets before real
@@ -1224,7 +1230,7 @@ for _ in $(seq 1 "$WAIT_ATTEMPTS"); do
         DSPARK_WARMUP_BEARER="$_warmup_bearer" \
         DSPARK_WARMUP_TRITON_CACHE_DIR="$_warmup_tcache_host" \
         bash "$SCRIPT_DIR/scripts/boot-shape-warmup.sh" \
-        "${CHAT_URL%/v1/chat/completions}" "${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}" || \
+        "${CHAT_URL%/v1/chat/completions}" "$PROBE_MODEL" || \
         echo "WARN: boot shape warmup incomplete — uncovered shapes may JIT mid-serve (issue #117)" >&2
     else
       echo "Boot shape warmup: SKIPPED (DSPARK_BOOT_SHAPE_WARMUP=0)"
