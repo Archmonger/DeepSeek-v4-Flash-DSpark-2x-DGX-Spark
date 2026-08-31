@@ -85,6 +85,7 @@ PY
 | `DRAFT_SAMPLE_METHOD` | DSpark `draft_sample_method` in `--speculative-config`. Compose default **`probabilistic`** (the previously hardcoded value). `greedy` is what the official model cards pair with `num_speculative_tokens=7` (issue #84). Consumed by the compose command line, not a vLLM env registry key. The entrypoint (and `validate-dspark-config.sh`) accept exactly `probabilistic`/`greedy` and exit nonzero on anything else, so the raw value never reaches the `--speculative-config` JSON. |
 | `DSPARK_SUPPRESS_STOPS_IN_REASONING` | `1` (default): after the detokenizer hotfix, client `stop` stays dormant until `</think>`. `0` restores stock matching. Also accepts Tony's `VLLM_SUPPRESS_STOPS_IN_REASONING` via compose interpolation (not added as a compose `VLLM_*` key, so Anemll does not warn). |
 | `DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX` | `1` skips applying `patches/hotfix-dsv4-suppress-stops-in-reasoning.py` |
+| `LIMIT_MM_PER_PROMPT` | Compose CLI `--limit-mm-per-prompt`. Default JSON `{"image":8}`. `image=N` is converted (Anemll argparse is `json.loads` only). Vision-Exp images only, and only in `user` messages (`system`/`assistant` → HTTP 400). No video. |
 | `DSPARK_SKIP_SPIN_WAIT_HOTFIX` | `1` skips `patches/hotfix-gb10-spin-wait.sh` (issue #79: `busy_loop_s` 1s→2ms) |
 | `DSPARK_ENABLE_ISSUE31_GPU_HOTFIX` | **Not** `VLLM_*`. Default `0` = stock V2 (no thinking_token_budget). `1` applies the GPU budget hotfix at boot (fail-closed). Issue #66: default-on omit-field traffic can hit a decode cliff. |
 | `DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT` | **Not** `VLLM_*`. Default `0` (and every non-`1` value) keeps stock `/v1/responses` request validation. Exact `1` fail-closed patches the pinned request model to accept only a type-less assistant replay with one string `output_text` part, preserving supplied `id`, `status`, `phase`, annotations, logprobs, and all typed item behavior. This does **not** enable the Responses store or change `previous_response_id`. |
@@ -143,6 +144,7 @@ docker compose --env-file .env.dspark \
 | `DSPARK_SLOT_CLAMP` | Non-`VLLM_` prefix (no unknown-`VLLM_` warning). Only meaningful if the image reads it; treat as Stage-C/overlay unless confirmed |
 | `B12X_W4A16_TC_DECODE` | Non-`VLLM_` package/debug knob |
 | `VLLM_HOST` / `VLLM_PORT` | Used by **compose command substitution** / start scripts, not as in-process vLLM config envs in the same way as registry keys |
+| `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` | **Prepare only.** Forwarded into the download container (`-e`) on head and worker. Not passed to `vllm serve`. Prefer a shell export; a value in `.env.dspark` is scp'd to the worker. |
 | `DSPARK_MODEL`, `DSPARK_REVISION`, `DSPARK_VLLM_IMAGE`, `ENABLE_VLLM_GB10_PATCH`, … | Launcher / compose only |
 | `DSPARK_RESTART_POLICY` | Compose `restart:` (default `unless-stopped`, issue #38). After a reboot, dockerd restores the ranks, so `./start-…` exits **3** (already running) rather than 1. Supervising the launcher: set systemd `SuccessExitStatus=3` + `RemainAfterExit=yes`, or set `DSPARK_RESTART_POLICY=no` if the unit owns start/stop. Exit 3 does **not** prove the TP group is healthy (head-only reboot can leave a stale worker). |
 | `DSPARK_STOP_GRACE` | Compose `stop_grace_period` (default `10s`; do not use 180s — hangs stop) |
@@ -156,7 +158,7 @@ docker compose --env-file .env.dspark \
 
 Keep the slim set in `.env.dspark.example` + `docker-compose.dspark.yml`:
 
-- Serve profile: `MTP_NUM_TOKENS=5`, capture `max_num_seqs * (k+1)`, `GPU_MEMORY_UTILIZATION≈0.80`
+- Serve profile: `MTP_NUM_TOKENS=6` on Vision-Exp (`k % 3 == 0` and `k >= 5`), capture `max_num_seqs * (k+1)`, `GPU_MEMORY_UTILIZATION≈0.80`
 - `VLLM_USE_BREAKABLE_CUDAGRAPH=0` (explicit opt-out; omission auto-enables the slower breakable path on DS4)
 - `VLLM_USE_B12X_MOE=1`
 - `CUTE_DSL_ARCH=sm_121a` (GB10 CuTeDSL target; prevents slower JIT fallbacks)

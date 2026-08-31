@@ -222,6 +222,7 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
             invocations,
             [
                 "hotfix-vllm-issue138-responses-history.py",
+                "hotfix-dsv4-vision-exp.py",
                 "hotfix-vllm-empty-encoder-output.py",
                 "hotfix-dsv4-issue27-partial-prefill-concurrency.py",
                 "hotfix-dsv4-issue43-decode-fairness-and-diag.py",
@@ -316,6 +317,7 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
         self.assertEqual(
             invocations,
             [
+                "hotfix-dsv4-vision-exp.py",
                 "hotfix-vllm-empty-encoder-output.py",
                 "hotfix-dsv4-issue27-partial-prefill-concurrency.py",
                 "hotfix-dsv4-issue43-decode-fairness-and-diag.py",
@@ -328,6 +330,7 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
 
     def test_each_runtime_patcher_failure_blocks_later_steps_and_service_exec(self):
         order = [
+            "hotfix-dsv4-vision-exp.py",
             "hotfix-vllm-empty-encoder-output.py",
             "hotfix-dsv4-issue27-partial-prefill-concurrency.py",
             "hotfix-dsv4-issue43-decode-fairness-and-diag.py",
@@ -347,6 +350,7 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
 
     def test_issue141_unset_zero_and_nonone_are_byte_neutral(self):
         expected = [
+            "hotfix-dsv4-vision-exp.py",
             "hotfix-vllm-empty-encoder-output.py",
             "hotfix-dsv4-issue27-partial-prefill-concurrency.py",
             "hotfix-dsv4-issue43-decode-fairness-and-diag.py",
@@ -380,6 +384,7 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
         self.assertEqual(
             invocations,
             [
+                "hotfix-dsv4-vision-exp.py",
                 "hotfix-dsv4-issue141-sparse-mla-decode-chunk.py",
                 "hotfix-vllm-empty-encoder-output.py",
                 "hotfix-dsv4-issue27-partial-prefill-concurrency.py",
@@ -400,7 +405,10 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertEqual(
             invocations,
-            ["hotfix-dsv4-issue141-sparse-mla-decode-chunk.py"],
+            [
+                "hotfix-dsv4-vision-exp.py",
+                "hotfix-dsv4-issue141-sparse-mla-decode-chunk.py",
+            ],
         )
         self.assertFalse(reached)
 
@@ -413,6 +421,7 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
         self.assertEqual(
             invocations,
             [
+                "hotfix-dsv4-vision-exp.py",
                 "hotfix-vllm-empty-encoder-output.py",
                 "hotfix-dsv4-issue27-partial-prefill-concurrency.py",
                 "hotfix-dsv4-issue43-decode-fairness-and-diag.py",

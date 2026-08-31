@@ -55,6 +55,7 @@ py_files+=(
   scripts/test-redact-api-key-log.py
   scripts/test-hotfix-atomic-transaction.py
   scripts/test-python-hotfix-failclosed.py
+  scripts/test-dsv4-vision-exp-hotfix.py
   scripts/test-issue141-sparse-mla-decode-chunk.py
   scripts/test-issue136-xgrammar-termination.py
   scripts/verify-issue136-xgrammar-live.py
@@ -104,6 +105,8 @@ python3 scripts/test-hotfix-atomic-transaction.py -q
 ok "test-hotfix-atomic-transaction"
 python3 scripts/test-python-hotfix-failclosed.py -q
 ok "test-python-hotfix-failclosed"
+python3 scripts/test-dsv4-vision-exp-hotfix.py -q
+ok "test-dsv4-vision-exp-hotfix"
 python3 scripts/test-issue141-sparse-mla-decode-chunk.py -q
 ok "test-issue141-sparse-mla-decode-chunk"
 python3 scripts/test-issue136-xgrammar-termination.py -q
@@ -251,6 +254,26 @@ if grep -Fq 'hotfix-vllm-empty-encoder-output.py}:/opt/hotfix-vllm-empty-encoder
 else
   bad "empty encoder output hotfix wiring is incomplete"
 fi
+if grep -Fq 'hotfix-dsv4-vision-exp.py}:/opt/hotfix-dsv4-vision-exp.py:ro' docker-compose.dspark.yml \
+  && grep -Fq 'python3 /opt/hotfix-dsv4-vision-exp.py || exit 1' docker-compose.dspark.yml \
+  && grep -Fq 'scp "$DSPARK_VISION_EXP_HOTFIX"' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'scp -r "$SCRIPT_DIR/patches/vision_exp/."' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq "rm -rf '\${REMOTE_WORKER_DIR}/patches/vision_exp'" start-deepseek-v4-flash-dspark.sh \
+  && [ -f patches/hotfix-dsv4-vision-exp.py ] \
+  && [ -f patches/vision_exp/apply.py ]; then
+  ok "Vision-Exp native image hotfix is mounted, fail-closed, and worker-synced"
+else
+  bad "Vision-Exp native image hotfix wiring is incomplete"
+fi
+# Anemll argparse parses --limit-mm-per-prompt with json.loads. Bare `image=8`
+# is ArgumentTypeError at exec. Convert image=N in the entrypoint; pass JSON.
+if grep -Fq 'LIMIT_MM_ARGS=(--limit-mm-per-prompt "$${LIMIT_MM_JSON}")' docker-compose.dspark.yml \
+  && grep -Fq '"$${LIMIT_MM_ARGS[@]}"' docker-compose.dspark.yml \
+  && ! grep -Fq -- '--limit-mm-per-prompt ${LIMIT_MM_PER_PROMPT:-image=8}' docker-compose.dspark.yml; then
+  ok "limit-mm-per-prompt is converted to JSON before vllm argparse"
+else
+  bad "compose must not pass bare image=8 to --limit-mm-per-prompt (JSON only)"
+fi
 # Assistant-final continuation (#52/PR53): default OFF (stock renderer);
 # ON must be an exactly-1 gate with a fail-closed invocation.
 if grep -Fq 'DSPARK_ENABLE_ASSISTANT_FINAL_HOTFIX: "${DSPARK_ENABLE_ASSISTANT_FINAL_HOTFIX:-0}"' docker-compose.dspark.yml \
@@ -304,6 +327,7 @@ for p in \
   patches/hotfix-dsv4-issue133-triton-specialization.py \
   patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py \
   patches/hotfix-vllm-empty-encoder-output.py \
+  patches/hotfix-dsv4-vision-exp.py \
   patches/hotfix-vllm-issue136-xgrammar-termination.py \
   patches/hotfix-nvfp4-ds-mla-issue22.sh \
   patches/hotfix-gb10-spin-wait.sh \
