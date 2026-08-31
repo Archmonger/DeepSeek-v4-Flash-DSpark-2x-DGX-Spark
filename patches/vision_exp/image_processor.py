@@ -15,10 +15,21 @@ from types import SimpleNamespace
 from typing import Any, TYPE_CHECKING
 from urllib.request import urlopen
 
-from PIL import Image, ImageOps
-
 if TYPE_CHECKING:
     import torch
+    from PIL import Image as PILImage
+
+
+def _pil():
+    """Load Pillow on first image decode. CPU CI does not install it."""
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as exc:
+        raise ModuleNotFoundError(
+            "Pillow is required to decode Vision-Exp images"
+        ) from exc
+    return Image, ImageOps
+
 
 IMAGE_START, IMAGE_PAD, IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(5)
 COMPRESS_PAD_TO = 4
@@ -65,8 +76,9 @@ def is_unregistered_router_bias(name: str, param_names: Any) -> bool:
     )
 
 
-def as_pil(item: Any) -> Image.Image:
+def as_pil(item: Any) -> PILImage.Image:
     """Normalize vLLM image items (PIL, HWC/CHW array, tensor, dict) to RGB PIL."""
+    Image, _ImageOps = _pil()
     if isinstance(item, Image.Image):
         return item.convert("RGB")
     if isinstance(item, dict):
@@ -228,9 +240,11 @@ def load_image_bytes(record) -> bytes:
     raise ValueError(f"Cannot load image from record: {list(record.keys())}")
 
 
-def pil_to_patches(image: Image.Image, args) -> tuple[Any, int, int, int, int]:
+def pil_to_patches(image: PILImage.Image, args) -> tuple[Any, int, int, int, int]:
     """Resize/pad one RGB image and return ViT patches plus LLM grid sizes."""
     import torch
+
+    _Image, ImageOps = _pil()
 
     p = args.vision_patch_size
     image = image.convert("RGB")
@@ -281,6 +295,7 @@ def pil_to_patches(image: Image.Image, args) -> tuple[Any, int, int, int, int]:
 
 def load_image(record, args):
     """Load and transform one image record into ViT patches."""
+    Image, _ImageOps = _pil()
     with Image.open(io.BytesIO(load_image_bytes(record))) as source:
         image = source.convert("RGB")
         return pil_to_patches(image, args)

@@ -29,6 +29,13 @@ try:
 except ImportError:
     HAS_TORCH = False
 
+try:
+    from PIL import Image as _PILImage  # noqa: F401
+
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
 _spec = importlib.util.spec_from_file_location(
     "hotfix_dsv4_vision_exp",
     ROOT / "patches" / "hotfix-dsv4-vision-exp.py",
@@ -59,7 +66,7 @@ class VisionExpLayoutTest(unittest.TestCase):
         self.assertGreater(int((types == IMAGE).sum()), 0)
         self.assertEqual(int(perm.numel()), 16)
 
-    @unittest.skipUnless(HAS_TORCH, "torch not installed on this host")
+    @unittest.skipUnless(HAS_TORCH and HAS_PIL, "torch+Pillow not installed on this host")
     def test_pil_to_patches_respects_max_tokens(self):
         from PIL import Image
 
@@ -75,6 +82,7 @@ class VisionExpLayoutTest(unittest.TestCase):
         self.assertLessEqual(types.numel(), 384)
         self.assertEqual(int(perm.numel()), int((types == IMAGE).sum()))
 
+    @unittest.skipUnless(HAS_PIL, "Pillow not installed on this host")
     def test_as_pil_accepts_pil_hwc_chw_and_dict(self):
         from PIL import Image
 
