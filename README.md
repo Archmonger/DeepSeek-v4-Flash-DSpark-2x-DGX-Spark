@@ -52,7 +52,7 @@ working, and the same image + HF cache on both.
    ```
 
    Leave serving knobs at the defaults unless you mean to change them.
-   Meaningful on/off flags (thinking, hotfixes) are
+   Meaningful on/off flags (`ABLITERATED`, thinking, hotfixes) are
    listed under [.env.dspark switches](#envdspark-switches).
 
 2. **Image on both nodes**
@@ -70,7 +70,8 @@ working, and the same image + HF cache on both.
    ./prepare-dspark-model-cache.sh --official
    ```
 
-   Use `--yes` (reads model vars from `.env.dspark`). Prepare forces HF
+   Use `--abliterated` or `--yes` (reads `ABLITERATED` from `.env.dspark`).
+   Abliterated weights are gated (`HF_TOKEN`). Prepare forces HF
    online even if `HF_HUB_OFFLINE=1`, then you can serve offline. After the cache is complete, keep `HF_HUB_OFFLINE=1` so a hub
    retry cannot fill the worker disk.
 
@@ -120,7 +121,7 @@ hosts or it can kill vLLM under deep-context load.
 | Knob | Default |
 | --- | --- |
 | Image | `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` |
-| Checkpoint | official Vision-Exp @ `86f746b36186f0e567729a5c06a8c918caba82a9` |
+| Checkpoint | official Vision-Exp @ `86f746b36186f0e567729a5c06a8c918caba82a9` (`ABLITERATED=0`) |
 | Served name | `deepseek-v4-flash-vision-exp` |
 | Context ceiling | `MAX_MODEL_LEN=1048576` (1M) |
 | Concurrent seqs | `MAX_NUM_SEQS=6` |
@@ -162,9 +163,34 @@ cluster wiring, not product switches. Full Anemll vs Stage-C matrix:
 
 | Variable | Default | What it does |
 | --- | --- | --- |
+| **`ABLITERATED`** | `0` | **`0`** = official [`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp) @ `DSPARK_REVISION`. **`1`** = [Keys abliterated](https://huggingface.co/drowzeys/keys-DeepSeekV4Flash-Vision-EXP-ablit). Start and prepare pick the HF id from this flag. Gated; `prepare --abliterated` needs `HF_TOKEN`. |
 | `DSPARK_REVISION` | `86f746b36186f0e567729a5c06a8c918caba82a9` | Official Vision-Exp pin. Empty = tip of `main`. |
+| `DSPARK_REVISION_ABLITERATED` | empty | Abliterated pin. Empty = tip of that repo. |
+| `DSPARK_MODEL_OFFICIAL` / `DSPARK_MODEL_ABLITERATED` | the two HF ids above | Override only if you intentionally swap the repo id. Do not point this at the 0731 ablit dump — that drops `image_url`. |
 | `SERVED_MODEL_NAME` | `deepseek-v4-flash-vision-exp` | Name clients send as `model`. |
 | `HF_HUB_OFFLINE` | `1` | `1` after both caches are warm (avoids filling the worker disk). Prepare forces online for the download. |
+
+Flip `ABLITERATED` like this:
+
+```bash
+# in .env.dspark
+ABLITERATED=1
+
+./prepare-dspark-model-cache.sh --yes    # or --abliterated / --official
+./stop-deepseek-v4-flash-dspark.sh
+./start-deepseek-v4-flash-dspark.sh
+```
+
+`--official` writes `ABLITERATED=0`; `--abliterated` writes `1`.
+
+If official Vision-Exp is already cached, overlay the 26 edited shards
+(~87 GiB) instead of re-fetching the full ~157 GiB dump:
+
+```bash
+python3 scripts/overlay-vision-exp-ablit-cache.py
+```
+
+The 0731 abliterated freeze stays on branch `0731-ablit`.
 
 Images: OpenAI `image_url` (JPEG/PNG/GIF/WebP; GIF is still-frame). No video.
 Images belong in **`user` messages only** — `system` or `assistant` returns HTTP 400.
@@ -532,7 +558,8 @@ only when the corresponding live behavior is outside the test scope.
 | `.env.dspark.example` | Cluster template |
 | `docker-compose.dspark.yml` | Anemll serve (installs Vision-Exp encoder + hotfixes) |
 | `start-` / `stop-` / `status-` / `logs-` / `smoke-*.sh` | Two-node ops |
-| `prepare-dspark-model-cache.sh` | Vision-Exp weights on head **and** worker |
+| `prepare-dspark-model-cache.sh` | Vision-Exp weights on head **and** worker (`--official` / `--abliterated`) |
+| `scripts/overlay-vision-exp-ablit-cache.py` | Hardlink official Vision-Exp blobs + copy the 26 ablit shards |
 | `scripts/benchmark-0731.py` | Prompt × concurrency sweep |
 | `scripts/verify-responses-api-live.py` | Strict Responses, multi-turn cache, and disconnect gates |
 | `scripts/verify-issue138-responses-history-live.py` | Mode-strict stock/enabled full-history replay gate |
@@ -550,6 +577,11 @@ Full list: [`CREDITS.md`](CREDITS.md).
 
 **[drowzeys ("Keys")](https://github.com/drowzeys/)** — DSpark concurrency
 patch, ragged `query_start_loc`, `nvfp4_ds_mla` wiring.
+
+**[@u1tra_instinct](https://x.com/u1tra_instinct)** — abliterated Vision-Exp
+weights (`ABLITERATED=1`), from the original repo
+[`drowzeys/keys-DeepSeekV4Flash-Vision-EXP-ablit`](https://huggingface.co/drowzeys/keys-DeepSeekV4Flash-Vision-EXP-ablit).
+
 Also: [tonyd2wild](https://github.com/tonyd2wild/), Rafael Caricio, Fraser Price,
 [Anemll](https://github.com/Anemll/dspark-vllm-gx10), MiaAI-Lab packaging.
 

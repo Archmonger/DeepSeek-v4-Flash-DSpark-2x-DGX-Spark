@@ -8,16 +8,19 @@ usage() {
   cat <<'EOF'
 Usage: ./prepare-dspark-model-cache.sh [--official | --abliterated] [--yes]
 
-Downloads DeepSeek-V4-Flash-Vision-Exp weights (official or 0731-abliterated) into HF_CACHE
+Downloads DeepSeek-V4-Flash-Vision-Exp weights (official or abliterated) into HF_CACHE
 on this node, then optionally on the worker.
 
   --official      Download deepseek-ai/DeepSeek-V4-Flash-Vision-Exp (sets ABLITERATED=0)
-  --abliterated   Download Keys abliterated 0731 weights (sets ABLITERATED=1)
+  --abliterated   Download Keys abliterated weights (sets ABLITERATED=1)
   --yes           Non-interactive: use ABLITERATED from .env.dspark (or 0)
 
 Official downloads default to DSPARK_REVISION=86f746b3… (Vision-Exp pin). Override
 via DSPARK_REVISION in .env.dspark, or clear it to follow tip of main.
-Abliterated uses DSPARK_REVISION_ABLITERATED (default: unpinned).
+Abliterated uses DSPARK_REVISION_ABLITERATED (default: unpinned). The Hub id is
+gated (auto-approve after RESPONSIBLE_USE.md). Prefer overlaying the 26 edited
+shards onto the already-cached official Vision-Exp dump
+(scripts/overlay-vision-exp-ablit-cache.py) instead of re-fetching 157 GiB.
 
 Hub auth is automatic when HF_TOKEN or HUGGING_FACE_HUB_TOKEN is exported in
 the calling shell (it wins over .env.dspark). Otherwise prepare uses the env
@@ -61,7 +64,7 @@ if [ -n "${THIS_NODE_HF_CACHE:-}" ]; then
 fi
 
 DSPARK_MODEL_OFFICIAL="${DSPARK_MODEL_OFFICIAL:-deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}"
-DSPARK_MODEL_ABLITERATED="${DSPARK_MODEL_ABLITERATED:-drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32}"
+DSPARK_MODEL_ABLITERATED="${DSPARK_MODEL_ABLITERATED:-drowzeys/keys-DeepSeekV4Flash-Vision-EXP-ablit}"
 # Official tested pin. Override with DSPARK_REVISION=<sha> or clear with
 # DSPARK_REVISION= to follow tip of main. Abliterated uses DSPARK_REVISION_ABLITERATED
 # (default empty = tip of that repo).
