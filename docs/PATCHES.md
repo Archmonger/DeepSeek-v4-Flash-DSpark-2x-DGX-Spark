@@ -387,6 +387,42 @@ this implementation commit; the mode-strict two-turn run is the release gate.
 
 ---
 
+## Codex `agent_message` Responses history compatibility
+
+`patches/hotfix-vllm-codex-agent-message.py` source-locks the complete pinned
+`ResponsesRequest.input_item_parsing` method by SHA-256, plus the surrounding
+input union guards. It accepts either the stock method or the exact issue #138
+postimage and is invoked after issue138, so either opt-in can run alone and the
+two enabled patches compose without widening issue138's own acceptance rule.
+
+With `DSPARK_ENABLE_CODEX_AGENT_MESSAGE_COMPAT=1`, the patch converts only an
+`agent_message` with non-empty string `id`, `author`, and `recipient`, a
+non-empty content list whose parts contain exactly string `type=input_text` and
+`text`, and either no internal metadata or the evidenced `turn_id` / numeric
+`create_time` dictionary. The result contains only `type=message`,
+`role=assistant`, and the original content list. Extra or missing keys, empty or
+malformed content, altered metadata, and all unknown types remain unchanged for
+stock Pydantic validation and therefore retain the prior rejection behavior.
+
+The conversion irreversibly drops `id`, `author`, `recipient`, and internal
+chat metadata. The model sees the text as assistant conversation history, but
+cannot recover routing or attribution. Do not enable this compatibility layer
+when those fields must be available to the model for audit or routing logic.
+
+The patcher uses the same atomic publish, mode preservation, fsync,
+post-publication verification, atomic rollback, and `--status` behavior as the
+issue138 patch, without importing vLLM or GPU dependencies. CPU verification:
+
+```bash
+python3 scripts/test-codex-agent-message-compat.py
+python3 scripts/test-python-hotfix-failclosed.py
+```
+
+Recreate both containers after toggling the flag; a restart does not revert a
+patched writable layer.
+
+---
+
 ## Issue #141 — sparse-MLA verify-decode chunking workaround (default OFF)
 
 ### Evidence and scope
