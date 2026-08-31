@@ -112,11 +112,11 @@ COMPOSE_ENV_FILE="$_dspark_env_clean"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION_TEXT:-0.835}"
 export GPU_MEMORY_UTILIZATION
 
-# Checkpoint: official Vision-Exp vs Keys abliterated (0731-only) weights.
+# Checkpoint flag: official Vision-Exp vs Keys abliterated weights.
 #   ABLITERATED=0 → DSPARK_MODEL_OFFICIAL
 #   ABLITERATED=1 → DSPARK_MODEL_ABLITERATED
 DSPARK_MODEL_OFFICIAL="${DSPARK_MODEL_OFFICIAL:-deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}"
-DSPARK_MODEL_ABLITERATED="${DSPARK_MODEL_ABLITERATED:-drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32}"
+DSPARK_MODEL_ABLITERATED="${DSPARK_MODEL_ABLITERATED:-drowzeys/keys-DeepSeekV4Flash-Vision-EXP-ablit}"
 DEFAULT_OFFICIAL_REVISION="86f746b36186f0e567729a5c06a8c918caba82a9"
 if [ "${ABLITERATED:-0}" = "1" ]; then
   DSPARK_MODEL="$DSPARK_MODEL_ABLITERATED"
@@ -131,22 +131,20 @@ export ABLITERATED DSPARK_MODEL DSPARK_MODEL_OFFICIAL DSPARK_MODEL_ABLITERATED D
 
 # Vision-Exp: Anemll SpeculativeConfig requires
 # num_speculative_tokens % num_nextn_predict_layers == 0 when k > n_predict.
-# Checkpoint n_predict=3 and dspark_block_size=5 → k in {6,9,…}. 0731 was
-# n_predict=1, which is why k=5 booted on that recipe.
-if [ "${ABLITERATED:-0}" != "1" ]; then
-  _mtp_k="${MTP_NUM_TOKENS:-6}"
-  case "$_mtp_k" in
-    ''|*[!0-9]*)
-      echo "error: MTP_NUM_TOKENS must be a non-negative integer (got ${_mtp_k})" >&2
-      exit 2
-      ;;
-  esac
-  if [ "$_mtp_k" -lt 5 ] || [ $((_mtp_k % 3)) -ne 0 ]; then
-    echo "error: Vision-Exp requires MTP_NUM_TOKENS >= 5 and divisible by 3 (num_nextn_predict_layers=3); got ${_mtp_k}" >&2
+# Checkpoint n_predict=3 and dspark_block_size=5 → k in {6,9,…}. Official and
+# Keys ablit share that layout (0731 was n_predict=1, which is why k=5 booted).
+_mtp_k="${MTP_NUM_TOKENS:-6}"
+case "$_mtp_k" in
+  ''|*[!0-9]*)
+    echo "error: MTP_NUM_TOKENS must be a non-negative integer (got ${_mtp_k})" >&2
     exit 2
-  fi
-  unset _mtp_k
+    ;;
+esac
+if [ "$_mtp_k" -lt 5 ] || [ $((_mtp_k % 3)) -ne 0 ]; then
+  echo "error: Vision-Exp requires MTP_NUM_TOKENS >= 5 and divisible by 3 (num_nextn_predict_layers=3); got ${_mtp_k}" >&2
+  exit 2
 fi
+unset _mtp_k
 
 # CLI values have highest precedence; the env file remains the persistent
 # configuration source when no command-line override is provided.
