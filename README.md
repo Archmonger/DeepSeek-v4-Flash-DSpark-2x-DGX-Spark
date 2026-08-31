@@ -102,9 +102,9 @@ working, and the same image + HF cache on both.
    Boot log (trust the live numbers):
 
    ```text
-   Available KV cache memory: 18.08 GiB
-   GPU KV cache size: 2,493,464 tokens
-   Maximum concurrency for 1,048,576 tokens per request: 2.38x
+   Available KV cache memory: 17.04 GiB
+   GPU KV cache size: 2,331,430 tokens
+   Maximum concurrency for 1,048,576 tokens per request: 2.22x
    ```
 
 API: `http://HEAD_NODE_IP:8888/v1` (`VLLM_HOST=0.0.0.0` by default).
@@ -125,7 +125,7 @@ hosts or it can kill vLLM under deep-context load.
 | Context ceiling | `MAX_MODEL_LEN=1048576` (1M) |
 | Concurrent seqs | `MAX_NUM_SEQS=6` |
 | Batch tokens | `MAX_NUM_BATCHED_TOKENS=8192` |
-| KV | `nvfp4_ds_mla`, text util **0.835** (~2.49M tokens on this cluster) |
+| KV | `nvfp4_ds_mla`, **17.04 GiB / 2,331,430 tokens** on this cluster (util 0.83; Vision-Exp ViT takes more weight RAM than 0731) |
 | Spec | `MTP_NUM_TOKENS=6` (≥ `dspark_block_size` 5 and divisible by Vision-Exp `n_predict=3`) |
 | Thinking | `DEFAULT_THINKING=max` (`off` / `low` / `high` / `max`) |
 | Graphs | `VLLM_USE_BREAKABLE_CUDAGRAPH=0` (keep this; unset is slower) |
@@ -394,7 +394,7 @@ yet supported by the V2 model runner` — so keep the capability `false` unless
 
 | Knob | Meaning | This build |
 | --- | --- | --- |
-| KV pool | Shared blocks after weights load | ~2.49M tokens @ util 0.835 |
+| KV pool | Shared blocks after weights load | 2,331,430 tokens / 17.04 GiB @ util 0.83 |
 | `max_model_len` | Per-request **ceiling** | 1,048,576 |
 | `max_num_seqs` | Max **active** sequences | 6 |
 
@@ -405,7 +405,7 @@ yet supported by the V2 model runner` — so keep the capability `false` unless
 6 ×   1M  =  6.0M   impossible — extras queue
 ```
 
-The boot line `Maximum concurrency for 1,048,576 tokens … ~2.4x` only means a
+The boot line `Maximum concurrency for 1,048,576 tokens … 2.22x` only means a
 few *simultaneous full-1M* requests fit.
 
 ---
