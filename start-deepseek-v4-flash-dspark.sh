@@ -106,26 +106,18 @@ fi
 # DSPARK_API_KEYS ambient guard (end)
 COMPOSE_ENV_FILE="$_dspark_env_clean"
 
-# Vision mode flag selects 0731 GPU util (and whether the VL sidecar starts).
-#   ENABLE_VL_SIDECAR=1 → vision coexist → GPU_MEMORY_UTILIZATION_VISION (default 0.80)
-#   ENABLE_VL_SIDECAR=0 → text-only     → GPU_MEMORY_UTILIZATION_TEXT   (default 0.835)
-# Explicit GPU_MEMORY_UTILIZATION in the env file is overridden by this profile
-# so one flag is enough to switch modes safely.
-if [ "${ENABLE_VL_SIDECAR:-0}" = "1" ]; then
-  GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION_VISION:-0.80}"
-  DSPARK_SERVE_MODE="vision"
-else
-  GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION_TEXT:-0.835}"
-  DSPARK_SERVE_MODE="text"
-fi
-export GPU_MEMORY_UTILIZATION ENABLE_VL_SIDECAR DSPARK_SERVE_MODE
+# GPU util comes from GPU_MEMORY_UTILIZATION_TEXT (default 0.835).
+# Explicit GPU_MEMORY_UTILIZATION in the env file is overridden by this so
+# the profile stays in one place.
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION_TEXT:-0.835}"
+export GPU_MEMORY_UTILIZATION
 
-# Checkpoint flag: official 0731 vs Keys abliterated weights.
+# Checkpoint: official Vision-Exp vs Keys abliterated (0731-only) weights.
 #   ABLITERATED=0 → DSPARK_MODEL_OFFICIAL
 #   ABLITERATED=1 → DSPARK_MODEL_ABLITERATED
-DSPARK_MODEL_OFFICIAL="${DSPARK_MODEL_OFFICIAL:-deepseek-ai/DeepSeek-V4-Flash-0731}"
+DSPARK_MODEL_OFFICIAL="${DSPARK_MODEL_OFFICIAL:-deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}"
 DSPARK_MODEL_ABLITERATED="${DSPARK_MODEL_ABLITERATED:-drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32}"
-DEFAULT_OFFICIAL_REVISION="9e165c30e2704aec5d9d593cce3eebd58bbef1cb"
+DEFAULT_OFFICIAL_REVISION="86f746b36186f0e567729a5c06a8c918caba82a9"
 if [ "${ABLITERATED:-0}" = "1" ]; then
   DSPARK_MODEL="$DSPARK_MODEL_ABLITERATED"
   DSPARK_REVISION="${DSPARK_REVISION_ABLITERATED:-}"
@@ -136,6 +128,25 @@ else
   fi
 fi
 export ABLITERATED DSPARK_MODEL DSPARK_MODEL_OFFICIAL DSPARK_MODEL_ABLITERATED DSPARK_REVISION
+
+# Vision-Exp: Anemll SpeculativeConfig requires
+# num_speculative_tokens % num_nextn_predict_layers == 0 when k > n_predict.
+# Checkpoint n_predict=3 and dspark_block_size=5 → k in {6,9,…}. 0731 was
+# n_predict=1, which is why k=5 booted on that recipe.
+if [ "${ABLITERATED:-0}" != "1" ]; then
+  _mtp_k="${MTP_NUM_TOKENS:-6}"
+  case "$_mtp_k" in
+    ''|*[!0-9]*)
+      echo "error: MTP_NUM_TOKENS must be a non-negative integer (got ${_mtp_k})" >&2
+      exit 2
+      ;;
+  esac
+  if [ "$_mtp_k" -lt 5 ] || [ $((_mtp_k % 3)) -ne 0 ]; then
+    echo "error: Vision-Exp requires MTP_NUM_TOKENS >= 5 and divisible by 3 (num_nextn_predict_layers=3); got ${_mtp_k}" >&2
+    exit 2
+  fi
+  unset _mtp_k
+fi
 
 # CLI values have highest precedence; the env file remains the persistent
 # configuration source when no command-line override is provided.
@@ -774,7 +785,6 @@ on_error() {
 print_resolved_profile() {
   echo "Resolved DSpark profile:"
   echo "  project: $PROJECT_NAME"
-  echo "  serve mode: $DSPARK_SERVE_MODE (ENABLE_VL_SIDECAR=${ENABLE_VL_SIDECAR:-0})"
   echo "  checkpoint: $DSPARK_MODEL (ABLITERATED=${ABLITERATED:-0})"
   if [ -n "${DSPARK_REVISION:-}" ]; then
     echo "  revision: $DSPARK_REVISION"
@@ -787,12 +797,12 @@ print_resolved_profile() {
   echo "  max model len: ${MAX_MODEL_LEN:-1000000}"
   echo "  max num seqs: ${MAX_NUM_SEQS:-6}"
   echo "  max batched tokens: ${MAX_NUM_BATCHED_TOKENS:-8192}"
-  echo "  gpu memory utilization: ${GPU_MEMORY_UTILIZATION:-0.80} (text default ${GPU_MEMORY_UTILIZATION_TEXT:-0.835} / vision default ${GPU_MEMORY_UTILIZATION_VISION:-0.80})"
-  echo "  mtp speculative tokens: ${MTP_NUM_TOKENS:-5} (dspark_block_size min is 5)"
+  echo "  gpu memory utilization: ${GPU_MEMORY_UTILIZATION:-0.835} (from GPU_MEMORY_UTILIZATION_TEXT=${GPU_MEMORY_UTILIZATION_TEXT:-0.835})"
+  echo "  mtp speculative tokens: ${MTP_NUM_TOKENS:-6} (Vision-Exp: >=5 and divisible by 3)"
   echo "  default thinking: $DEFAULT_THINKING (off/low/high/max)"
   echo "  issue31 GPU thinking_token_budget hotfix: ${DSPARK_ENABLE_ISSUE31_GPU_HOTFIX:-0} (0=stock V2 / 1=apply)"
   echo "  issue133 Triton specialization hotfix: will apply on start"
-  echo "  cudagraph capture size: $(( ${MAX_NUM_SEQS:-6} * (${MTP_NUM_TOKENS:-5} + 1) ))"
+  echo "  cudagraph capture size: $(( ${MAX_NUM_SEQS:-6} * (${MTP_NUM_TOKENS:-6} + 1) ))"
   echo "  API bind: $VLLM_HOST:$VLLM_PORT"
   echo "  API probe: $API_URL"
   echo "  head fabric IP: $VLLM_HOST_IP"
@@ -805,12 +815,6 @@ print_resolved_profile() {
   echo "  worker dir: $WORKER_DIR"
   echo "  worker cache: ${WORKER_HF_CACHE:-${HF_CACHE:-}}"
   echo "  GB10 vLLM patch: $ENABLE_VLLM_GB10_PATCH"
-  if [ "${ENABLE_VL_SIDECAR:-0}" = "1" ]; then
-    echo "  VL sidecar: ${VL_SIDECAR_MODEL:-cyankiwi/Qwen3-VL-4B-Instruct-AWQ-4bit} TP=${VL_SIDECAR_TP_SIZE:-2} nnodes=${VL_SIDECAR_NNODES:-2} on 127.0.0.1:${VL_SIDECAR_PORT:-8889} (util ${VL_SIDECAR_GPU_UTIL:-0.04}/GPU, kv ${VL_SIDECAR_KV_CACHE_DTYPE:-int4_per_token_head}, master-port ${VL_SIDECAR_MASTER_PORT:-25100})"
-    echo "  vision MCP install: ${INSTALL_VISION_MCP:-1} (only when ENABLE_VL_SIDECAR=1; harnesses: ${VISION_MCP_HARNESSES:-auto})"
-  else
-    echo "  VL sidecar: disabled (text-only 0731)"
-  fi
   if [ -f "$SCRIPT_DIR/patches/hotfix-nvfp4-ds-mla-issue22.sh" ]; then
     if [ "${DSPARK_SKIP_ISSUE22_HOTFIX:-0}" = "1" ]; then
       echo "  Issue #22 hotfix: SKIPPED (DSPARK_SKIP_ISSUE22_HOTFIX=1)"
@@ -937,10 +941,6 @@ ssh "$WORKER_HOST" "
   _env_tmp=
   trap - EXIT HUP INT TERM
 " < "$COMPOSE_ENV_FILE"
-SIDECAR_COMPOSE_FILE="${SIDECAR_COMPOSE_FILE:-$SCRIPT_DIR/docker-compose.vl-sidecar.yml}"
-if [ -f "$SIDECAR_COMPOSE_FILE" ]; then
-  scp "$SIDECAR_COMPOSE_FILE" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/docker-compose.vl-sidecar.yml"
-fi
 ssh "$WORKER_HOST" "mkdir -p $REMOTE_WORKER_DIR/recipe/vllm/v1/spec_decode"
 scp "$DSPARK_PROPOSER_FILE" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/recipe/vllm/v1/spec_decode/dspark_proposer.py"
 DSPARK_HOTFIX_FILE="$SCRIPT_DIR/patches/hotfix-nvfp4-ds-mla-issue22.sh"
@@ -1025,6 +1025,19 @@ if [ -f "$DSPARK_ASSISTANT_FINAL_HOTFIX" ]; then
   ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
   scp "$DSPARK_ASSISTANT_FINAL_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-assistant-final-continuation.py"
 fi
+DSPARK_VISION_EXP_HOTFIX="${DSPARK_VISION_EXP_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-vision-exp.py}"
+if [ -f "$DSPARK_VISION_EXP_HOTFIX" ]; then
+  echo "Syncing Vision-Exp native image hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_VISION_EXP_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-vision-exp.py"
+fi
+if [ -d "$SCRIPT_DIR/patches/vision_exp" ]; then
+  echo "Syncing patches/vision_exp/ to ${WORKER_HOST}:${WORKER_DIR}/patches/vision_exp/"
+  # Replace the dest dir. `scp -r vision_exp patches/` nests into
+  # patches/vision_exp/vision_exp when the dest already exists.
+  ssh "$WORKER_HOST" "rm -rf '${REMOTE_WORKER_DIR}/patches/vision_exp' && mkdir -p '${REMOTE_WORKER_DIR}/patches/vision_exp'"
+  scp -r "$SCRIPT_DIR/patches/vision_exp/." "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/vision_exp/"
+fi
 if [ "$ENABLE_VLLM_GB10_PATCH" = "1" ]; then
   echo "Syncing GB10 vLLM patch to ${WORKER_HOST}:${WORKER_DIR}/vllm_patch_gb10"
   tar -C "$VLLM_GB10_PATCH_DIR" \
@@ -1040,11 +1053,6 @@ remote_compose "NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP=
 
 echo "Starting DSpark head..."
 compose_base 0 "" up -d
-
-# VL TP=2 sidecar is launched AFTER the main API is healthy (see wait loop):
-# DeepSeek and VL must not GPU-profile concurrently. VL uses a separate
-# NCCL master port (VL_SIDECAR_MASTER_PORT, default 25100).
-SIDECAR_COMPOSE_FILE="${SIDECAR_COMPOSE_FILE:-$SCRIPT_DIR/docker-compose.vl-sidecar.yml}"
 
 if [ "${DSPARK_SKIP_HOTFIX:-0}" = "1" ]; then
   echo "Entrypoint will skip DSV4 v0.27 perf hotfixes (DSPARK_SKIP_HOTFIX=1)."
@@ -1064,47 +1072,6 @@ for _ in $(seq 1 "$WAIT_ATTEMPTS"); do
     echo "DeepSeek V4 Flash DSpark is running: $API_URL"
     compose_base 0 "" ps
     remote_compose "docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.dspark.yml ps"
-    # VL sidecar TP=2 (Qwen3-VL): worker-first, then head API rank. 0731 stays
-    # text-only; agents use ds4f-vision MCP. Same compose project as DeepSeek
-    # so stop tears it down. Separate NCCL master port from DeepSeek.
-    if [ "${ENABLE_VL_SIDECAR:-0}" = "1" ] && [ -f "$SIDECAR_COMPOSE_FILE" ]; then
-      VL_MASTER_PORT="${VL_SIDECAR_MASTER_PORT:-25100}"
-      echo "Starting VL sidecar TP=${VL_SIDECAR_TP_SIZE:-2} (${VL_SIDECAR_MODEL:-cyankiwi/Qwen3-VL-4B-Instruct-AWQ-4bit}, port ${VL_SIDECAR_PORT:-8889}, master-port ${VL_MASTER_PORT})..."
-      echo "  VL worker first on ${WORKER_HOST}..."
-      remote_compose "MASTER_ADDR='$MASTER_ADDR' NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.vl-sidecar.yml up -d"
-      echo "  VL head (API rank)..."
-      env -u NODE_RANK -u HEADLESS COMPOSE_DISABLE_ENV_FILE=1 \
-        NODE_RANK=0 \
-        docker compose -p "$PROJECT_NAME" --env-file "$COMPOSE_ENV_FILE" -f "$SIDECAR_COMPOSE_FILE" up -d
-      SIDECAR_MODELS_URL="http://127.0.0.1:${VL_SIDECAR_PORT:-8889}/v1/models"
-      SIDECAR_READY=0
-      for _sidecar_i in $(seq 1 "${VL_SIDECAR_WAIT_ATTEMPTS:-90}"); do
-        if curl -fsS --max-time 5 "$SIDECAR_MODELS_URL" 2>/dev/null | grep -q "qwen3-vl"; then
-          SIDECAR_READY=1
-          break
-        fi
-        sleep "${VL_SIDECAR_WAIT_SECONDS:-2}"
-      done
-      if [ "$SIDECAR_READY" = "1" ]; then
-        echo "VL sidecar is ready: $SIDECAR_MODELS_URL"
-        # Only register MCP when vision mode is on (this block) and install is
-        # not explicitly disabled. INSTALL_VISION_MCP defaults to follow the flag.
-        if [ "${ENABLE_VL_SIDECAR:-0}" = "1" ] && [ "${INSTALL_VISION_MCP:-1}" = "1" ]; then
-          echo "Registering ds4f-vision MCP into detected harnesses (pi/omp/hermes/opencode/goose/grok/openclaw/zcode/prime/factory/commandcode)..."
-          if ! "$SCRIPT_DIR/scripts/install-ds4f-vision-mcp.sh"; then
-            echo "WARN: vision MCP harness install failed (non-fatal)." >&2
-          fi
-        elif [ "${INSTALL_VISION_MCP:-1}" = "0" ]; then
-          echo "Skipping vision MCP install (INSTALL_VISION_MCP=0)."
-        fi
-      else
-        echo "WARN: VL sidecar not ready at $SIDECAR_MODELS_URL — skipping vision MCP install." >&2
-        echo "  Recent VL head logs:" >&2
-        COMPOSE_DISABLE_ENV_FILE=1 docker compose -p "$PROJECT_NAME" --env-file "$COMPOSE_ENV_FILE" -f "$SIDECAR_COMPOSE_FILE" logs --tail=80 >&2 || true
-        echo "  Recent VL worker logs:" >&2
-        remote_compose "docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.vl-sidecar.yml logs --tail=80" >&2 || true
-      fi
-    fi
     if [ "${DSPARK_ENABLE_ISSUE31_GPU_HOTFIX:-0}" = "1" ]; then
       echo "Running minimal OpenAI-compatible thinking-budget chat request..."
       curl -fsS --max-time 60 "${AUTH_HEADER_ARGS[@]}" "$CHAT_URL" \
