@@ -48,6 +48,7 @@ patch_model_text = _mod.patch_model_text
 patch_dspark_text = _mod.patch_dspark_text
 ENC_MARK = _mod.ENC_MARK
 ENC_ROLE_MARK = _mod.ENC_ROLE_MARK
+ENC_ROLE_PAIRED_MARK = _mod.ENC_ROLE_PAIRED_MARK
 MODEL_MARK = _mod.MODEL_MARK
 DSPARK_MARK = _mod.DSPARK_MARK
 
@@ -245,6 +246,82 @@ def _process_image_blocks(blocks):
             )
         self.assertIn("assistant", str(assistant_err.exception))
         ns["_validate_no_image_sp_tokens"]({"role": "system", "content": "text only"})
+        ns["_validate_no_image_sp_tokens"](
+            {
+                "role": "system",
+                "content": "You are a helpful assistant. Markdown images look like <image> tags.",
+            }
+        )
+        ns["_validate_no_image_sp_tokens"](
+            {"role": "assistant", "content": "example: <image> in markdown"}
+        )
+        with self.assertRaises(ValueError) as paired_err:
+            ns["_validate_no_image_sp_tokens"](
+                {
+                    "role": "system",
+                    "content": "load <image>/tmp/shot.png</image> now",
+                }
+            )
+        self.assertIn("user messages only", str(paired_err.exception))
+
+    def test_encoding_role_check_upgrades_bare_image_substring(self):
+        src = '''
+IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
+
+def _validate_no_image_sp_tokens(msg):
+    content = msg.get("content")
+    if isinstance(content, str) and IMAGE_PLACEHOLDER in content:
+        raise ValueError("bad")
+    reasoning_content = msg.get("reasoning_content")
+    if isinstance(reasoning_content, str) and IMAGE_PLACEHOLDER in reasoning_content:
+        raise ValueError("bad-reason")
+
+def _process_image_blocks(blocks):
+    text = blocks[0].get("text") or ""
+    if IMAGE_PLACEHOLDER in text:
+        raise ValueError("bad-text")
+'''
+        first, status = patch_encoding_text(src)
+        self.assertEqual(status, "applied")
+        stale_inject = f'''
+{ENC_ROLE_MARK}
+def _dspark_vision_value_has_image(value) -> bool:
+    if isinstance(value, str):
+        return IMAGE_PLACEHOLDER in value or "<image>" in value
+    return False
+
+def _validate_no_image_sp_tokens(msg):
+    role = msg.get("role")
+    if role in ("user", "developer"):
+        return
+    if _dspark_vision_value_has_image(msg.get("content")):
+        raise ValueError(
+            "Images are supported in user messages only: "
+            "images in " + repr(role) + " messages return a 400 error."
+        )
+'''
+        stale = first[: first.rfind(ENC_ROLE_MARK)] + stale_inject
+        self.assertNotIn(ENC_ROLE_PAIRED_MARK, stale)
+        ns_stale: dict = {}
+        exec(compile(stale, "encoding.py", "exec"), ns_stale)
+        with self.assertRaises(ValueError):
+            ns_stale["_validate_no_image_sp_tokens"](
+                {
+                    "role": "system",
+                    "content": "Markdown images look like <image> tags.",
+                }
+            )
+        upgraded, status2 = patch_encoding_text(stale)
+        self.assertEqual(status2, "applied")
+        self.assertIn(ENC_ROLE_PAIRED_MARK, upgraded)
+        ns: dict = {}
+        exec(compile(upgraded, "encoding.py", "exec"), ns)
+        ns["_validate_no_image_sp_tokens"](
+            {
+                "role": "system",
+                "content": "Markdown images look like <image> tags.",
+            }
+        )
 
     def test_dspark_remaps_bias_vl_before_lookup(self):
         src = '''
