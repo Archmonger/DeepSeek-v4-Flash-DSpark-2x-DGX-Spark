@@ -40,6 +40,7 @@ DEFAULT_PATCHES = Path("/opt/dspark-patches/vision_exp")
 MODEL_MARK = "# [vision-exp-hotfix] native DeepSeek-V4-Flash-Vision-Exp image tower"
 ENC_MARK = "# [vision-exp-hotfix] allow vLLM-inserted image placeholders"
 ENC_ROLE_MARK = "# [vision-exp-hotfix] images only in user messages"
+ENC_ROLE_PAIRED_MARK = "# [vision-exp-hotfix] paired <image> tag (issue 165)"
 DSPARK_MARK = "# [vision-exp-hotfix] remap ffn.gate.bias_vl"
 
 DSPARK_GATE_BIAS_OLD = '''                if name.endswith(".ffn.gate.bias"):
@@ -93,9 +94,24 @@ TEXT_CHECK_NEW = f"if False and IMAGE_PLACEHOLDER in text:  {ENC_MARK}"
 
 ENC_ROLE_INJECT = f'''
 {ENC_ROLE_MARK}
+{ENC_ROLE_PAIRED_MARK}
+def _dspark_vision_text_has_image(text: str) -> bool:
+    if IMAGE_PLACEHOLDER in text:
+        return True
+    needle, close = "<image>", "</image>"
+    start = 0
+    while True:
+        i = text.find(needle, start)
+        if i < 0:
+            return False
+        if text.find(close, i + len(needle)) >= 0:
+            return True
+        start = i + len(needle)
+
+
 def _dspark_vision_value_has_image(value) -> bool:
     if isinstance(value, str):
-        return IMAGE_PLACEHOLDER in value or "<image>" in value
+        return _dspark_vision_text_has_image(value)
     if not isinstance(value, list):
         return False
     for block in value:
@@ -104,9 +120,7 @@ def _dspark_vision_value_has_image(value) -> bool:
         if block.get("type") in ("image", "image_url"):
             return True
         text = block.get("text") or ""
-        if isinstance(text, str) and (
-            IMAGE_PLACEHOLDER in text or "<image>" in text
-        ):
+        if isinstance(text, str) and _dspark_vision_text_has_image(text):
             return True
         nested = block.get("content")
         if isinstance(nested, list) and _dspark_vision_value_has_image(nested):
@@ -149,6 +163,7 @@ def patch_encoding_text(source: str) -> tuple[str, str]:
     if (
         ENC_MARK in source
         and ENC_ROLE_MARK in source
+        and ENC_ROLE_PAIRED_MARK in source
         and CONTENT_CHECK_NEW in source
     ):
         return source, "skipped"
@@ -167,6 +182,8 @@ def patch_encoding_text(source: str) -> tuple[str, str]:
             source = source.replace(old, new, 1)
         if missing:
             return source, "drift:" + ",".join(missing)
+    if ENC_ROLE_MARK in source and ENC_ROLE_PAIRED_MARK not in source:
+        source = source[: source.rfind(ENC_ROLE_MARK)].rstrip() + "\n"
     if ENC_ROLE_MARK not in source:
         source = source.rstrip() + "\n" + ENC_ROLE_INJECT
     compile(source, "encoding.py", "exec")
@@ -207,6 +224,7 @@ def main() -> int:
             "vision-exp encoding.py                 :",
             "APPLIED"
             if ENC_MARK in encoding and ENC_ROLE_MARK in encoding
+            and ENC_ROLE_PAIRED_MARK in encoding
             else "NOT APPLIED",
         )
         print(
@@ -217,6 +235,7 @@ def main() -> int:
             MODEL_MARK in model
             and ENC_MARK in encoding
             and ENC_ROLE_MARK in encoding
+            and ENC_ROLE_PAIRED_MARK in encoding
             and DSPARK_MARK in dspark
         )
         return 0 if ok else 1
