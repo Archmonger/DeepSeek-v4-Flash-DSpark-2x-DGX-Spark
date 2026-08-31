@@ -1,3 +1,9 @@
+## 2026-09-01
+
+### Fixed
+
+- **Vision-Exp role check no longer 400s when a tool result quotes image markers ([Issue #167](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/167))**: `tool` / `function` message *text* is opaque (grep/cat of the hotfix, commit messages that mention `<image>`). Only a structured `image` / `image_url` part in those roles is rejected. System/assistant still use the issue #165 paired-tag + placeholder scan. Recreate both containers after pull (`./stop` then `./start`); restart keeps the old encoder bytes.
+
 ## 2026-08-31
 
 ### Fixed

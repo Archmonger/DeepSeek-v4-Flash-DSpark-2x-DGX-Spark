@@ -14,6 +14,9 @@ startup patch:
    ``<｜deepseek_image｜>`` text so OpenAI ``image_url`` parts survive
    vLLM's chat parser, then restores the official Chat Completions rule:
    images in ``user`` messages only (``system`` / ``assistant`` → 400).
+   ``tool`` / ``function`` *result text* is not scanned for image markers
+   (a ``cat`` of this file must not 400). Structured ``image`` /
+   ``image_url`` parts in those roles still 400.
 
 Video is not wired: the official weights, ``encoding/``, and ``inference/``
 have no video encoder. GIF is decoded as a still RGB frame.
@@ -41,6 +44,7 @@ MODEL_MARK = "# [vision-exp-hotfix] native DeepSeek-V4-Flash-Vision-Exp image to
 ENC_MARK = "# [vision-exp-hotfix] allow vLLM-inserted image placeholders"
 ENC_ROLE_MARK = "# [vision-exp-hotfix] images only in user messages"
 ENC_ROLE_PAIRED_MARK = "# [vision-exp-hotfix] paired <image> tag (issue 165)"
+ENC_ROLE_TOOL_MARK = "# [vision-exp-hotfix] tool text is not an image (issue 167)"
 DSPARK_MARK = "# [vision-exp-hotfix] remap ffn.gate.bias_vl"
 
 DSPARK_GATE_BIAS_OLD = '''                if name.endswith(".ffn.gate.bias"):
@@ -95,6 +99,7 @@ TEXT_CHECK_NEW = f"if False and IMAGE_PLACEHOLDER in text:  {ENC_MARK}"
 ENC_ROLE_INJECT = f'''
 {ENC_ROLE_MARK}
 {ENC_ROLE_PAIRED_MARK}
+{ENC_ROLE_TOOL_MARK}
 def _dspark_vision_text_has_image(text: str) -> bool:
     if IMAGE_PLACEHOLDER in text:
         return True
@@ -109,9 +114,9 @@ def _dspark_vision_text_has_image(text: str) -> bool:
         start = i + len(needle)
 
 
-def _dspark_vision_value_has_image(value) -> bool:
+def _dspark_vision_value_has_image(value, scan_text: bool = True) -> bool:
     if isinstance(value, str):
-        return _dspark_vision_text_has_image(value)
+        return bool(scan_text) and _dspark_vision_text_has_image(value)
     if not isinstance(value, list):
         return False
     for block in value:
@@ -119,11 +124,14 @@ def _dspark_vision_value_has_image(value) -> bool:
             continue
         if block.get("type") in ("image", "image_url"):
             return True
-        text = block.get("text") or ""
-        if isinstance(text, str) and _dspark_vision_text_has_image(text):
-            return True
+        if scan_text:
+            text = block.get("text") or ""
+            if isinstance(text, str) and _dspark_vision_text_has_image(text):
+                return True
         nested = block.get("content")
-        if isinstance(nested, list) and _dspark_vision_value_has_image(nested):
+        if isinstance(nested, list) and _dspark_vision_value_has_image(
+            nested, scan_text
+        ):
             return True
     return False
 
@@ -139,9 +147,10 @@ def _validate_no_image_sp_tokens(msg):
     role = msg.get("role")
     if role in ("user", "developer"):
         return
-    if _dspark_vision_value_has_image(msg.get("content")) or _dspark_vision_value_has_image(
-        msg.get("content_blocks")
-    ):
+    scan_text = role not in ("tool", "function")
+    if _dspark_vision_value_has_image(
+        msg.get("content"), scan_text
+    ) or _dspark_vision_value_has_image(msg.get("content_blocks"), scan_text):
         raise ValueError(
             "Images are supported in user messages only: "
             "images in " + repr(role) + " messages return a 400 error."
@@ -164,6 +173,7 @@ def patch_encoding_text(source: str) -> tuple[str, str]:
         ENC_MARK in source
         and ENC_ROLE_MARK in source
         and ENC_ROLE_PAIRED_MARK in source
+        and ENC_ROLE_TOOL_MARK in source
         and CONTENT_CHECK_NEW in source
     ):
         return source, "skipped"
@@ -182,7 +192,9 @@ def patch_encoding_text(source: str) -> tuple[str, str]:
             source = source.replace(old, new, 1)
         if missing:
             return source, "drift:" + ",".join(missing)
-    if ENC_ROLE_MARK in source and ENC_ROLE_PAIRED_MARK not in source:
+    if ENC_ROLE_MARK in source and (
+        ENC_ROLE_PAIRED_MARK not in source or ENC_ROLE_TOOL_MARK not in source
+    ):
         source = source[: source.rfind(ENC_ROLE_MARK)].rstrip() + "\n"
     if ENC_ROLE_MARK not in source:
         source = source.rstrip() + "\n" + ENC_ROLE_INJECT
@@ -225,6 +237,7 @@ def main() -> int:
             "APPLIED"
             if ENC_MARK in encoding and ENC_ROLE_MARK in encoding
             and ENC_ROLE_PAIRED_MARK in encoding
+            and ENC_ROLE_TOOL_MARK in encoding
             else "NOT APPLIED",
         )
         print(
@@ -236,6 +249,7 @@ def main() -> int:
             and ENC_MARK in encoding
             and ENC_ROLE_MARK in encoding
             and ENC_ROLE_PAIRED_MARK in encoding
+            and ENC_ROLE_TOOL_MARK in encoding
             and DSPARK_MARK in dspark
         )
         return 0 if ok else 1
