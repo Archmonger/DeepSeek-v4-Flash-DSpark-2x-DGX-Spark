@@ -21,6 +21,7 @@ from vision_exp.image_processor import (  # noqa: E402
     image_block_num_tokens,
     is_unregistered_router_bias,
     is_vision_exp_weight_name,
+    looks_like_chw,
     salt_mm_image_hash,
     vision_args_from_config,
 )
@@ -137,10 +138,34 @@ class VisionExpLayoutTest(unittest.TestCase):
             return
         hwc = np.zeros((6, 4, 3), dtype="uint8")
         hwc[..., 0] = 11
+        self.assertEqual(as_pil(hwc).size, (4, 6))
         self.assertEqual(as_pil(hwc).getpixel((0, 0)), (11, 0, 0))
         chw = np.zeros((3, 6, 4), dtype="uint8")
         chw[1] = 22
-        self.assertEqual(as_pil(chw).getpixel((0, 0)), (0, 22, 0))
+        got_chw = as_pil(chw)
+        self.assertEqual(got_chw.size, (4, 6))
+        self.assertEqual(got_chw.getpixel((0, 0)), (0, 22, 0))
+        chw_w3 = np.zeros((3, 8, 3), dtype="uint8")
+        chw_w3[1] = 22
+        self.assertEqual(as_pil(chw_w3).size, (3, 8))
+        self.assertEqual(as_pil(chw_w3).getpixel((0, 0)), (0, 22, 0))
+        chw_wide = np.zeros((3, 8, 5), dtype="uint8")
+        chw_wide[1] = 22
+        self.assertEqual(as_pil(chw_wide).getpixel((0, 0)), (0, 22, 0))
+
+    def test_looks_like_chw_width_in_channel_set(self):
+        self.assertTrue(looks_like_chw((3, 6, 4)))
+        self.assertTrue(looks_like_chw((3, 8, 3)))
+        self.assertTrue(looks_like_chw((3, 8, 1)))
+        self.assertTrue(looks_like_chw((3, 8, 5)))
+        self.assertTrue(looks_like_chw((3, 8, 8)))
+        self.assertTrue(looks_like_chw((4, 100, 200)))
+        self.assertTrue(looks_like_chw((1, 100, 200)))
+        self.assertFalse(looks_like_chw((8, 5, 3)))
+        self.assertFalse(looks_like_chw((6, 4, 3)))
+        self.assertFalse(looks_like_chw((4, 100, 3)))
+        self.assertFalse(looks_like_chw((1, 100, 3)))
+        self.assertFalse(looks_like_chw((6, 4)))
 
     def test_vision_weight_names_bypass_stacked_w1(self):
         self.assertTrue(is_vision_exp_weight_name("aligner.w1.bias"))
