@@ -25,6 +25,8 @@ for f in \
   scripts/test-nccl-ib-hca-gid-resolve.sh \
   scripts/boot-shape-warmup.sh \
   scripts/test-boot-shape-warmup.sh \
+  lmcache/run-lmcache-server.sh \
+  scripts/test-lmcache-compose-gate.sh \
   patches/*.sh
 do
   [ -e "$f" ] || continue
@@ -39,6 +41,9 @@ py_files+=(
   scripts/test-issue31-thinking-budget-gpu.py
   scripts/test-issue55-tool-truncation.py
   scripts/test-responses-api-live.py
+  scripts/verify-issue138-responses-history-live.py
+  scripts/test-issue138-responses-history-hotfix.py
+  scripts/test-issue138-responses-history-live.py
   scripts/test-encoding-dsv4-issue21.py
   scripts/test-suppress-stops-in-reasoning.py
   scripts/test-assistant-final-continuation.py
@@ -51,12 +56,16 @@ py_files+=(
   scripts/test-hotfix-atomic-transaction.py
   scripts/test-python-hotfix-failclosed.py
   scripts/test-dsv4-vision-exp-hotfix.py
+  scripts/test-issue141-sparse-mla-decode-chunk.py
+  scripts/test-issue136-xgrammar-termination.py
+  scripts/verify-issue136-xgrammar-live.py
   scripts/test-empty-encoder-output-hotfix.py
   scripts/ruler-lite.py
   scripts/verify-dsv4-027-equality-gate.py
   scripts/ab-issue133-triton-specialization.py
   tests/test_dspark_stacked_mapping.py
   tests/test_issue133_triton_specialization.py
+  lmcache/patch-compose-lmcache.py
 )
 python3 -m py_compile "${py_files[@]}"
 ok "py_compile ${#py_files[@]} files"
@@ -70,6 +79,10 @@ python3 scripts/test-issue55-tool-truncation.py -q
 ok "test-issue55-tool-truncation"
 python3 scripts/test-responses-api-live.py -q
 ok "test-responses-api-live"
+python3 scripts/test-issue138-responses-history-hotfix.py -q
+ok "test-issue138-responses-history-hotfix"
+python3 scripts/test-issue138-responses-history-live.py -q
+ok "test-issue138-responses-history-live"
 python3 scripts/test-encoding-dsv4-issue21.py -q
 ok "test-encoding-dsv4-issue21"
 python3 scripts/test-suppress-stops-in-reasoning.py -q
@@ -94,6 +107,10 @@ python3 scripts/test-python-hotfix-failclosed.py -q
 ok "test-python-hotfix-failclosed"
 python3 scripts/test-dsv4-vision-exp-hotfix.py -q
 ok "test-dsv4-vision-exp-hotfix"
+python3 scripts/test-issue141-sparse-mla-decode-chunk.py -q
+ok "test-issue141-sparse-mla-decode-chunk"
+python3 scripts/test-issue136-xgrammar-termination.py -q
+ok "test-issue136-xgrammar-termination"
 python3 scripts/test-empty-encoder-output-hotfix.py -q
 ok "test-empty-encoder-output-hotfix"
 python3 tests/test_issue27_inflight_cap.py -q
@@ -114,6 +131,8 @@ bash scripts/test-boot-shape-warmup.sh -q
 ok "test-boot-shape-warmup"
 bash scripts/test-nccl-ib-hca-gid-resolve.sh -q
 ok "test-nccl-ib-hca-gid-resolve"
+bash scripts/test-lmcache-compose-gate.sh -q
+ok "test-lmcache-compose-gate"
 
 echo "== recipe guards (do not re-ship known regressions) =="
 
@@ -181,12 +200,33 @@ if grep -Fq 'python3 /opt/hotfix-dsv4-issue26-hybrid-swa-min.py || exit 1' docke
 else
   bad "compose must apply #26 + #27 with || exit 1"
 fi
+# The safe #27 cap must agree across the fresh-clone env and Compose fallback.
+if grep -Fxq 'DSPARK_MAX_INFLIGHT_PREFILLS=1' .env.dspark.example \
+  && grep -Fq 'DSPARK_MAX_INFLIGHT_PREFILLS: "${DSPARK_MAX_INFLIGHT_PREFILLS:-1}"' docker-compose.dspark.yml; then
+  ok "issue27 in-flight prefill cap defaults to 1"
+else
+  bad "issue27 in-flight prefill cap must default to 1 in env example and compose"
+fi
 if grep -Fq 'hotfix-dsv4-issue133-triton-specialization.py}:/opt/hotfix-dsv4-issue133-triton-specialization.py:ro' docker-compose.dspark.yml \
   && grep -Fq 'python3 /opt/hotfix-dsv4-issue133-triton-specialization.py || exit 1' docker-compose.dspark.yml \
   && grep -Fq 'scp "$DSPARK_ISSUE133_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-issue133-triton-specialization.py"' start-deepseek-v4-flash-dspark.sh; then
   ok "issue133 triton specialization hotfix is mounted, fail-closed, and worker-synced"
 else
   bad "issue133 hotfix wiring is incomplete"
+fi
+# Issue #141: default OFF; exact 1 mounts and runs the source-locked
+# fixed-64 workaround fail-closed on both identically synced ranks.
+if grep -Fq 'hotfix-dsv4-issue141-sparse-mla-decode-chunk.py}:/opt/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py:ro' docker-compose.dspark.yml \
+  && grep -Fq 'DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK: "${DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK:-0}"' docker-compose.dspark.yml \
+  && grep -Fq 'if [ "$${DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py || exit 1; fi;' docker-compose.dspark.yml \
+  && grep -Fq 'if [ ! -f "$DSPARK_ISSUE141_HOTFIX" ]; then' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'issue141 sparse-MLA fixed-64 workaround: $DSPARK_ISSUE141_EFFECTIVE' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq "DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK='\$DSPARK_ISSUE141_EFFECTIVE'" start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq "DSPARK_ISSUE141_HOTFIX='./patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py'" start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'scp "$DSPARK_ISSUE141_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py"' start-deepseek-v4-flash-dspark.sh; then
+  ok "issue141 workaround is default-off, exact-1, fail-closed, preflighted, reported, and worker-synced"
+else
+  bad "issue141 sparse-MLA workaround wiring is incomplete"
 fi
 if grep -Fq 'python3 /opt/hotfix-dsv4-suppress-stops-in-reasoning.py || exit 1' docker-compose.dspark.yml; then
   ok "compose applies suppress-stops-in-reasoning fail-closed"
@@ -242,6 +282,22 @@ if grep -Fq 'DSPARK_ENABLE_ASSISTANT_FINAL_HOTFIX: "${DSPARK_ENABLE_ASSISTANT_FI
 else
   bad "compose must invoke assistant-final hotfix only when DSPARK_ENABLE_ASSISTANT_FINAL_HOTFIX=1, with || exit 1"
 fi
+# Issue #138 Responses history replay: default OFF, exact-1/fail-closed on
+# both ranks, with launcher preflight/reporting and canonical worker sync.
+issue138_worker_env="DSPARK_ISSUE138_HOTFIX='./patches/hotfix-vllm-issue138-responses-history.py'"
+issue138_worker_count="$(grep -Fc "$issue138_worker_env" start-deepseek-v4-flash-dspark.sh || true)"
+if grep -Fq 'hotfix-vllm-issue138-responses-history.py}:/opt/hotfix-vllm-issue138-responses-history.py:ro' docker-compose.dspark.yml \
+  && grep -Fq 'DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT: "${DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT:-0}"' docker-compose.dspark.yml \
+  && grep -Fq 'if [ "$${DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT:-0}" = "1" ]; then python3 /opt/hotfix-vllm-issue138-responses-history.py || exit 1; fi;' docker-compose.dspark.yml \
+  && grep -Fq '# Issue #138 Responses history compatibility pre-flight (begin).' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'issue138 Responses history compatibility: 0 (stock)' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'issue138 Responses history compatibility: 1 (apply)' start-deepseek-v4-flash-dspark.sh \
+  && [ "$issue138_worker_count" -eq 2 ] \
+  && grep -Fq 'scp "$DSPARK_ISSUE138_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-issue138-responses-history.py"' start-deepseek-v4-flash-dspark.sh; then
+  ok "issue138 hotfix is default-off, exact-1 fail-closed, preflighted, reported, and propagated to both ranks"
+else
+  bad "issue138 Responses history hotfix wiring is incomplete"
+fi
 if grep -q 'VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"' docker-compose.dspark.yml \
   && grep -q 'TILELANG_CACHE_DIR: "${TILELANG_CACHE_DIR:-/cache/huggingface/tilelang-cache}"' docker-compose.dspark.yml; then
   ok "compose JIT timeout 1800s + persistent TileLang cache (#65/#87)"
@@ -269,12 +325,15 @@ for p in \
   patches/hotfix-dsv4-issue26-hybrid-swa-min.py \
   patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py \
   patches/hotfix-dsv4-issue133-triton-specialization.py \
+  patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py \
   patches/hotfix-vllm-empty-encoder-output.py \
   patches/hotfix-dsv4-vision-exp.py \
+  patches/hotfix-vllm-issue136-xgrammar-termination.py \
   patches/hotfix-nvfp4-ds-mla-issue22.sh \
   patches/hotfix-gb10-spin-wait.sh \
   patches/hotfix-dsv4-suppress-stops-in-reasoning.py \
   patches/hotfix-dsv4-assistant-final-continuation.py \
+  patches/hotfix-vllm-issue138-responses-history.py \
   patches/hotfix-vllm-redact-api-key-log.sh
 do
   if [ -f "$p" ]; then

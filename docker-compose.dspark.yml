@@ -55,6 +55,11 @@ services:
       - ${DSPARK_ISSUE26_HOTFIX:-./patches/hotfix-dsv4-issue26-hybrid-swa-min.py}:/opt/hotfix-dsv4-issue26-hybrid-swa-min.py:ro
       # Issue #133: stop global top-k Triton recompiles on sliced-pointer alignment.
       - ${DSPARK_ISSUE133_HOTFIX:-./patches/hotfix-dsv4-issue133-triton-specialization.py}:/opt/hotfix-dsv4-issue133-triton-specialization.py:ro
+      # Issue #141 workaround: keep oversized SM120 sparse-MLA decode calls on
+      # FlashInfer's fixed 64-row decode path. Default-off and source-locked.
+      - ${DSPARK_ISSUE141_HOTFIX:-./patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py}:/opt/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py:ro
+      # Issue #136: exact vLLM #52805 XGrammar termination backport (opt-in).
+      - ${DSPARK_ISSUE136_XGRAMMAR_HOTFIX:-./patches/hotfix-vllm-issue136-xgrammar-termination.py}:/opt/hotfix-vllm-issue136-xgrammar-termination.py:ro
       # Client stop strings stay dormant until </think> (Tony/Capicua25x Patch 5).
       - ${DSPARK_SUPPRESS_STOPS_HOTFIX:-./patches/hotfix-dsv4-suppress-stops-in-reasoning.py}:/opt/hotfix-dsv4-suppress-stops-in-reasoning.py:ro
       # A request ending with an assistant message must still get a generation
@@ -63,6 +68,9 @@ services:
       - ${DSPARK_ASSISTANT_FINAL_HOTFIX:-./patches/hotfix-dsv4-assistant-final-continuation.py}:/opt/hotfix-dsv4-assistant-final-continuation.py:ro
       # Native Vision-Exp ViT/Aligner + image_url processor (images only; no video).
       - ${DSPARK_VISION_EXP_HOTFIX:-./patches/hotfix-dsv4-vision-exp.py}:/opt/hotfix-dsv4-vision-exp.py:ro
+      # Issue #138: opt-in compatibility for singleton type-less assistant
+      # output_text items replayed through the Responses API.
+      - ${DSPARK_ISSUE138_HOTFIX:-./patches/hotfix-vllm-issue138-responses-history.py}:/opt/hotfix-vllm-issue138-responses-history.py:ro
       - ${DSPARK_PATCHES_DIR:-./patches}:/opt/dspark-patches:ro
       - ${DSPARK_TMP_HOST:-${HOME}/.cache/dspark-tmp}:/tmp
 
@@ -85,9 +93,9 @@ services:
       # (scheduled prefill/decode tokens per request + zero-token decode
       # skips) when set to 1. Off by default (zero overhead).
       DSPARK_ISSUE43_SCHED_DIAG: "${DSPARK_ISSUE43_SCHED_DIAG:-0}"
-      # In-flight partial-prefill cap for the #27 hotfix (1-3, default 2).
-      # Do NOT pass --max-num-partial-prefills (Anemll 0.1.1 rejects it).
-      DSPARK_MAX_INFLIGHT_PREFILLS: "${DSPARK_MAX_INFLIGHT_PREFILLS:-2}"
+      # In-flight partial-prefill cap for the #27 hotfix (1-3, default 1).
+      # Values 2-3 are opt-in; Anemll 0.1.1 rejects the native CLI flag.
+      DSPARK_MAX_INFLIGHT_PREFILLS: "${DSPARK_MAX_INFLIGHT_PREFILLS:-1}"
       # Pin HF revision (issue #19). Empty → tip of default branch / refs/main.
       DSPARK_REVISION: "${DSPARK_REVISION:-}"
       DSPARK_ENCODING_FILE: "${DSPARK_ENCODING_FILE:-}"
@@ -238,6 +246,15 @@ services:
       # empty no-op turn loop). 0 (default) = stock renderer, patch not
       # invoked; 1 = apply at boot and fail the container on any patch error.
       DSPARK_ENABLE_ASSISTANT_FINAL_HOTFIX: "${DSPARK_ENABLE_ASSISTANT_FINAL_HOTFIX:-0}"
+      # Issue #138: 0/non-1 = stock Responses validation; exact 1 applies
+      # the pinned-source compatibility patch and fails boot on any error.
+      DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT: "${DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT:-0}"
+      # Issue #141 stochastic TP=2 sparse-MLA stall workaround. Only exact 1
+      # applies the pinned-source, fixed-64-row patch; default 0 changes no bytes.
+      DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK: "${DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK:-0}"
+      # Issue #136: vLLM #52805 XGrammar termination fix. Exact 1 applies
+      # source-exact bytes at boot; default 0 leaves the image untouched.
+      DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX: "${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}"
       # Issue #66: GPU V2 thinking_token_budget hotfix. 0 (default) = stock
       # sampler (HTTP 400 if a client sends the field). 1 = apply at boot
       # (fail-closed) so explicit thinking_token_budget works. Omit-field
@@ -283,8 +300,10 @@ services:
         if [ "$${DSPARK_SKIP_SPIN_WAIT_HOTFIX:-0}" != "1" ]; then if [ ! -f /opt/dspark-patches/hotfix-gb10-spin-wait.sh ]; then echo "FATAL: /opt/dspark-patches/hotfix-gb10-spin-wait.sh missing" >&2; exit 1; fi; bash /opt/dspark-patches/hotfix-gb10-spin-wait.sh || exit 1; fi;
         if [ "$${DSPARK_SKIP_HOTFIX:-0}" != "1" ]; then for _hf in hotfix-dsv4-mtp-buffer-50312.sh hotfix-dsv4-skip-topk-49486.sh hotfix-dsv4-dense-prefill-indexer-48407.sh hotfix-dsv4-skip-empty-c128-48957.sh hotfix-dsv4-flashmla-workspace-50298.sh hotfix-dsv4-grammar-advance.sh; do if [ ! -f /opt/dspark-patches/$${_hf} ]; then echo "FATAL: /opt/dspark-patches/$${_hf} missing" >&2; exit 1; fi; bash /opt/dspark-patches/$${_hf} || exit 1; done; fi;
         if [ "$${_dspark_keys_set}" = "1" ] || [ -n "$${VLLM_API_KEY:-}" ]; then bash /opt/dspark-patches/hotfix-vllm-redact-api-key-log.sh || exit 1; bash /opt/dspark-patches/hotfix-vllm-redact-api-key-log.sh --status || exit 1; fi;
-        python3 /opt/hotfix-dsv4-vision-exp.py || exit 1; python3 /opt/hotfix-vllm-empty-encoder-output.py || exit 1; python3 /opt/hotfix-dsv4-issue27-partial-prefill-concurrency.py || exit 1; python3 /opt/hotfix-dsv4-issue43-decode-fairness-and-diag.py || exit 1; python3 /opt/hotfix-dsv4-issue26-hybrid-swa-min.py || exit 1; python3 /opt/hotfix-dsv4-issue133-triton-specialization.py || exit 1; if [ "$${DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX:-0}" != "1" ]; then python3 /opt/hotfix-dsv4-suppress-stops-in-reasoning.py || exit 1; fi; VLLM_QUANTIZATION_ARGS="";
+        if [ "$${DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT:-0}" = "1" ]; then python3 /opt/hotfix-vllm-issue138-responses-history.py || exit 1; fi;
+        python3 /opt/hotfix-dsv4-vision-exp.py || exit 1; if [ "$${DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py || exit 1; fi; python3 /opt/hotfix-vllm-empty-encoder-output.py || exit 1; python3 /opt/hotfix-dsv4-issue27-partial-prefill-concurrency.py || exit 1; python3 /opt/hotfix-dsv4-issue43-decode-fairness-and-diag.py || exit 1; python3 /opt/hotfix-dsv4-issue26-hybrid-swa-min.py || exit 1; python3 /opt/hotfix-dsv4-issue133-triton-specialization.py || exit 1; if [ "$${DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX:-0}" != "1" ]; then python3 /opt/hotfix-dsv4-suppress-stops-in-reasoning.py || exit 1; fi; VLLM_QUANTIZATION_ARGS="";
         if [ "$${DSPARK_ENABLE_ASSISTANT_FINAL_HOTFIX:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-assistant-final-continuation.py || exit 1; fi;
+        if [ "$${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}" = "1" ]; then python3 /opt/hotfix-vllm-issue136-xgrammar-termination.py || exit 1; fi;
         if [ "$${ENABLE_VLLM_GB10_PATCH:-0}" = "1" ]; then
           python3 -m pip install -e /opt/vllm-gb10-hybrid-nvfp4 --no-deps;
           export VLLM_PLUGINS="$${VLLM_PLUGINS:-gb10_hybrid_nvfp4}";

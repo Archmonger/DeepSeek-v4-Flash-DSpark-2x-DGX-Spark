@@ -237,6 +237,50 @@ if { [ "$_dspark_keys_set" = "1" ] || [ -n "${VLLM_API_KEY:-}" ]; } && [ ! -f "$
 fi
 # DSPARK redaction pre-flight (end)
 
+# Issue #138 Responses history compatibility pre-flight (begin).
+# Only the literal 1 enables it; normalize every other spelling to 0 before
+# either Compose rank sees the flag. Relative path overrides are rooted at
+# this checkout.
+case "${DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT:-0}" in
+  1) DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT=1 ;;
+  *) DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT=0 ;;
+esac
+DSPARK_ISSUE138_HOTFIX="${DSPARK_ISSUE138_HOTFIX:-patches/hotfix-vllm-issue138-responses-history.py}"
+case "$DSPARK_ISSUE138_HOTFIX" in
+  /*) ;;
+  *) DSPARK_ISSUE138_HOTFIX="$SCRIPT_DIR/$DSPARK_ISSUE138_HOTFIX" ;;
+esac
+export DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT DSPARK_ISSUE138_HOTFIX
+if [ "$DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT" = "1" ] && [ ! -f "$DSPARK_ISSUE138_HOTFIX" ]; then
+  echo "error: issue #138 Responses history compatibility is enabled but patcher is missing: $DSPARK_ISSUE138_HOTFIX" >&2
+  exit 1
+fi
+# Issue #138 Responses history compatibility pre-flight (end).
+# Issue #141 is exact-1 and default-off. Normalize the effective switch once so
+# head and worker receive the same 0/1 value, and fail before remote side effects
+# when an enabled start cannot mount the selected local patch source.
+DSPARK_ISSUE141_HOTFIX="${DSPARK_ISSUE141_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py}"
+case "$DSPARK_ISSUE141_HOTFIX" in
+  /*) ;;
+  *) DSPARK_ISSUE141_HOTFIX="$SCRIPT_DIR/${DSPARK_ISSUE141_HOTFIX#./}" ;;
+esac
+DSPARK_ISSUE141_EFFECTIVE=0
+if [ "${DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK:-0}" = "1" ]; then
+  DSPARK_ISSUE141_EFFECTIVE=1
+  if [ ! -f "$DSPARK_ISSUE141_HOTFIX" ]; then
+    echo "error: DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK=1 but patch source is missing: $DSPARK_ISSUE141_HOTFIX" >&2
+    exit 1
+  fi
+fi
+DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK="$DSPARK_ISSUE141_EFFECTIVE"
+export DSPARK_ISSUE141_HOTFIX DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK
+DSPARK_ISSUE136_XGRAMMAR_HOTFIX="${DSPARK_ISSUE136_XGRAMMAR_HOTFIX:-$SCRIPT_DIR/patches/hotfix-vllm-issue136-xgrammar-termination.py}"
+if [ "${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}" = "1" ] && { [ ! -f "$DSPARK_ISSUE136_XGRAMMAR_HOTFIX" ] || [ -L "$DSPARK_ISSUE136_XGRAMMAR_HOTFIX" ]; }; then
+  echo "Issue #136 XGrammar hotfix is enabled but its local patcher is missing or not a regular file: $DSPARK_ISSUE136_XGRAMMAR_HOTFIX" >&2
+  exit 1
+fi
+export DSPARK_ISSUE136_XGRAMMAR_HOTFIX DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX
+
 : "${WORKER_HOST:?WORKER_HOST must be set in $ENV_FILE}"
 : "${MASTER_ADDR:?MASTER_ADDR must be set in $ENV_FILE}"
 : "${MASTER_PORT:?MASTER_PORT must be set in $ENV_FILE}"
@@ -273,6 +317,7 @@ REMOTE_WORKER_DIR="$(printf '%q' "$WORKER_DIR")"
 REMOTE_COMPOSE_FILE="$REMOTE_WORKER_DIR/docker-compose.dspark.yml"
 REMOTE_ENV_FILE="$REMOTE_WORKER_DIR/.env.dspark"
 REMOTE_VLLM_GB10_PATCH_DIR="$REMOTE_WORKER_DIR/vllm_patch_gb10"
+REMOTE_ISSUE136_ENABLE="$(printf '%q' "${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}")"
 REMOTE_COMPOSE="cd $REMOTE_WORKER_DIR && env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS COMPOSE_DISABLE_ENV_FILE=1"
 STARTUP_LOG_SINCE=""
 
@@ -739,7 +784,9 @@ compose_base() {
 }
 
 remote_compose() {
-  ssh "$WORKER_HOST" "$REMOTE_COMPOSE $(remote_nccl_env) $*"
+  # The head may use an absolute local mount override; the worker always uses
+  # the canonical synced relative path.
+  ssh "$WORKER_HOST" "$REMOTE_COMPOSE DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX=$REMOTE_ISSUE136_ENABLE DSPARK_ISSUE136_XGRAMMAR_HOTFIX='./patches/hotfix-vllm-issue136-xgrammar-termination.py' $(remote_nccl_env) $*"
 }
 
 log_since() {
@@ -801,7 +848,14 @@ print_resolved_profile() {
   echo "  mtp speculative tokens: ${MTP_NUM_TOKENS:-6} (Vision-Exp: >=5 and divisible by 3)"
   echo "  default thinking: $DEFAULT_THINKING (off/low/high/max)"
   echo "  issue31 GPU thinking_token_budget hotfix: ${DSPARK_ENABLE_ISSUE31_GPU_HOTFIX:-0} (0=stock V2 / 1=apply)"
+  if [ "$DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT" = "1" ]; then
+    echo "  issue138 Responses history compatibility: 1 (apply)"
+  else
+    echo "  issue138 Responses history compatibility: 0 (stock)"
+  fi
+  echo "  issue136 XGrammar termination hotfix: ${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0} (0=stock / 1=preflight+apply)"
   echo "  issue133 Triton specialization hotfix: will apply on start"
+  echo "  issue141 sparse-MLA fixed-64 workaround: $DSPARK_ISSUE141_EFFECTIVE (0=stock / 1=apply)"
   echo "  cudagraph capture size: $(( ${MAX_NUM_SEQS:-6} * (${MTP_NUM_TOKENS:-6} + 1) ))"
   echo "  API bind: $VLLM_HOST:$VLLM_PORT"
   echo "  API probe: $API_URL"
@@ -851,7 +905,7 @@ validate_compose() {
   echo "Validating head compose config..."
   compose_base 0 "" config --quiet
   echo "Validating worker compose config..."
-  remote_compose "NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.dspark.yml config --quiet"
+  remote_compose "NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK='$DSPARK_ISSUE141_EFFECTIVE' DSPARK_ISSUE141_HOTFIX='./patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT='$DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT' DSPARK_ISSUE138_HOTFIX='./patches/hotfix-vllm-issue138-responses-history.py' docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.dspark.yml config --quiet"
 }
 
 need_cmd docker
@@ -1011,6 +1065,11 @@ if [ -f "$DSPARK_ISSUE133_HOTFIX" ]; then
   ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
   scp "$DSPARK_ISSUE133_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-issue133-triton-specialization.py"
 fi
+if [ -f "$DSPARK_ISSUE141_HOTFIX" ]; then
+  echo "Syncing Issue #141 sparse-MLA decode workaround to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_ISSUE141_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py"
+fi
 DSPARK_SUPPRESS_STOPS_HOTFIX="${DSPARK_SUPPRESS_STOPS_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-suppress-stops-in-reasoning.py}"
 if [ -f "$DSPARK_SUPPRESS_STOPS_HOTFIX" ]; then
   echo "Syncing suppress-stops-in-reasoning hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
@@ -1038,6 +1097,16 @@ if [ -d "$SCRIPT_DIR/patches/vision_exp" ]; then
   ssh "$WORKER_HOST" "rm -rf '${REMOTE_WORKER_DIR}/patches/vision_exp' && mkdir -p '${REMOTE_WORKER_DIR}/patches/vision_exp'"
   scp -r "$SCRIPT_DIR/patches/vision_exp/." "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/vision_exp/"
 fi
+if [ -f "$DSPARK_ISSUE138_HOTFIX" ]; then
+  echo "Syncing issue #138 Responses history compatibility patcher to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_ISSUE138_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-issue138-responses-history.py"
+fi
+if [ -f "$DSPARK_ISSUE136_XGRAMMAR_HOTFIX" ] && [ ! -L "$DSPARK_ISSUE136_XGRAMMAR_HOTFIX" ]; then
+  echo "Syncing Issue #136 XGrammar termination hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_ISSUE136_XGRAMMAR_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-issue136-xgrammar-termination.py"
+fi
 if [ "$ENABLE_VLLM_GB10_PATCH" = "1" ]; then
   echo "Syncing GB10 vLLM patch to ${WORKER_HOST}:${WORKER_DIR}/vllm_patch_gb10"
   tar -C "$VLLM_GB10_PATCH_DIR" \
@@ -1048,8 +1117,15 @@ if [ "$ENABLE_VLLM_GB10_PATCH" = "1" ]; then
 fi
 validate_compose
 
+if [ "${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}" = "1" ]; then
+  echo "Checking Issue #136 XGrammar compatibility on the worker before either rank starts..."
+  remote_compose "NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.dspark.yml run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-issue136-xgrammar-termination.py --check"
+  echo "Checking Issue #136 XGrammar compatibility on the head before either rank starts..."
+  compose_base 0 "" run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-issue136-xgrammar-termination.py --check
+fi
+
 echo "Starting DSpark worker on ${WORKER_HOST}..."
-remote_compose "NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.dspark.yml up -d"
+remote_compose "NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK='$DSPARK_ISSUE141_EFFECTIVE' DSPARK_ISSUE141_HOTFIX='./patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT='$DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT' DSPARK_ISSUE138_HOTFIX='./patches/hotfix-vllm-issue138-responses-history.py' docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.dspark.yml up -d"
 
 echo "Starting DSpark head..."
 compose_base 0 "" up -d
