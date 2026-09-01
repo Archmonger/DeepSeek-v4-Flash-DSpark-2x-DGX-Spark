@@ -14,6 +14,7 @@
 
 ### Fixed
 
+- **Vision-Exp `as_pil` no longer turns RGB CHW with width 1/3/4 into a black image**: the old last-axis `{1,3,4}` ⇒ HWC rule treated `np.transpose(pil, (2,0,1))` of a 4-wide RGB array as 3-pixel-tall RGBA. Leading C=3 is now CHW (unit test `(3, 6, 4)` → `(0, 22, 0)`). Normal photos (W∉{1,3,4}) were already correct. Restart both ranks so `/opt/dspark-patches/vision_exp` reloads.
 - **Vision-Exp role check no longer 400s on the literal substring `<image>` ([Issue #165](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/165))**: system/assistant text that *mentions* the tag (opencode and other agent prompts) is allowed; only a paired `<image>…</image>` reference or a real `image`/`image_url` part is treated as an image. Recreate both containers after pull (`./stop` then `./start`); restart keeps the old encoder bytes.
 
 ### Changed

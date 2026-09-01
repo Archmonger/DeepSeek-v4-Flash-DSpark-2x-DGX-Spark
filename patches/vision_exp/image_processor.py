@@ -12,7 +12,7 @@ import io
 import math
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, TYPE_CHECKING
+from typing import Any, Sequence, TYPE_CHECKING
 from urllib.request import urlopen
 
 if TYPE_CHECKING:
@@ -105,6 +105,27 @@ def is_unregistered_router_bias(name: str, param_names: Any) -> bool:
     )
 
 
+def looks_like_chw(shape: Sequence[int]) -> bool:
+    """True when a 3-D array should be treated as C×H×W rather than H×W×C.
+
+    Last axis in ``{1, 3, 4}`` also looks like HWC. The old check therefore
+    skipped transpose whenever width was 1, 3, or 4, so RGB CHW from
+    ``np.transpose(pil, (2, 0, 1))`` of a 4-wide image became a black
+    3-pixel-tall RGBA. Prefer CHW when the leading axis is RGB (C=3), which
+    matches vLLM's layout and the ``(3, 6, 4)`` unit test. Gray/RGBA leading
+    1/4 still use the unambiguous rule (last axis not a channel count).
+    """
+    if len(shape) != 3:
+        return False
+    channels = (1, 3, 4)
+    c, _h, w = int(shape[0]), int(shape[1]), int(shape[2])
+    if c not in channels:
+        return False
+    if w not in channels:
+        return True
+    return c == 3
+
+
 def as_pil(item: Any) -> PILImage.Image:
     """Normalize vLLM image items (PIL, HWC/CHW array, tensor, dict) to RGB PIL."""
     Image, _ImageOps = _pil()
@@ -133,7 +154,7 @@ def as_pil(item: Any) -> PILImage.Image:
     arr = np.asarray(array)
     if arr.ndim == 2:
         arr = np.stack([arr, arr, arr], axis=-1)
-    elif arr.ndim == 3 and arr.shape[-1] not in (1, 3, 4) and arr.shape[0] in (1, 3, 4):
+    elif looks_like_chw(arr.shape):
         arr = np.transpose(arr, (1, 2, 0))
     if arr.ndim != 3:
         raise TypeError(f"Unsupported image array shape: {arr.shape!r}")
