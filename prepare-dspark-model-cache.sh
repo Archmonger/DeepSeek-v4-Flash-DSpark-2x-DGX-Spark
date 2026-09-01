@@ -9,7 +9,8 @@ usage() {
 Usage: ./prepare-dspark-model-cache.sh [--official | --abliterated] [--yes]
 
 Downloads DeepSeek-V4-Flash-Vision-Exp weights (official or abliterated) into HF_CACHE
-on this node, then optionally on the worker.
+on this node. With DSPARK_WORKER_HF_NFS=1 (default) the worker is not downloaded —
+start exports this cache over NFS. Set DSPARK_WORKER_HF_NFS=0 to also copy onto the worker.
 
   --official      Download deepseek-ai/DeepSeek-V4-Flash-Vision-Exp (sets ABLITERATED=0)
   --abliterated   Download Keys abliterated weights (sets ABLITERATED=1)
@@ -338,13 +339,19 @@ verify_cache "$DSPARK_MODEL" "${DSPARK_REVISION:-}"
 
 if [ "${PREPARE_WORKER:-1}" = "1" ]; then
   : "${WORKER_HOST:?WORKER_HOST must be set in $ENV_FILE or environment}"
-  WORKER_DIR="${WORKER_SCRIPT_DIR:-${WORKER_DIR:-$SCRIPT_DIR}}"
-  WORKER_HF_CACHE="${WORKER_HF_CACHE:-$HF_CACHE}"
-  need_cmd ssh
-  need_cmd scp
-  ssh -o BatchMode=yes -o ConnectTimeout=10 "$WORKER_HOST" "mkdir -p '$WORKER_DIR' '$WORKER_HF_CACHE'"
-  verify_worker_image
-  scp "$SCRIPT_DIR/prepare-dspark-model-cache.sh" "${WORKER_HOST}:${WORKER_DIR}/prepare-dspark-model-cache.sh"
-  scp "$ENV_FILE" "${WORKER_HOST}:${WORKER_DIR}/.env.dspark"
-  ssh "$WORKER_HOST" "cd '$WORKER_DIR' && chmod +x ./prepare-dspark-model-cache.sh && env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS ENV_FILE='.env.dspark' THIS_NODE_HF_CACHE='$WORKER_HF_CACHE' PREPARE_WORKER=0 ABLITERATED='$ABLITERATED' DSPARK_REVISION='${DSPARK_REVISION:-}' DSPARK_REVISION_ABLITERATED='${DSPARK_REVISION_ABLITERATED:-}' ${WORKER_HF_TOKEN_ENV} ./prepare-dspark-model-cache.sh --yes"
+  if [ "${DSPARK_WORKER_HF_NFS:-1}" = "1" ]; then
+    echo "prepare: DSPARK_WORKER_HF_NFS=1 — checkpoint stays on this node ($HF_CACHE)."
+    echo "prepare: worker will mount it over NFS at start (no second Hub download)."
+    echo "prepare: set DSPARK_WORKER_HF_NFS=0 to copy weights onto the worker instead."
+  else
+    WORKER_DIR="${WORKER_SCRIPT_DIR:-${WORKER_DIR:-$SCRIPT_DIR}}"
+    WORKER_HF_CACHE="${WORKER_HF_CACHE:-$HF_CACHE}"
+    need_cmd ssh
+    need_cmd scp
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "$WORKER_HOST" "mkdir -p '$WORKER_DIR' '$WORKER_HF_CACHE'"
+    verify_worker_image
+    scp "$SCRIPT_DIR/prepare-dspark-model-cache.sh" "${WORKER_HOST}:${WORKER_DIR}/prepare-dspark-model-cache.sh"
+    scp "$ENV_FILE" "${WORKER_HOST}:${WORKER_DIR}/.env.dspark"
+    ssh "$WORKER_HOST" "cd '$WORKER_DIR' && chmod +x ./prepare-dspark-model-cache.sh && env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS ENV_FILE='.env.dspark' THIS_NODE_HF_CACHE='$WORKER_HF_CACHE' PREPARE_WORKER=0 ABLITERATED='$ABLITERATED' DSPARK_REVISION='${DSPARK_REVISION:-}' DSPARK_REVISION_ABLITERATED='${DSPARK_REVISION_ABLITERATED:-}' ${WORKER_HF_TOKEN_ENV} ./prepare-dspark-model-cache.sh --yes"
+  fi
 fi

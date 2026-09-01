@@ -7,6 +7,24 @@ COMPOSE_FILE="${COMPOSE_FILE:-$SCRIPT_DIR/docker-compose.dspark.yml}"
 PROJECT_NAME="${PROJECT_NAME:-deepseek-v4-flash}"
 LEGACY_PROJECT_NAME="${LEGACY_PROJECT_NAME:-$(basename "$SCRIPT_DIR" | tr '[:upper:]' '[:lower:]')}"
 
+STOP_NFS=0
+usage() {
+  cat <<'EOF'
+Usage: ./stop-deepseek-v4-flash-dspark.sh [--nfs]
+
+  (default)  Stop vLLM on worker then head. Leaves the NFS share up.
+  --nfs      Also stop the DSpark-owned NFS exporter (dspark-nfs) and remove
+             the worker dspark-hf volume. Does not touch vllm-fn-nfs (Qwen).
+EOF
+}
+for arg in "$@"; do
+  case "$arg" in
+    --nfs) STOP_NFS=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown argument: $arg (try --help)" >&2; exit 2 ;;
+  esac
+done
+
 if [ -f "$ENV_FILE" ]; then
   set -a
   # shellcheck disable=SC1090
@@ -21,6 +39,15 @@ cd "$SCRIPT_DIR"
 WORKER_DIR="${WORKER_SCRIPT_DIR:-${WORKER_DIR:-$SCRIPT_DIR}}"
 WORKER_HF_CACHE="${WORKER_HF_CACHE:-${HF_CACHE:-}}"
 WORKER_VLLM_HOST_IP="${WORKER_VLLM_HOST_IP:-}"
+DSPARK_WORKER_HF_NFS="${DSPARK_WORKER_HF_NFS:-1}"
+NFS_VOLUME="${NFS_VOLUME:-dspark-hf}"
+NFS_CONTAINER="${NFS_CONTAINER:-dspark-nfs}"
+WORKER_COMPOSE_FILES="-f docker-compose.dspark.yml"
+WORKER_HF_COMPOSE_ENV="HF_CACHE='$WORKER_HF_CACHE'"
+if [ "$DSPARK_WORKER_HF_NFS" = "1" ]; then
+  WORKER_COMPOSE_FILES="-f docker-compose.dspark.yml -f docker-compose.dspark-nfs.override.yml"
+  WORKER_HF_COMPOSE_ENV="HF_CACHE='$NFS_VOLUME' DSPARK_JIT_CACHE='$WORKER_HF_CACHE'"
+fi
 
 # A stop that cannot reach the worker must not report success: a powered-down
 # worker resurrects its stale rank (compose restart: unless-stopped) the next
@@ -125,10 +152,10 @@ stop_main_worker() {
       echo 'Stopping DSpark on worker $WORKER_HOST (project $project)...'
       docker ps -aq --filter 'name=${project}-vllm-dspark' | xargs -r docker rm -f >/dev/null 2>&1 || true
       env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS \
-        COMPOSE_DISABLE_ENV_FILE=1 HF_CACHE='$WORKER_HF_CACHE' \
+        COMPOSE_DISABLE_ENV_FILE=1 $WORKER_HF_COMPOSE_ENV \
         VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' NODE_RANK=1 HEADLESS=1 \
         docker compose -p '$project' --env-file .env.dspark \
-          -f docker-compose.dspark.yml down --remove-orphans -t 1 2>&1 \
+          $WORKER_COMPOSE_FILES down --remove-orphans -t 1 2>&1 \
           | grep -v 'No resource found to remove for project' || true
     else
       echo 'No DSpark worker resources for project $project on $WORKER_HOST; skipping.'
@@ -154,6 +181,19 @@ stop_project() {
 stop_project "$PROJECT_NAME"
 if [ "$LEGACY_PROJECT_NAME" != "$PROJECT_NAME" ]; then
   stop_project "$LEGACY_PROJECT_NAME"
+fi
+
+if [ "$STOP_NFS" = "1" ]; then
+  # shellcheck source=files/nfs-share.sh
+  source "$SCRIPT_DIR/files/nfs-share.sh"
+  nfs_stop_owned_server || STOP_FAILURES=$((STOP_FAILURES + 1))
+  if [ "${WORKER_REACHABLE:-0}" = "1" ]; then
+    echo "Removing worker NFS volume ($NFS_VOLUME)..."
+    ssh "$WORKER_HOST" "docker volume rm $NFS_VOLUME 2>/dev/null && echo '  Worker volume: removed.' || echo '  Worker volume: not present.'" \
+      || stop_warn "worker volume rm failed on ${WORKER_HOST}"
+  else
+    stop_warn "worker ${WORKER_HOST} unreachable: NFS volume $NFS_VOLUME not removed"
+  fi
 fi
 
 if [ "$STOP_FAILURES" -gt 0 ]; then
