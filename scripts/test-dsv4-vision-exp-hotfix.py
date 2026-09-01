@@ -16,9 +16,12 @@ from vision_exp.image_processor import (  # noqa: E402
     IMAGE_START,
     as_pil,
     build_image_block,
+    compress_pad_tokens,
     grid_tokens,
+    image_block_num_tokens,
     is_unregistered_router_bias,
     is_vision_exp_weight_name,
+    salt_mm_image_hash,
     vision_args_from_config,
 )
 
@@ -59,6 +62,40 @@ class VisionExpLayoutTest(unittest.TestCase):
         n_h, n_w, n_tok = grid_tokens(756, 756, 14, 3)
         self.assertEqual((n_h, n_w), (18, 18))
         self.assertLessEqual(n_tok, 384)
+
+    def test_issue172_40x19_block_lengths_are_122_plus_compress_pad(self):
+        n_h, n_w, base = grid_tokens(19 * 14, 40 * 14, 14, 3)
+        self.assertEqual((n_h, n_w, base), (7, 14, 122))
+        expected = {0: 125, 1: 124, 2: 123, 3: 122}
+        for start, ntok in expected.items():
+            self.assertEqual(compress_pad_tokens(start), 3 - start)
+            self.assertEqual(image_block_num_tokens(7, 14, start), ntok)
+            self.assertEqual(image_block_num_tokens(7, 14, start + 4), ntok)
+
+    def test_issue172_encoder_cache_hash_includes_block_length(self):
+        a = salt_mm_image_hash("deadbeef", 125)
+        b = salt_mm_image_hash("deadbeef", 124)
+        self.assertNotEqual(a, b)
+        self.assertTrue(a.endswith("vlexp-ntok125"))
+        self.assertTrue(b.endswith("vlexp-ntok124"))
+
+    def test_issue172_processor_salts_encoder_cache_hash(self):
+        text = (ROOT / "patches" / "vision_exp" / "processor.py").read_text()
+        self.assertIn("salt_mm_image_hash", text)
+        self.assertIn("_salt_image_mm_hashes", text)
+        self.assertIn("mm_info._replace(hashes=salted)", text)
+
+    def test_issue172_embed_rejects_placeholder_mismatch(self):
+        text = (ROOT / "patches" / "vision_exp" / "apply.py").read_text()
+        self.assertIn("placeholder/embedding mismatch", text)
+        self.assertIn("issue #172", text)
+
+    @unittest.skipUnless(HAS_TORCH, "torch not installed on this host")
+    def test_issue172_build_image_block_matches_num_tokens_helper(self):
+        for start in range(8):
+            types, perm = build_image_block(7, 14, start_pos=start)
+            self.assertEqual(int(types.numel()), image_block_num_tokens(7, 14, start))
+            self.assertEqual(int(perm.numel()), 7 * 14)
 
     @unittest.skipUnless(HAS_TORCH, "torch not installed on this host")
     def test_build_image_block_starts_and_ends(self):
