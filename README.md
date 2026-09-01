@@ -25,10 +25,11 @@ tables, method, historical lanes). Checkpoint / encoder:
 ## Quick start
 
 Run everything from the **head** node. You need two DGX Sparks, RoCE/NCCL
-working, and the same image on both. **Weights live only on the head**;
-the worker mounts the head HuggingFace cache over NFSv4 on the ConnectX
-link (same pattern as Qwen3.8-Flash-vLLM). Set `DSPARK_WORKER_HF_NFS=0`
-to keep a local worker copy instead.
+working, and the same image on both. By default each node has its own
+HuggingFace checkpoint (`prepare` copies onto the worker). Set
+`DSPARK_WORKER_HF_NFS=1` to keep weights only on the head: the worker
+mounts that cache over NFSv4 on the ConnectX link (same pattern as
+Qwen3.8-Flash-vLLM).
 
 1. **Env**
 
@@ -39,7 +40,8 @@ to keep a local worker copy instead.
    Set at least: `WORKER_HOST`, `MASTER_ADDR`, `NCCL_IB_HCA`,
    `NCCL_SOCKET_IFNAME` (and matching `TP_` / `GLOO_` IF names),
    `VLLM_HOST_IP`, `WORKER_VLLM_HOST_IP`, `HF_CACHE`.
-   `WORKER_HF_CACHE` is the worker's local JIT cache when NFS is on (default).
+   `WORKER_HF_CACHE` is the worker checkpoint path. When `DSPARK_WORKER_HF_NFS=1`,
+   it is the worker's local JIT overlay on the NFS mount.
    If the worker checkout is not the same path, set `WORKER_DIR` /
    `WORKER_SCRIPT_DIR`.
 
@@ -77,8 +79,10 @@ to keep a local worker copy instead.
    Use `--abliterated` or `--yes` (reads `ABLITERATED` from `.env.dspark`).
    Abliterated weights are gated (`HF_TOKEN`). Prepare forces HF
    online even if `HF_HUB_OFFLINE=1`, then you can serve offline.
-   Default `DSPARK_WORKER_HF_NFS=1` does **not** download onto the worker;
-   `./start-…` exports `HF_CACHE` over NFS. After the head cache is complete, keep `HF_HUB_OFFLINE=1`.
+   Default `DSPARK_WORKER_HF_NFS=0` also downloads onto the worker. After
+   the cache is complete, keep `HF_HUB_OFFLINE=1`. See
+   [Worker weights over NFS](#worker-weights-over-nfs-optional) to skip the
+   second copy.
 
 4. **Optional CPU gates** (no GPU; will not measure tok/s)
 
@@ -173,8 +177,8 @@ cluster wiring, not product switches. Full Anemll vs Stage-C matrix:
 | `DSPARK_REVISION_ABLITERATED` | empty | Abliterated pin. Empty = tip of that repo. |
 | `DSPARK_MODEL_OFFICIAL` / `DSPARK_MODEL_ABLITERATED` | the two HF ids above | Override only if you intentionally swap the repo id. Do not point this at the 0731 ablit dump — that drops `image_url`. |
 | `SERVED_MODEL_NAME` | `deepseek-v4-flash-vision-exp` | Name clients send as `model`. |
-| `HF_HUB_OFFLINE` | `1` | `1` after the **head** cache is warm. Prepare forces online for the download. Worker reads the same files over NFS. |
-| `DSPARK_WORKER_HF_NFS` | `1` | **`1`** = worker mounts head `HF_CACHE` over NFSv4 on ConnectX (no local checkpoint). **`0`** = bind `WORKER_HF_CACHE` as a second copy (`prepare` then downloads on the worker). |
+| `HF_HUB_OFFLINE` | `1` | `1` after the hub cache is warm. Prepare forces online for the download. |
+| `DSPARK_WORKER_HF_NFS` | `0` | **`0`** (default) = bind `WORKER_HF_CACHE` as a second copy (`prepare` downloads on the worker). **`1`** = worker mounts head `HF_CACHE` over NFSv4 on ConnectX (no local checkpoint). |
 
 Flip `ABLITERATED` like this:
 
@@ -188,6 +192,25 @@ ABLITERATED=1
 ```
 
 `--official` writes `ABLITERATED=0`; `--abliterated` writes `1`.
+
+### Worker weights over NFS (optional)
+
+Default is **off**: `DSPARK_WORKER_HF_NFS=0`. `prepare` downloads the checkpoint
+onto the worker as well.
+
+Set `DSPARK_WORKER_HF_NFS=1` in `.env.dspark` to skip that second Hub download.
+Start then exports the head `HF_CACHE` via NFSv4 on `NCCL_SOCKET_IFNAME`
+(ConnectX). A live exporter on that address is reused (for example Qwen's
+`vllm-fn-nfs`); otherwise start brings up `dspark-nfs`. The worker Docker
+volume `dspark-hf` mounts the share read-only. Triton, TileLang, vLLM,
+FlashInfer, CuTe, and NCCL-FR caches stay on the worker host as overlays
+under `WORKER_HF_CACHE`. `./stop-deepseek-v4-flash-dspark.sh --nfs` tears
+down only `dspark-nfs`, not Qwen's share.
+
+```env
+DSPARK_WORKER_HF_NFS=1
+# NFS_SERVER_IP=10.0.22.1   # optional; default is IPv4 on NCCL_SOCKET_IFNAME
+```
 
 If official Vision-Exp is already cached, overlay the 26 edited shards
 (~87 GiB) instead of re-fetching the full ~157 GiB dump:
@@ -564,7 +587,7 @@ only when the corresponding live behavior is outside the test scope.
 | `.env.dspark.example` | Cluster template |
 | `docker-compose.dspark.yml` | Anemll serve (installs Vision-Exp encoder + hotfixes) |
 | `start-` / `stop-` / `status-` / `logs-` / `smoke-*.sh` | Two-node ops (`stop --nfs` also tears down `dspark-nfs`, not Qwen's `vllm-fn-nfs`) |
-| `prepare-dspark-model-cache.sh` | Vision-Exp weights on the **head** (`--official` / `--abliterated`). Worker uses NFS unless `DSPARK_WORKER_HF_NFS=0`. |
+| `prepare-dspark-model-cache.sh` | Vision-Exp weights on both nodes (`--official` / `--abliterated`). With `DSPARK_WORKER_HF_NFS=1`, head only; worker mounts over NFS. |
 | `files/nfs-share.sh` / `files/nfs-server/` | NFSv4 exporter for the head HF cache (reuses a live share if one is already up) |
 | `docker-compose.dspark-nfs.override.yml` | Worker: named NFS volume + local JIT overlays |
 | `scripts/overlay-vision-exp-ablit-cache.py` | Hardlink official Vision-Exp blobs + copy the 26 ablit shards |
