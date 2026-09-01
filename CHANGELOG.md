@@ -4,6 +4,8 @@
 
 - **Vision-Exp role check no longer 400s when a tool result quotes image markers ([Issue #167](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/167))**: `tool` / `function` message *text* is opaque (grep/cat of the hotfix, commit messages that mention `<image>`). Only a structured `image` / `image_url` part in those roles is rejected. System/assistant still use the issue #165 paired-tag + placeholder scan. Recreate both containers after pull (`./stop` then `./start`); restart keeps the old encoder bytes.
 
+- **Vision-Exp 40×19 image grids no longer merge 124 embeddings into 125 placeholders ([Issue #172](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/172))**: N-layout block length is `122 + compress_pad` and `compress_pad` depends on `start_pos % 4`. vLLM's encoder cache hashed image bytes only, so the same photo at a shifted offset reused the wrong pad and killed EngineCore. Processor hashes are now salted with `num_tokens`; `embed_input_ids` rejects a count mismatch instead of doing a strict index-put. Recreate both containers after pull. Independent Docker `unless-stopped` restarts can still split a TP=2 pair (`DSPARK_RESTART_POLICY=no` + `./stop`/`./start` together).
+
 ## 2026-08-31
 
 ### Fixed

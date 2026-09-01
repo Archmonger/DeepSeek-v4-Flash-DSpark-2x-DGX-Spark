@@ -122,6 +122,15 @@ def merge_one_image(
     return block
 
 
+def _mm_embed_rows(multimodal_embeddings: Any) -> int:
+    if hasattr(multimodal_embeddings, "shape"):
+        return int(multimodal_embeddings.shape[0])
+    total = 0
+    for part in multimodal_embeddings:
+        total += _mm_embed_rows(part)
+    return total
+
+
 def embed_multimodal(self, **kwargs: object):
     pixel_values = kwargs.get("pixel_values")
     if pixel_values is None:
@@ -261,10 +270,20 @@ def apply_vision_exp(
         from vllm.model_executor.models.interfaces import _require_is_multimodal
         from vllm.model_executor.models.utils import _merge_multimodal_embeddings
 
+        is_mm = _require_is_multimodal(is_multimodal)
+        n_placeholders = int(is_mm.sum().item()) if hasattr(is_mm, "sum") else int(is_mm)
+        n_embeds = _mm_embed_rows(multimodal_embeddings)
+        if n_placeholders != n_embeds:
+            raise ValueError(
+                "Vision-Exp placeholder/embedding mismatch: "
+                f"{n_embeds} multimodal tokens vs {n_placeholders} placeholders. "
+                "Image block length depends on start_pos%4; a content-only encoder "
+                "cache hit can reuse the wrong compress_pad (issue #172)."
+            )
         return _merge_multimodal_embeddings(
             inputs_embeds=text_embeds,
             multimodal_embeddings=multimodal_embeddings,
-            is_multimodal=_require_is_multimodal(is_multimodal),
+            is_multimodal=is_mm,
         )
 
     DeepseekV4ForCausalLM.embed_input_ids = embed_input_ids
