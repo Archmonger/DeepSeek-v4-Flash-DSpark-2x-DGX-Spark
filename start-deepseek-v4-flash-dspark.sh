@@ -290,6 +290,13 @@ VLLM_HOST_IP="${VLLM_HOST_IP:-$MASTER_ADDR}"
 WORKER_VLLM_HOST_IP="${WORKER_VLLM_HOST_IP:-$WORKER_HOST}"
 WORKER_DIR="${WORKER_SCRIPT_DIR:-${WORKER_DIR:-$SCRIPT_DIR}}"
 WORKER_HF_CACHE="${WORKER_HF_CACHE:-${HF_CACHE:-}}"
+# Worker loads hub weights from the head HF cache over NFS (ConnectX), same
+# pattern as Qwen3.8-Flash-vLLM. JIT caches stay on the worker host path.
+# Set DSPARK_WORKER_HF_NFS=0 to bind a local worker copy instead.
+DSPARK_WORKER_HF_NFS="${DSPARK_WORKER_HF_NFS:-1}"
+NFS_VOLUME="${NFS_VOLUME:-dspark-hf}"
+NFS_CONTAINER="${NFS_CONTAINER:-dspark-nfs}"
+NFS_OVERRIDE_FILE="${NFS_OVERRIDE_FILE:-$SCRIPT_DIR/docker-compose.dspark-nfs.override.yml}"
 # Per-node CX7/RoCE pins (3-node ring: facing ports often differ by hostname).
 # Set WORKER_NCCL_* in the head .env; start script injects them on remote compose.
 # Do not put WORKER_* first in docker-compose substitution — that is not rank-aware.
@@ -335,6 +342,20 @@ host_without_user() {
     printf '%s' "$h"
   fi
 }
+
+WORKER_COMPOSE_FILES="-f docker-compose.dspark.yml"
+WORKER_HF_COMPOSE_ENV="HF_CACHE='$WORKER_HF_CACHE'"
+if [ "$DSPARK_WORKER_HF_NFS" = "1" ]; then
+  IFACE="${NFS_IFACE:-$NCCL_SOCKET_IFNAME}"
+  HF_CACHE_DIR="${HF_CACHE:-$HOME/.cache/huggingface}"
+  WORKER_IP="$(host_without_user "$WORKER_HOST")"
+  # shellcheck source=files/nfs-share.sh
+  source "$SCRIPT_DIR/files/nfs-share.sh"
+  nfs_detect_server_ip
+  WORKER_COMPOSE_FILES="-f docker-compose.dspark.yml -f docker-compose.dspark-nfs.override.yml"
+  WORKER_HF_COMPOSE_ENV="HF_CACHE='$NFS_VOLUME' DSPARK_JIT_CACHE='$WORKER_HF_CACHE'"
+  REMOTE_NFS_OVERRIDE_FILE="$REMOTE_WORKER_DIR/docker-compose.dspark-nfs.override.yml"
+fi
 
 ipv4_to_gid_suffix() {
   # IPv4-mapped RoCEv2 GID ends with ffff:aabb:ccdd for a.b.c.d
@@ -865,7 +886,12 @@ print_resolved_profile() {
   echo "  head NCCL_IB_GID_INDEX: ${NCCL_IB_GID_INDEX:-}"
   echo "  worker NCCL_IB_GID_INDEX: ${WORKER_NCCL_IB_GID_INDEX:-}"
   echo "  worker dir: $WORKER_DIR"
-  echo "  worker cache: ${WORKER_HF_CACHE:-${HF_CACHE:-}}"
+  if [ "$DSPARK_WORKER_HF_NFS" = "1" ]; then
+    echo "  worker weights: NFS $NFS_VOLUME from ${NFS_SERVER_IP:-$IFACE} (head $HF_CACHE_DIR, no worker copy)"
+    echo "  worker JIT cache: $WORKER_HF_CACHE (local overlays on the NFS mount)"
+  else
+    echo "  worker cache: ${WORKER_HF_CACHE:-${HF_CACHE:-}} (local bind, DSPARK_WORKER_HF_NFS=0)"
+  fi
   echo "  GB10 vLLM patch: $ENABLE_VLLM_GB10_PATCH"
   if [ -f "$SCRIPT_DIR/patches/hotfix-nvfp4-ds-mla-issue22.sh" ]; then
     if [ "${DSPARK_SKIP_ISSUE22_HOTFIX:-0}" = "1" ]; then
@@ -903,7 +929,7 @@ validate_compose() {
   echo "Validating head compose config..."
   compose_base 0 "" config --quiet
   echo "Validating worker compose config..."
-  remote_compose "NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK='$DSPARK_ISSUE141_EFFECTIVE' DSPARK_ISSUE141_HOTFIX='./patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT='$DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT' DSPARK_ISSUE138_HOTFIX='./patches/hotfix-vllm-issue138-responses-history.py' docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.dspark.yml config --quiet"
+  remote_compose "NODE_RANK=1 HEADLESS=1 $WORKER_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK='$DSPARK_ISSUE141_EFFECTIVE' DSPARK_ISSUE141_HOTFIX='./patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT='$DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT' DSPARK_ISSUE138_HOTFIX='./patches/hotfix-vllm-issue138-responses-history.py' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER_COMPOSE_FILES config --quiet"
 }
 
 need_cmd docker
@@ -976,6 +1002,10 @@ print_resolved_profile
 echo "Syncing DSpark deployment files to ${WORKER_HOST}:${WORKER_DIR}"
 ssh "$WORKER_HOST" "mkdir -p $REMOTE_WORKER_DIR"
 scp "$COMPOSE_FILE" "${WORKER_HOST}:${REMOTE_COMPOSE_FILE}"
+if [ "$DSPARK_WORKER_HF_NFS" = "1" ]; then
+  [ -f "$NFS_OVERRIDE_FILE" ] || { echo "Missing NFS compose override: $NFS_OVERRIDE_FILE" >&2; exit 1; }
+  scp "$NFS_OVERRIDE_FILE" "${WORKER_HOST}:${REMOTE_NFS_OVERRIDE_FILE}"
+fi
 # Stream into a private sibling, then atomically replace the worker env file.
 ssh "$WORKER_HOST" "
   set -euo pipefail
@@ -1113,17 +1143,38 @@ if [ "$ENABLE_VLLM_GB10_PATCH" = "1" ]; then
     --exclude='*.pyc' \
     -cf - . | ssh "$WORKER_HOST" "mkdir -p $REMOTE_VLLM_GB10_PATCH_DIR && tar -C $REMOTE_VLLM_GB10_PATCH_DIR --no-overwrite-dir -xf -"
 fi
+
+if [ "$DSPARK_WORKER_HF_NFS" = "1" ]; then
+  echo "Sharing head HF cache over NFS for the worker (no local checkpoint copy)..."
+  nfs_ensure_server
+  if [ -z "$WORKER_HF_CACHE" ] || [ "$WORKER_HF_CACHE" = "${HF_CACHE:-}" ]; then
+    WORKER_HF_CACHE="$(ssh "$WORKER_HOST" 'printf %s "$HOME/.cache/huggingface"')"
+    [ -n "$WORKER_HF_CACHE" ] || { echo "Could not resolve worker HOME for JIT cache overlays." >&2; exit 1; }
+    WORKER_HF_COMPOSE_ENV="HF_CACHE='$NFS_VOLUME' DSPARK_JIT_CACHE='$WORKER_HF_CACHE'"
+    echo "Worker JIT cache defaulted to $WORKER_HF_CACHE"
+  fi
+  nfs_ensure_worker_jit_dirs "$WORKER_HF_CACHE"
+  nfs_ensure_worker_volume recreate
+  _nfs_model_rel="hub/models--$(printf '%s' "$DSPARK_MODEL" | sed 's|/|--|g')"
+  if nfs_worker_has_model "$_nfs_model_rel"; then
+    echo "Worker sees $_nfs_model_rel over NFS ($NFS_VOLUME)."
+  else
+    echo "WORKER cannot see $_nfs_model_rel over NFS. Check: docker logs ${NFS_CONTAINER} (or the existing NFSv4 exporter on ${NFS_SERVER_IP:-$IFACE})." >&2
+    echo "Download weights on the head first: ./prepare-dspark-model-cache.sh --yes" >&2
+    exit 1
+  fi
+fi
 validate_compose
 
 if [ "${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}" = "1" ]; then
   echo "Checking Issue #136 XGrammar compatibility on the worker before either rank starts..."
-  remote_compose "NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.dspark.yml run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-issue136-xgrammar-termination.py --check"
+  remote_compose "NODE_RANK=1 HEADLESS=1 $WORKER_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER_COMPOSE_FILES run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-issue136-xgrammar-termination.py --check"
   echo "Checking Issue #136 XGrammar compatibility on the head before either rank starts..."
   compose_base 0 "" run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-issue136-xgrammar-termination.py --check
 fi
 
 echo "Starting DSpark worker on ${WORKER_HOST}..."
-remote_compose "NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK='$DSPARK_ISSUE141_EFFECTIVE' DSPARK_ISSUE141_HOTFIX='./patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT='$DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT' DSPARK_ISSUE138_HOTFIX='./patches/hotfix-vllm-issue138-responses-history.py' docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.dspark.yml up -d"
+remote_compose "NODE_RANK=1 HEADLESS=1 $WORKER_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK='$DSPARK_ISSUE141_EFFECTIVE' DSPARK_ISSUE141_HOTFIX='./patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT='$DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT' DSPARK_ISSUE138_HOTFIX='./patches/hotfix-vllm-issue138-responses-history.py' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER_COMPOSE_FILES up -d"
 
 echo "Starting DSpark head..."
 compose_base 0 "" up -d

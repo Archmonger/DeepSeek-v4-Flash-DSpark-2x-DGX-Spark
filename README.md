@@ -25,7 +25,10 @@ tables, method, historical lanes). Checkpoint / encoder:
 ## Quick start
 
 Run everything from the **head** node. You need two DGX Sparks, RoCE/NCCL
-working, and the same image + HF cache on both.
+working, and the same image on both. **Weights live only on the head**;
+the worker mounts the head HuggingFace cache over NFSv4 on the ConnectX
+link (same pattern as Qwen3.8-Flash-vLLM). Set `DSPARK_WORKER_HF_NFS=0`
+to keep a local worker copy instead.
 
 1. **Env**
 
@@ -35,7 +38,8 @@ working, and the same image + HF cache on both.
 
    Set at least: `WORKER_HOST`, `MASTER_ADDR`, `NCCL_IB_HCA`,
    `NCCL_SOCKET_IFNAME` (and matching `TP_` / `GLOO_` IF names),
-   `VLLM_HOST_IP`, `WORKER_VLLM_HOST_IP`, `HF_CACHE`, `WORKER_HF_CACHE`.
+   `VLLM_HOST_IP`, `WORKER_VLLM_HOST_IP`, `HF_CACHE`.
+   `WORKER_HF_CACHE` is the worker's local JIT cache when NFS is on (default).
    If the worker checkout is not the same path, set `WORKER_DIR` /
    `WORKER_SCRIPT_DIR`.
 
@@ -64,7 +68,7 @@ working, and the same image + HF cache on both.
    Repeat on the worker (or pull there via ssh). Start refuses to launch if
    either node is missing the image.
 
-3. **Weights on both nodes**
+3. **Weights on the head**
 
    ```bash
    ./prepare-dspark-model-cache.sh --official
@@ -72,8 +76,9 @@ working, and the same image + HF cache on both.
 
    Use `--abliterated` or `--yes` (reads `ABLITERATED` from `.env.dspark`).
    Abliterated weights are gated (`HF_TOKEN`). Prepare forces HF
-   online even if `HF_HUB_OFFLINE=1`, then you can serve offline. After the cache is complete, keep `HF_HUB_OFFLINE=1` so a hub
-   retry cannot fill the worker disk.
+   online even if `HF_HUB_OFFLINE=1`, then you can serve offline.
+   Default `DSPARK_WORKER_HF_NFS=1` does **not** download onto the worker;
+   `./start-…` exports `HF_CACHE` over NFS. After the head cache is complete, keep `HF_HUB_OFFLINE=1`.
 
 4. **Optional CPU gates** (no GPU; will not measure tok/s)
 
@@ -168,7 +173,8 @@ cluster wiring, not product switches. Full Anemll vs Stage-C matrix:
 | `DSPARK_REVISION_ABLITERATED` | empty | Abliterated pin. Empty = tip of that repo. |
 | `DSPARK_MODEL_OFFICIAL` / `DSPARK_MODEL_ABLITERATED` | the two HF ids above | Override only if you intentionally swap the repo id. Do not point this at the 0731 ablit dump — that drops `image_url`. |
 | `SERVED_MODEL_NAME` | `deepseek-v4-flash-vision-exp` | Name clients send as `model`. |
-| `HF_HUB_OFFLINE` | `1` | `1` after both caches are warm (avoids filling the worker disk). Prepare forces online for the download. |
+| `HF_HUB_OFFLINE` | `1` | `1` after the **head** cache is warm. Prepare forces online for the download. Worker reads the same files over NFS. |
+| `DSPARK_WORKER_HF_NFS` | `1` | **`1`** = worker mounts head `HF_CACHE` over NFSv4 on ConnectX (no local checkpoint). **`0`** = bind `WORKER_HF_CACHE` as a second copy (`prepare` then downloads on the worker). |
 
 Flip `ABLITERATED` like this:
 
@@ -557,8 +563,10 @@ only when the corresponding live behavior is outside the test scope.
 | [results/RESULTS-2026-08-14.md](results/RESULTS-2026-08-14.md) | Dated benches and how to read them |
 | `.env.dspark.example` | Cluster template |
 | `docker-compose.dspark.yml` | Anemll serve (installs Vision-Exp encoder + hotfixes) |
-| `start-` / `stop-` / `status-` / `logs-` / `smoke-*.sh` | Two-node ops |
-| `prepare-dspark-model-cache.sh` | Vision-Exp weights on head **and** worker (`--official` / `--abliterated`) |
+| `start-` / `stop-` / `status-` / `logs-` / `smoke-*.sh` | Two-node ops (`stop --nfs` also tears down `dspark-nfs`, not Qwen's `vllm-fn-nfs`) |
+| `prepare-dspark-model-cache.sh` | Vision-Exp weights on the **head** (`--official` / `--abliterated`). Worker uses NFS unless `DSPARK_WORKER_HF_NFS=0`. |
+| `files/nfs-share.sh` / `files/nfs-server/` | NFSv4 exporter for the head HF cache (reuses a live share if one is already up) |
+| `docker-compose.dspark-nfs.override.yml` | Worker: named NFS volume + local JIT overlays |
 | `scripts/overlay-vision-exp-ablit-cache.py` | Hardlink official Vision-Exp blobs + copy the 26 ablit shards |
 | `scripts/benchmark-0731.py` | Prompt × concurrency sweep |
 | `scripts/verify-responses-api-live.py` | Strict Responses, multi-turn cache, and disconnect gates |

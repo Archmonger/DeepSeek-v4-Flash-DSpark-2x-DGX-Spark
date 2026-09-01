@@ -6,6 +6,10 @@
 
 - **Vision-Exp 40×19 image grids no longer merge 124 embeddings into 125 placeholders ([Issue #172](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/172))**: N-layout block length is `122 + compress_pad` and `compress_pad` depends on `start_pos % 4`. vLLM's encoder cache hashed image bytes only, so the same photo at a shifted offset reused the wrong pad and killed EngineCore. Processor hashes are now salted with `num_tokens`; `embed_input_ids` rejects a count mismatch instead of doing a strict index-put. Recreate both containers after pull. Independent Docker `unless-stopped` restarts can still split a TP=2 pair (`DSPARK_RESTART_POLICY=no` + `./stop`/`./start` together).
 
+### Changed
+
+- **Worker loads hub weights from the head over NFS** (same ConnectX share as Qwen3.8-Flash-vLLM). Default `DSPARK_WORKER_HF_NFS=1`: `prepare` downloads only on the head; start exports `HF_CACHE` via NFSv4 (reuses a live exporter such as `vllm-fn-nfs`) and the worker Docker volume `dspark-hf` mounts it read-only. Triton/TileLang/vLLM/FlashInfer/CuTe/NCCL-FR caches stay on the worker host path as overlays. `DSPARK_WORKER_HF_NFS=0` restores a local worker copy. `./stop-… --nfs` tears down only `dspark-nfs`, not Qwen's share. Recreate the pair after pull (`./stop` then `./start`).
+
 ## 2026-08-31
 
 ### Fixed

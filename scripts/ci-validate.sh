@@ -16,6 +16,8 @@ for f in \
   stop-deepseek-v4-flash-dspark.sh \
   validate-dspark-config.sh \
   prepare-dspark-model-cache.sh \
+  files/nfs-share.sh \
+  files/nfs-server/entrypoint.sh \
   smoke-deepseek-v4-flash-dspark.sh \
   status-deepseek-v4-flash-dspark.sh \
   scripts/ci-validate.sh \
@@ -303,6 +305,17 @@ if grep -q 'VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "${VLLM_EXECUTE_MODEL_TIMEOUT_SE
   ok "compose JIT timeout 1800s + persistent TileLang cache (#65/#87)"
 else
   bad "compose missing VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800 or TILELANG_CACHE_DIR"
+fi
+if grep -Fq 'DSPARK_WORKER_HF_NFS="${DSPARK_WORKER_HF_NFS:-1}"' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'source "$SCRIPT_DIR/files/nfs-share.sh"' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'dspark-hf:/cache/huggingface:ro' docker-compose.dspark-nfs.override.yml \
+  && grep -Fq 'docker-compose.dspark-nfs.override.yml' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'DSPARK_WORKER_HF_NFS:-1' prepare-dspark-model-cache.sh \
+  && grep -Fq -- '--nfs' stop-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'vllm-fn-nfs' files/nfs-share.sh; then
+  ok "worker HF NFS share is default-on, override-mounted, prepare-skipped, stop --nfs safe vs Qwen"
+else
+  bad "worker HF NFS wiring is incomplete"
 fi
 if grep -q 'restart: ${DSPARK_RESTART_POLICY:-unless-stopped}' docker-compose.dspark.yml; then
   ok "compose restart unless-stopped"
