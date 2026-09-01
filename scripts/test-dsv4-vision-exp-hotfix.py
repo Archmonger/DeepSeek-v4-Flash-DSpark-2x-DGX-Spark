@@ -14,6 +14,7 @@ from vision_exp.image_processor import (  # noqa: E402
     IMAGE,
     IMAGE_END,
     IMAGE_START,
+    IMAGE_TOKEN_ID,
     as_pil,
     build_image_block,
     compress_pad_tokens,
@@ -23,6 +24,7 @@ from vision_exp.image_processor import (  # noqa: E402
     is_vision_exp_weight_name,
     looks_like_chw,
     salt_mm_image_hash,
+    token_routing_kind,
     vision_args_from_config,
 )
 
@@ -235,6 +237,39 @@ class VisionExpLayoutTest(unittest.TestCase):
         self.assertIn("requires_raw_input_tokens = True", text)
         self.assertIn("multimodal_embeddings", text)
         self.assertIn("_merge_multimodal_embeddings", text)
+
+    def test_issue175_placeholder_id_is_in_vocab_tail(self):
+        self.assertEqual(IMAGE_TOKEN_ID, 129264)
+        proc = (ROOT / "patches" / "vision_exp" / "processor.py").read_text()
+        self.assertIn("return IMAGE_TOKEN_ID", proc)
+
+    def test_issue175_token_routing_kind_splits_placeholder_rows(self):
+        img = IMAGE_TOKEN_ID
+        self.assertEqual(token_routing_kind(None), "text")
+        self.assertEqual(token_routing_kind([]), "text")
+        self.assertEqual(token_routing_kind([1, 2, 3]), "text")
+        self.assertEqual(token_routing_kind([img, img]), "image")
+        self.assertEqual(token_routing_kind([1, img, 2]), "mixed")
+
+    @unittest.skipUnless(HAS_TORCH, "torch not installed on this host")
+    def test_issue175_token_routing_kind_accepts_tensors(self):
+        import torch
+
+        img = IMAGE_TOKEN_ID
+        self.assertEqual(token_routing_kind(torch.tensor([7, 8])), "text")
+        self.assertEqual(token_routing_kind(torch.tensor([img, img])), "image")
+        self.assertEqual(token_routing_kind(torch.tensor([[1, img]])), "mixed")
+
+    def test_issue175_overlay_routes_image_rows_with_bias_vl(self):
+        text = (ROOT / "patches" / "vision_exp" / "apply.py").read_text()
+        self.assertIn("def fused_topk_bias_split_vl", text)
+        self.assertIn("def _wrap_router_compute_routing", text)
+        self.assertIn("_wrap_router_compute_routing(router, self.gate)", text)
+        self.assertIn("e_score_correction_bias_vl", text)
+        self.assertIn('kind == "image"', text)
+        self.assertIn("return _call(hidden_states, gating_output, vl, None, None)", text)
+        self.assertIn("nvidia_mod.fused_topk_bias = _split_ftb", text)
+        self.assertIn("is_current_stream_capturing", text)
 
 
 class VisionExpHotfixTextTest(unittest.TestCase):

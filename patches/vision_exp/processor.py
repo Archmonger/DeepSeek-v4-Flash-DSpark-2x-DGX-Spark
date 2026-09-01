@@ -26,6 +26,7 @@ from vllm.multimodal.processing import (
 from .image_processor import (
     IMAGE_PAD,
     IMAGE_PLACEHOLDER,
+    IMAGE_TOKEN_ID,
     as_pil,
     build_image_block,
     pil_to_patches,
@@ -43,8 +44,7 @@ def _image_token_id(tokenizer) -> int:
     vocab = getattr(tokenizer, "get_vocab", lambda: {})()
     if IMAGE_PLACEHOLDER in vocab:
         return int(vocab[IMAGE_PLACEHOLDER])
-    # Vision-Exp added-token id (vocab_size 129280; placeholder is in the tail).
-    return 129264
+    return IMAGE_TOKEN_ID
 
 
 def _as_int(value: Any) -> int:

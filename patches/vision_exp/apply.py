@@ -13,8 +13,10 @@ from torch import nn
 
 from .image_processor import (
     IMAGE,
+    IMAGE_TOKEN_ID,
     is_unregistered_router_bias,
     is_vision_exp_weight_name,
+    token_routing_kind,
     vision_args_from_config,
 )
 from .processor import IMAGE_PLACEHOLDER, register_vision_exp_processor
@@ -131,6 +133,159 @@ def _mm_embed_rows(multimodal_embeddings: Any) -> int:
     return total
 
 
+def _bias_data(param: Any) -> Any:
+    if param is None:
+        return None
+    return param.data if hasattr(param, "data") else param
+
+
+def fused_topk_bias_split_vl(
+    *,
+    hidden_states: Any,
+    gating_output: Any,
+    scoring_func: str,
+    e_score_correction_bias: Any,
+    e_score_correction_bias_vl: Any,
+    topk: int,
+    renormalize: bool,
+    indices_type: Any,
+    input_tokens: Any,
+    hash_indices_table: Any,
+    routed_scaling_factor: float,
+) -> tuple[Any, Any]:
+    """Route image placeholder rows with bias_vl and no hash table (issue #175)."""
+    from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+        fused_topk_bias,
+    )
+
+    def _call(hs, go, bias, tokens, hash_tab):
+        return fused_topk_bias(
+            hidden_states=hs,
+            gating_output=go,
+            scoring_func=scoring_func,
+            e_score_correction_bias=bias,
+            topk=topk,
+            renormalize=renormalize,
+            indices_type=indices_type,
+            input_tokens=tokens,
+            hash_indices_table=hash_tab,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+
+    vl = _bias_data(e_score_correction_bias_vl)
+    kind = token_routing_kind(input_tokens)
+    if vl is None or kind == "text":
+        return _call(
+            hidden_states,
+            gating_output,
+            e_score_correction_bias,
+            input_tokens,
+            hash_indices_table,
+        )
+    if kind == "image":
+        return _call(hidden_states, gating_output, vl, None, None)
+
+    tokens = input_tokens.reshape(-1)
+    n_rows = int(hidden_states.size(0))
+    if int(tokens.numel()) != n_rows:
+        return _call(
+            hidden_states,
+            gating_output,
+            e_score_correction_bias,
+            input_tokens,
+            hash_indices_table,
+        )
+    image_mask = tokens == IMAGE_TOKEN_ID
+    text_mask = ~image_mask
+    w_text, id_text = _call(
+        hidden_states[text_mask],
+        gating_output[text_mask],
+        e_score_correction_bias,
+        tokens[text_mask],
+        hash_indices_table,
+    )
+    w_img, id_img = _call(
+        hidden_states[image_mask],
+        gating_output[image_mask],
+        vl,
+        None,
+        None,
+    )
+    topk_w = w_text.new_empty((n_rows, w_text.shape[1]))
+    topk_id = id_text.new_empty((n_rows, id_text.shape[1]))
+    topk_w[text_mask] = w_text
+    topk_w[image_mask] = w_img
+    topk_id[text_mask] = id_text
+    topk_id[image_mask] = id_img
+    return topk_w, topk_id
+
+
+def _append_fused_shared_experts(router: Any, topk_weights: Any, topk_ids: Any):
+    n = int(getattr(router, "num_fused_shared_experts", 0) or 0)
+    if n <= 0:
+        return topk_weights, topk_ids
+    m = topk_ids.shape[0]
+    base = router.global_num_experts
+    shared_ids = torch.arange(
+        base, base + n, dtype=topk_ids.dtype, device=topk_ids.device
+    ).expand(m, n)
+    shared_w = torch.full(
+        (m, n),
+        router.shared_expert_weight,
+        dtype=topk_weights.dtype,
+        device=topk_weights.device,
+    )
+    return (
+        torch.cat([topk_weights, shared_w], dim=-1),
+        torch.cat([topk_ids, shared_ids], dim=-1),
+    )
+
+
+def _wrap_router_compute_routing(router: Any, gate: Any) -> None:
+    if getattr(router, "_dspark_bias_vl_wrapped", False):
+        return
+    if not hasattr(router, "_compute_routing"):
+        return
+    orig = router._compute_routing
+
+    def _compute_routing(
+        hidden_states,
+        router_logits,
+        indices_type,
+        *,
+        input_ids=None,
+    ):
+        vl = getattr(gate, "e_score_correction_bias_vl", None)
+        # Graph capture cannot .item() / host-branch on token ids (issue #175).
+        # Decode graphs only replay text tokens; image prefill stays eager.
+        capturing = False
+        try:
+            capturing = bool(torch.cuda.is_current_stream_capturing())
+        except Exception:
+            capturing = False
+        if vl is None or capturing or token_routing_kind(input_ids) == "text":
+            return orig(
+                hidden_states, router_logits, indices_type, input_ids=input_ids
+            )
+        topk_weights, topk_ids = fused_topk_bias_split_vl(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            scoring_func=router.scoring_func,
+            e_score_correction_bias=_bias_data(getattr(router, "e_score_correction_bias", None)),
+            e_score_correction_bias_vl=vl,
+            topk=router.top_k,
+            renormalize=router.renormalize,
+            indices_type=indices_type,
+            input_tokens=input_ids,
+            hash_indices_table=getattr(router, "_hash_indices_table", None),
+            routed_scaling_factor=getattr(router, "routed_scaling_factor", 1.0),
+        )
+        return _append_fused_shared_experts(router, topk_weights, topk_ids)
+
+    router._compute_routing = _compute_routing
+    router._dspark_bias_vl_wrapped = True
+
+
 def embed_multimodal(self, **kwargs: object):
     pixel_values = kwargs.get("pixel_values")
     if pixel_values is None:
@@ -235,8 +390,39 @@ def apply_vision_exp(
                 torch.empty(config.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
             )
+            experts = getattr(self, "experts", None)
+            router = getattr(experts, "router", None)
+            if router is not None:
+                _wrap_router_compute_routing(router, self.gate)
 
     DeepseekV4MoE.__init__ = moe_init
+
+    orig_moe_forward = DeepseekV4MoE.forward
+
+    def moe_forward(self, hidden_states, input_ids=None):
+        vl = getattr(getattr(self, "gate", None), "e_score_correction_bias_vl", None)
+        if not getattr(self, "use_mega_moe", False) or vl is None:
+            return orig_moe_forward(self, hidden_states, input_ids)
+        import vllm.models.deepseek_v4.nvidia.model as nvidia_mod
+
+        prev = nvidia_mod.fused_topk_bias
+
+        def _split_ftb(*args, **kwargs):
+            if args:
+                raise TypeError(
+                    "issue #175 mega-MoE wrap expects fused_topk_bias keyword args"
+                )
+            return fused_topk_bias_split_vl(
+                e_score_correction_bias_vl=vl, **kwargs
+            )
+
+        nvidia_mod.fused_topk_bias = _split_ftb
+        try:
+            return orig_moe_forward(self, hidden_states, input_ids)
+        finally:
+            nvidia_mod.fused_topk_bias = prev
+
+    DeepseekV4MoE.forward = moe_forward
 
     orig_lm_init = DeepseekV4ForCausalLM.__init__
 
@@ -298,6 +484,7 @@ def apply_vision_exp(
     DeepseekV4ForCausalLM.supports_multimodal_raw_input_only = False
     # Hash MoE (layers 0–2) looks up tid2eid with input_ids. The MM runner
     # otherwise sets input_ids=None whenever inputs_embeds is present.
+    # Issue #175 also needs raw ids so image placeholders can take bias_vl.
     DeepseekV4ForCausalLM.requires_raw_input_tokens = True
     DeepseekV4ForCausalLM.get_placeholder_str = get_placeholder_str
     DeepseekV4ForCausalLM.embed_multimodal = embed_multimodal
