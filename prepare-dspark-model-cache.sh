@@ -9,8 +9,8 @@ usage() {
 Usage: ./prepare-dspark-model-cache.sh [--official | --abliterated] [--yes]
 
 Downloads DeepSeek-V4-Flash-Vision-Exp weights (official or abliterated) into HF_CACHE
-on this node. With DSPARK_WORKER_HF_NFS=1 (default) the worker is not downloaded —
-start exports this cache over NFS. Set DSPARK_WORKER_HF_NFS=0 to also copy onto the worker.
+on this node, then onto the worker (default DSPARK_WORKER_HF_NFS=0). Set
+DSPARK_WORKER_HF_NFS=1 to skip the worker copy; start then exports this cache over NFS.
 
   --official      Download deepseek-ai/DeepSeek-V4-Flash-Vision-Exp (sets ABLITERATED=0)
   --abliterated   Download Keys abliterated weights (sets ABLITERATED=1)
@@ -339,7 +339,7 @@ verify_cache "$DSPARK_MODEL" "${DSPARK_REVISION:-}"
 
 if [ "${PREPARE_WORKER:-1}" = "1" ]; then
   : "${WORKER_HOST:?WORKER_HOST must be set in $ENV_FILE or environment}"
-  if [ "${DSPARK_WORKER_HF_NFS:-1}" = "1" ]; then
+  if [ "${DSPARK_WORKER_HF_NFS:-0}" = "1" ]; then
     echo "prepare: DSPARK_WORKER_HF_NFS=1 — checkpoint stays on this node ($HF_CACHE)."
     echo "prepare: worker will mount it over NFS at start (no second Hub download)."
     echo "prepare: set DSPARK_WORKER_HF_NFS=0 to copy weights onto the worker instead."

@@ -10,7 +10,7 @@
 
 ### Changed
 
-- **Worker loads hub weights from the head over NFS** (same ConnectX share as Qwen3.8-Flash-vLLM). Default `DSPARK_WORKER_HF_NFS=1`: `prepare` downloads only on the head; start exports `HF_CACHE` via NFSv4 (reuses a live exporter such as `vllm-fn-nfs`) and the worker Docker volume `dspark-hf` mounts it read-only. Triton/TileLang/vLLM/FlashInfer/CuTe/NCCL-FR caches stay on the worker host path as overlays. `DSPARK_WORKER_HF_NFS=0` restores a local worker copy. `./stop-… --nfs` tears down only `dspark-nfs`, not Qwen's share. Recreate the pair after pull (`./stop` then `./start`).
+- **Worker HF NFS is opt-in** (`DSPARK_WORKER_HF_NFS=0` by default). `prepare` copies hub weights onto the worker. Set `DSPARK_WORKER_HF_NFS=1` to skip that copy: start exports head `HF_CACHE` via NFSv4 on ConnectX (reuses a live exporter such as `vllm-fn-nfs`) and the worker Docker volume `dspark-hf` mounts it read-only. Triton/TileLang/vLLM/FlashInfer/CuTe/NCCL-FR caches stay on the worker host as overlays. `./stop-… --nfs` tears down only `dspark-nfs`, not Qwen's share.
 
 ## 2026-08-31
 

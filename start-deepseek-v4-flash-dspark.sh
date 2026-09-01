@@ -290,10 +290,10 @@ VLLM_HOST_IP="${VLLM_HOST_IP:-$MASTER_ADDR}"
 WORKER_VLLM_HOST_IP="${WORKER_VLLM_HOST_IP:-$WORKER_HOST}"
 WORKER_DIR="${WORKER_SCRIPT_DIR:-${WORKER_DIR:-$SCRIPT_DIR}}"
 WORKER_HF_CACHE="${WORKER_HF_CACHE:-${HF_CACHE:-}}"
-# Worker loads hub weights from the head HF cache over NFS (ConnectX), same
-# pattern as Qwen3.8-Flash-vLLM. JIT caches stay on the worker host path.
-# Set DSPARK_WORKER_HF_NFS=0 to bind a local worker copy instead.
-DSPARK_WORKER_HF_NFS="${DSPARK_WORKER_HF_NFS:-1}"
+# Worker hub weights: default is a local copy (prepare downloads on both nodes).
+# Set DSPARK_WORKER_HF_NFS=1 to mount the head HF cache over NFS (ConnectX);
+# JIT caches stay on the worker host path.
+DSPARK_WORKER_HF_NFS="${DSPARK_WORKER_HF_NFS:-0}"
 NFS_VOLUME="${NFS_VOLUME:-dspark-hf}"
 NFS_CONTAINER="${NFS_CONTAINER:-dspark-nfs}"
 NFS_OVERRIDE_FILE="${NFS_OVERRIDE_FILE:-$SCRIPT_DIR/docker-compose.dspark-nfs.override.yml}"

@@ -306,14 +306,14 @@ if grep -q 'VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "${VLLM_EXECUTE_MODEL_TIMEOUT_SE
 else
   bad "compose missing VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800 or TILELANG_CACHE_DIR"
 fi
-if grep -Fq 'DSPARK_WORKER_HF_NFS="${DSPARK_WORKER_HF_NFS:-1}"' start-deepseek-v4-flash-dspark.sh \
+if grep -Fq 'DSPARK_WORKER_HF_NFS="${DSPARK_WORKER_HF_NFS:-0}"' start-deepseek-v4-flash-dspark.sh \
   && grep -Fq 'source "$SCRIPT_DIR/files/nfs-share.sh"' start-deepseek-v4-flash-dspark.sh \
   && grep -Fq 'dspark-hf:/cache/huggingface:ro' docker-compose.dspark-nfs.override.yml \
   && grep -Fq 'docker-compose.dspark-nfs.override.yml' start-deepseek-v4-flash-dspark.sh \
-  && grep -Fq 'DSPARK_WORKER_HF_NFS:-1' prepare-dspark-model-cache.sh \
+  && grep -Fq 'DSPARK_WORKER_HF_NFS:-0' prepare-dspark-model-cache.sh \
   && grep -Fq -- '--nfs' stop-deepseek-v4-flash-dspark.sh \
   && grep -Fq 'vllm-fn-nfs' files/nfs-share.sh; then
-  ok "worker HF NFS share is default-on, override-mounted, prepare-skipped, stop --nfs safe vs Qwen"
+  ok "worker HF NFS share is opt-in (default 0), override-mounted, prepare copies worker unless =1, stop --nfs safe vs Qwen"
 else
   bad "worker HF NFS wiring is incomplete"
 fi
