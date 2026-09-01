@@ -9,7 +9,9 @@ startup patch:
    the tower, maps ``vision.*`` / ``aligner.*`` / ``image_*`` / ``bias_vl``
    weights, and registers a vLLM multimodal processor.
 2. Remaps DSpark draft ``ffn.gate.bias_vl`` → ``e_score_correction_bias_vl``
-   (Anemll only rewrote names ending in ``.ffn.gate.bias``).
+   (Anemll only rewrote names ending in ``.ffn.gate.bias``). Image placeholder
+   rows then route with that tensor and skip the hash table (issue #175);
+   text rows keep ``e_score_correction_bias`` + ``tid2eid``.
 3. Relaxes the Vision-Exp encoder's rejection of already-substituted
    ``<｜deepseek_image｜>`` text so OpenAI ``image_url`` parts survive
    vLLM's chat parser, then restores the official Chat Completions rule:
