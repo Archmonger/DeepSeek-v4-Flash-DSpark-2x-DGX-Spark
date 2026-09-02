@@ -60,6 +60,7 @@ py_files+=(
   scripts/test-spec-acceptance.py
   scripts/test-ruler-lite-pad.py
   scripts/test-env-normalisation.py
+  scripts/test-served-model-alias.py
   scripts/test-dspark-api-keys.py
   scripts/test-redact-api-key-log.py
   scripts/test-hotfix-atomic-transaction.py
@@ -107,6 +108,8 @@ python3 scripts/test-numeric-knob-validation.py -q
 ok "test-numeric-knob-validation"
 python3 scripts/test-env-normalisation.py -q
 ok "test-env-normalisation"
+python3 scripts/test-served-model-alias.py -q
+ok "test-served-model-alias"
 python3 scripts/test-dspark-api-keys.py -q
 ok "test-dspark-api-keys"
 python3 scripts/test-redact-api-key-log.py -q
