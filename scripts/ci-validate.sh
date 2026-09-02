@@ -22,6 +22,7 @@ for f in \
   files/nfs-server/entrypoint.sh \
   smoke-deepseek-v4-flash-dspark.sh \
   status-deepseek-v4-flash-dspark.sh \
+  logs-deepseek-v4-flash-dspark.sh \
   scripts/ci-validate.sh \
   scripts/verify-overlay-sources.sh \
   scripts/test-draft-sample-method-gate.sh \
@@ -129,6 +130,12 @@ python3 scripts/test-empty-encoder-output-hotfix.py -q
 ok "test-empty-encoder-output-hotfix"
 python3 tests/test_issue27_inflight_cap.py -q
 ok "test_issue27_inflight_cap"
+python3 tests/test_adaptive_prefill_chunk.py -q
+ok "test_adaptive_prefill_chunk"
+python3 tests/test_replicate_markov_head.py
+ok "test_replicate_markov_head"
+python3 tests/test_sp_indexer_prefill.py
+ok "test_sp_indexer_prefill"
 python3 tests/test_dspark_stacked_mapping.py -q
 ok "test_dspark_stacked_mapping"
 python3 tests/test_issue133_triton_specialization.py -q
@@ -220,6 +227,37 @@ if grep -Fxq 'DSPARK_MAX_INFLIGHT_PREFILLS=2' .env.dspark.example \
   ok "issue27 in-flight prefill cap defaults to 2 (A/B 2026-09-02)"
 else
   bad "issue27 in-flight prefill cap must default to 2 in env example and compose"
+fi
+if grep -Fq 'hotfix-dsv4-adaptive-prefill-chunk.py}:/opt/hotfix-dsv4-adaptive-prefill-chunk.py:ro' docker-compose.dspark.yml \
+  && grep -Fq 'if [ "$${DSPARK_ENABLE_ADAPTIVE_CHUNK:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-adaptive-prefill-chunk.py || exit 1; fi;' docker-compose.dspark.yml \
+  && grep -Fq 'scp "$DSPARK_ADAPTIVE_CHUNK_HOTFIX"' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'hotfix-dsv4-replicate-markov-head.py}:/opt/hotfix-dsv4-replicate-markov-head.py:ro' docker-compose.dspark.yml \
+  && grep -Fq 'if [ "$${DSPARK_ENABLE_REPLICATE_MARKOV:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-replicate-markov-head.py || exit 1; fi;' docker-compose.dspark.yml \
+  && grep -Fq 'scp "$DSPARK_REPLICATE_MARKOV_HOTFIX"' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'B12X_W4A16_TC_DECODE: "${B12X_W4A16_TC_DECODE:-0}"' docker-compose.dspark.yml \
+  && grep -Fq -- '--max-cudagraph-capture-size $$(( ( ${MAX_NUM_SEQS:-6} * (${MTP_NUM_TOKENS:-6} + 1) + 7 ) / 8 * 8 ))' docker-compose.dspark.yml; then
+  ok "fable5-1 easy knobs: adaptive chunk, replicate Markov, TC-decode env, capture-size round-up"
+else
+  bad "fable5-1 easy knobs wiring is incomplete"
+fi
+if grep -Fq 'hotfix-dsv4-sp-indexer-prefill.py}:/opt/hotfix-dsv4-sp-indexer-prefill.py:ro' docker-compose.dspark.yml \
+  && grep -Fq 'if [ "$${DSPARK_ENABLE_SP_INDEXER:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-sp-indexer-prefill.py || exit 1; fi;' docker-compose.dspark.yml \
+  && grep -Fq 'DSPARK_ENABLE_SP_INDEXER: "${DSPARK_ENABLE_SP_INDEXER:-0}"' docker-compose.dspark.yml \
+  && grep -Fq 'DSPARK_SP_INDEXER_MIN_KEYS: "${DSPARK_SP_INDEXER_MIN_KEYS:-8192}"' docker-compose.dspark.yml \
+  && grep -Fq 'scp "$DSPARK_SP_INDEXER_HOTFIX"' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq "DSPARK_ENABLE_SP_INDEXER='\$DSPARK_SP_INDEXER_EFFECTIVE'" start-deepseek-v4-flash-dspark.sh \
+  && grep -Fxq 'DSPARK_ENABLE_SP_INDEXER=0' .env.dspark.example; then
+  ok "item 6 SP indexer prefill: opt-in gate, env passthrough, worker sync, example default 0"
+else
+  bad "item 6 SP indexer prefill wiring is incomplete"
+fi
+if grep -Fq 'if [ "$${DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS:-0}" = "1" ]; then bash /opt/dspark-patches/hotfix-deepgemm-sm121-mqa-header-alias.sh || exit 1; fi;' docker-compose.dspark.yml \
+  && grep -Fq 'DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS: "${DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS:-0}"' docker-compose.dspark.yml \
+  && grep -Fq 'scp "$DSPARK_DEEPGEMM_ALIAS_HOTFIX"' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fxq 'DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS=0' .env.dspark.example; then
+  ok "DeepGEMM sm121 header alias: opt-in gate, env passthrough, worker sync, example default 0"
+else
+  bad "DeepGEMM sm121 header alias wiring is incomplete"
 fi
 if grep -Fq 'hotfix-dsv4-issue133-triton-specialization.py}:/opt/hotfix-dsv4-issue133-triton-specialization.py:ro' docker-compose.dspark.yml \
   && grep -Fq 'python3 /opt/hotfix-dsv4-issue133-triton-specialization.py || exit 1' docker-compose.dspark.yml \
@@ -349,6 +387,8 @@ for p in \
   patches/hotfix-dsv4-issue55-tool-truncation.py \
   patches/hotfix-dsv4-issue26-hybrid-swa-min.py \
   patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py \
+  patches/hotfix-dsv4-adaptive-prefill-chunk.py \
+  patches/hotfix-dsv4-replicate-markov-head.py \
   patches/hotfix-dsv4-issue133-triton-specialization.py \
   patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py \
   patches/hotfix-vllm-empty-encoder-output.py \
@@ -426,6 +466,19 @@ if grep -q "healthcheck:" docker-compose.dspark.yml \
   ok "compose healthcheck present, HEADLESS-gated, and VLLM_HOST-aware"
 else
   bad "compose healthcheck missing, not HEADLESS-gated, or still hardcoded to 127.0.0.1"
+fi
+
+if grep -qF -- '--tensor-parallel-size ${TP_SIZE:-2}' docker-compose.dspark.yml \
+  && grep -qF -- '--nnodes ${NNODES:-2}' docker-compose.dspark.yml \
+  && grep -q 'apply_tp3_patch.py' docker-compose.dspark.yml \
+  && grep -q 'DSPARK_TP3=1' start-tp3.sh \
+  && grep -q -- '--max-num-seqs' start-tp3.sh \
+  && grep -q 'TP3_MAX_NUM_SEQS' start-deepseek-v4-flash-dspark.sh \
+  && grep -q 'apply_tp3_bootstrap_ifaces' start-deepseek-v4-flash-dspark.sh \
+  && [ -f patches/tp3/apply_tp3_patch.py ]; then
+  ok "optional TP=3: compose parameterizes TP/nnodes, start-tp3.sh sets DSPARK_TP3=1, Gloo bootstrap on 10.0.0.x"
+else
+  bad "TP=3 optional path missing (compose TP_SIZE/NNODES, apply_tp3_patch, start-tp3.sh, or bootstrap ifaces)"
 fi
 
 echo "CI validate passed (CPU recipe gates only)."

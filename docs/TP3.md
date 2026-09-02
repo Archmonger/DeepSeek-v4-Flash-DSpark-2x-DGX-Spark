@@ -83,6 +83,7 @@ The 2-node recipe stays at `MAX_NUM_SEQS` (default `6`). TP=3 slots:
 ```
 
 CLI wins over `TP3_MAX_NUM_SEQS`. CUDA-graph capture size is
-`MAX_NUM_SEQS * (MTP_NUM_TOKENS + 1)`. If capture OOMs, lower
+`MAX_NUM_SEQS * (MTP_NUM_TOKENS + 1)` rounded up to a multiple of 8 (48 at
+6 slots). If capture OOMs, lower
 `GPU_MEMORY_UTILIZATION_TEXT` toward `0.78` rather than cutting
 `MAX_MODEL_LEN` first. Needs a recreate (`./stop-… && ./start-tp3.sh`).

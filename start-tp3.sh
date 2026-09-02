@@ -18,7 +18,8 @@ Requires WORKER_HOST and WORKER2_HOST in .env.dspark.
 
 Options:
   --max-num-seqs N   Concurrent slots (vLLM --max-num-seqs). CUDA-graph
-                     capture size is N * (MTP_NUM_TOKENS + 1).
+                     capture size is N * (MTP_NUM_TOKENS + 1) rounded up to a
+                     multiple of 8 (48 at N=6).
                      Default: TP3_MAX_NUM_SEQS in .env.dspark, else MAX_NUM_SEQS
                      (the 2-node value, usually 6). The 2-node start ignores
                      TP3_MAX_NUM_SEQS.

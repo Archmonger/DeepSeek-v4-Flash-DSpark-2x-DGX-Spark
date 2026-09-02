@@ -292,6 +292,8 @@ generous `max_tokens` or that budget hotfix, or thinking won't end. See
 | `DSPARK_SKIP_SPIN_WAIT_HOTFIX` | `0` | `1` = leave vLLM shm `busy_loop_s=1s` (issue **#79** P-core spin on TP=2). |
 | `DSPARK_ISSUE43_SCHED_DIAG` | `0` | `1` = one scheduler line per step in the vLLM log (mixed prefill/decode). |
 | `DSPARK_ENABLE_ISSUE31_GPU_HOTFIX` | `0` | `1` = apply GPU `thinking_token_budget` at boot (fail-closed). Default stock V2; omit-field clients do not need this ([Issue #66](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/66)). |
+| `DSPARK_ENABLE_SP_INDEXER` | `0` | `1` = sequence-parallel Lightning indexer for prefill chunks ≥ `DSPARK_SP_INDEXER_MIN_KEYS` (8192) compressed keys: each TP rank scores half the keys, exact top-k merge. Long-context TTFT lever ([docs/PATCHES.md](docs/PATCHES.md)). |
+| `DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS` | `0` | `1` = alias DeepGEMM `sm121_*` indexer-logits headers to the shipped `sm120_*` so a cold JIT cache can compile on GB10. |
 | `ENABLE_VLLM_GB10_PATCH` | `0` | `1` = experimental hybrid NVFP4 plugin (`--quantization modelopt_gb10_hybrid`). |
 
 Issue **#21 / #26 / #27 / #43** Python hotfixes always run at container start

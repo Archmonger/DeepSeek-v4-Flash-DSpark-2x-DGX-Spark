@@ -289,6 +289,40 @@ if [ "${DSPARK_SKIP_ISSUE117_RECHECK_HOTFIX:-0}" != "1" ] && { [ ! -f "$DSPARK_I
   echo "Issue #117 SHM ring hotfix is enabled but its local patcher is missing or not a regular file: $DSPARK_ISSUE117_HOTFIX" >&2
   exit 1
 fi
+# Report item 6: sequence-parallel Lightning indexer for long prefills.
+# Exact 1 applies the patcher at boot on both ranks (fail-closed); anything
+# else is normalized to 0 (stock bytes).
+DSPARK_SP_INDEXER_HOTFIX="${DSPARK_SP_INDEXER_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-sp-indexer-prefill.py}"
+case "$DSPARK_SP_INDEXER_HOTFIX" in
+  /*) ;;
+  *) DSPARK_SP_INDEXER_HOTFIX="$SCRIPT_DIR/${DSPARK_SP_INDEXER_HOTFIX#./}" ;;
+esac
+DSPARK_SP_INDEXER_EFFECTIVE=0
+if [ "${DSPARK_ENABLE_SP_INDEXER:-0}" = "1" ]; then
+  DSPARK_SP_INDEXER_EFFECTIVE=1
+  if [ ! -f "$DSPARK_SP_INDEXER_HOTFIX" ]; then
+    echo "error: DSPARK_ENABLE_SP_INDEXER=1 but patch source is missing: $DSPARK_SP_INDEXER_HOTFIX" >&2
+    exit 1
+  fi
+fi
+DSPARK_ENABLE_SP_INDEXER="$DSPARK_SP_INDEXER_EFFECTIVE"
+export DSPARK_SP_INDEXER_HOTFIX DSPARK_ENABLE_SP_INDEXER
+# DeepGEMM SM121 indexer-logits header alias (opt-in, see item8 design §5).
+DSPARK_DEEPGEMM_ALIAS_HOTFIX="${DSPARK_DEEPGEMM_ALIAS_HOTFIX:-$SCRIPT_DIR/patches/hotfix-deepgemm-sm121-mqa-header-alias.sh}"
+case "$DSPARK_DEEPGEMM_ALIAS_HOTFIX" in
+  /*) ;;
+  *) DSPARK_DEEPGEMM_ALIAS_HOTFIX="$SCRIPT_DIR/${DSPARK_DEEPGEMM_ALIAS_HOTFIX#./}" ;;
+esac
+DSPARK_DEEPGEMM_ALIAS_EFFECTIVE=0
+if [ "${DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS:-0}" = "1" ]; then
+  DSPARK_DEEPGEMM_ALIAS_EFFECTIVE=1
+  if [ ! -f "$DSPARK_DEEPGEMM_ALIAS_HOTFIX" ]; then
+    echo "error: DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS=1 but patch source is missing: $DSPARK_DEEPGEMM_ALIAS_HOTFIX" >&2
+    exit 1
+  fi
+fi
+DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS="$DSPARK_DEEPGEMM_ALIAS_EFFECTIVE"
+export DSPARK_DEEPGEMM_ALIAS_HOTFIX DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS
 DSPARK_ISSUE136_XGRAMMAR_HOTFIX="${DSPARK_ISSUE136_XGRAMMAR_HOTFIX:-$SCRIPT_DIR/patches/hotfix-vllm-issue136-xgrammar-termination.py}"
 if [ "${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}" = "1" ] && { [ ! -f "$DSPARK_ISSUE136_XGRAMMAR_HOTFIX" ] || [ -L "$DSPARK_ISSUE136_XGRAMMAR_HOTFIX" ]; }; then
   echo "Issue #136 XGrammar hotfix is enabled but its local patcher is missing or not a regular file: $DSPARK_ISSUE136_XGRAMMAR_HOTFIX" >&2
@@ -957,6 +991,7 @@ print_resolved_profile() {
   fi
   echo "  issue133 Triton specialization hotfix: will apply on start"
   echo "  issue141 sparse-MLA fixed-64 workaround: $DSPARK_ISSUE141_EFFECTIVE (0=stock / 1=apply)"
+  echo "  SP indexer prefill (item 6): $DSPARK_SP_INDEXER_EFFECTIVE (0=stock / 1=apply; min keys ${DSPARK_SP_INDEXER_MIN_KEYS:-8192})"
   echo "  DeepGEMM sm121 header alias: $DSPARK_DEEPGEMM_ALIAS_EFFECTIVE (0=stock / 1=apply)"
   echo "  cudagraph capture size: $(( ( ${MAX_NUM_SEQS:-6} * (${MTP_NUM_TOKENS:-6} + 1) + 7 ) / 8 * 8 )) (rounded up to a multiple of 8 so spec-decode keeps the full-concurrency shape)"
   echo "  API bind: $VLLM_HOST:$VLLM_PORT"
@@ -1234,6 +1269,18 @@ if [ -f "$DSPARK_ISSUE27_HOTFIX" ]; then
   ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
   scp "$DSPARK_ISSUE27_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py"
 fi
+DSPARK_ADAPTIVE_CHUNK_HOTFIX="${DSPARK_ADAPTIVE_CHUNK_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-adaptive-prefill-chunk.py}"
+if [ -f "$DSPARK_ADAPTIVE_CHUNK_HOTFIX" ]; then
+  echo "Syncing adaptive prefill-chunk hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_ADAPTIVE_CHUNK_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-adaptive-prefill-chunk.py"
+fi
+DSPARK_REPLICATE_MARKOV_HOTFIX="${DSPARK_REPLICATE_MARKOV_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-replicate-markov-head.py}"
+if [ -f "$DSPARK_REPLICATE_MARKOV_HOTFIX" ]; then
+  echo "Syncing replicate-Markov-head hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_REPLICATE_MARKOV_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-replicate-markov-head.py"
+fi
 DSPARK_ISSUE43_HOTFIX="${DSPARK_ISSUE43_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-issue43-decode-fairness-and-diag.py}"
 if [ -f "$DSPARK_ISSUE43_HOTFIX" ]; then
   echo "Syncing Issue #43 decode-fairness hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
@@ -1256,6 +1303,16 @@ if [ -f "$DSPARK_ISSUE141_HOTFIX" ]; then
   echo "Syncing Issue #141 sparse-MLA decode workaround to ${WORKER_HOST}:${WORKER_DIR}/patches/"
   ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
   scp "$DSPARK_ISSUE141_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py"
+fi
+if [ -f "$DSPARK_SP_INDEXER_HOTFIX" ]; then
+  echo "Syncing SP indexer prefill hotfix (item 6) to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_SP_INDEXER_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-sp-indexer-prefill.py"
+fi
+if [ -f "$DSPARK_DEEPGEMM_ALIAS_HOTFIX" ]; then
+  echo "Syncing DeepGEMM sm121 header alias hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_DEEPGEMM_ALIAS_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-deepgemm-sm121-mqa-header-alias.sh"
 fi
 DSPARK_SUPPRESS_STOPS_HOTFIX="${DSPARK_SUPPRESS_STOPS_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-suppress-stops-in-reasoning.py}"
 if [ -f "$DSPARK_SUPPRESS_STOPS_HOTFIX" ]; then
@@ -1450,11 +1507,11 @@ if [ "${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}" = "1" ]; then
 fi
 
 echo "Starting DSpark worker on ${WORKER_HOST}..."
-remote_compose "NODE_RANK=1 HEADLESS=1 $WORKER_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK='$DSPARK_ISSUE141_EFFECTIVE' DSPARK_ISSUE141_HOTFIX='./patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT='$DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT' DSPARK_ISSUE138_HOTFIX='./patches/hotfix-vllm-issue138-responses-history.py' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER_COMPOSE_FILES up -d"
+remote_compose "NODE_RANK=1 HEADLESS=1 $WORKER_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK='$DSPARK_ISSUE141_EFFECTIVE' DSPARK_ISSUE141_HOTFIX='./patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py' DSPARK_ENABLE_SP_INDEXER='$DSPARK_SP_INDEXER_EFFECTIVE' DSPARK_SP_INDEXER_HOTFIX='./patches/hotfix-dsv4-sp-indexer-prefill.py' DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS='$DSPARK_DEEPGEMM_ALIAS_EFFECTIVE' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT='$DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT' DSPARK_ISSUE138_HOTFIX='./patches/hotfix-vllm-issue138-responses-history.py' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER_COMPOSE_FILES up -d"
 
 if [ "$DSPARK_TP3" = "1" ]; then
   echo "Starting DSpark worker2 on ${WORKER2_HOST}..."
-  remote_compose2 "NODE_RANK=2 HEADLESS=1 $WORKER2_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER2_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK='$DSPARK_ISSUE141_EFFECTIVE' DSPARK_ISSUE141_HOTFIX='./patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT='$DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT' DSPARK_ISSUE138_HOTFIX='./patches/hotfix-vllm-issue138-responses-history.py' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER2_COMPOSE_FILES up -d"
+  remote_compose2 "NODE_RANK=2 HEADLESS=1 $WORKER2_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER2_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK='$DSPARK_ISSUE141_EFFECTIVE' DSPARK_ISSUE141_HOTFIX='./patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py' DSPARK_ENABLE_SP_INDEXER='$DSPARK_SP_INDEXER_EFFECTIVE' DSPARK_SP_INDEXER_HOTFIX='./patches/hotfix-dsv4-sp-indexer-prefill.py' DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS='$DSPARK_DEEPGEMM_ALIAS_EFFECTIVE' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT='$DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT' DSPARK_ISSUE138_HOTFIX='./patches/hotfix-vllm-issue138-responses-history.py' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER2_COMPOSE_FILES up -d"
 fi
 
 echo "Starting DSpark head..."

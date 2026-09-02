@@ -54,6 +54,10 @@ services:
       - ${DSPARK_EMPTY_ENCODER_OUTPUT_HOTFIX:-./patches/hotfix-vllm-empty-encoder-output.py}:/opt/hotfix-vllm-empty-encoder-output.py:ro
       # Issue #27 partial-prefill concurrency hotfix (enforce max_num_partial_prefills).
       - ${DSPARK_ISSUE27_HOTFIX:-./patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py}:/opt/hotfix-dsv4-issue27-partial-prefill-concurrency.py:ro
+      # Adaptive prefill chunk: 1024 only while decode lanes run; else full batch.
+      - ${DSPARK_ADAPTIVE_CHUNK_HOTFIX:-./patches/hotfix-dsv4-adaptive-prefill-chunk.py}:/opt/hotfix-dsv4-adaptive-prefill-chunk.py:ro
+      # Replicate DSpark Markov w1/w2 (drop 12 serialized collectives / decode step).
+      - ${DSPARK_REPLICATE_MARKOV_HOTFIX:-./patches/hotfix-dsv4-replicate-markov-head.py}:/opt/hotfix-dsv4-replicate-markov-head.py:ro
       # Issue #43 bounded decode service during mixed prefill steps + scheduler diag.
       - ${DSPARK_ISSUE43_HOTFIX:-./patches/hotfix-dsv4-issue43-decode-fairness-and-diag.py}:/opt/hotfix-dsv4-issue43-decode-fairness-and-diag.py:ro
       # Issue #26/#36 hybrid coordinator: SWA may shrink the common hit (v2).
@@ -63,6 +67,9 @@ services:
       # Issue #141 workaround: keep oversized SM120 sparse-MLA decode calls on
       # FlashInfer's fixed 64-row decode path. Default-off and source-locked.
       - ${DSPARK_ISSUE141_HOTFIX:-./patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py}:/opt/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py:ro
+      # Sequence-parallel Lightning indexer for long prefills (report item 6).
+      # Opt-in via DSPARK_ENABLE_SP_INDEXER=1; default-off, stock bytes.
+      - ${DSPARK_SP_INDEXER_HOTFIX:-./patches/hotfix-dsv4-sp-indexer-prefill.py}:/opt/hotfix-dsv4-sp-indexer-prefill.py:ro
       # Issue #136: exact vLLM #52805 XGrammar termination backport (opt-in).
       - ${DSPARK_ISSUE136_XGRAMMAR_HOTFIX:-./patches/hotfix-vllm-issue136-xgrammar-termination.py}:/opt/hotfix-vllm-issue136-xgrammar-termination.py:ro
       # Client stop strings stay dormant until </think> (Tony/Capicua25x Patch 5).
@@ -144,6 +151,8 @@ services:
       VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM: "${VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM:-0}"
       VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M: "${VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M:-16}"
       VLLM_B12X_W4A16_FORCE_TILE_CONFIG: "${VLLM_B12X_W4A16_FORCE_TILE_CONFIG:-}"
+      # b12x small-M packed decode (M<=8, i.e. c=1). Not a VLLM_* registry key.
+      B12X_W4A16_TC_DECODE: "${B12X_W4A16_TC_DECODE:-0}"
 
       TORCH_CUDA_ARCH_LIST: "${TORCH_CUDA_ARCH_LIST:-12.1a}"
       FLASHINFER_CUDA_ARCH_LIST: "${FLASHINFER_CUDA_ARCH_LIST:-12.1a}"
@@ -271,6 +280,28 @@ services:
       # Issue #141 stochastic TP=2 sparse-MLA stall workaround. Only exact 1
       # applies the pinned-source, fixed-64-row patch; default 0 changes no bytes.
       DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK: "${DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK:-0}"
+      # Report item 6: sequence-parallel Lightning indexer for prefill chunks
+      # with >= DSPARK_SP_INDEXER_MIN_KEYS compressed keys (default 8192 =
+      # 32K tokens at compress ratio 4). TP ranks each score a page-aligned
+      # slice of every request's keys and merge (score, id) candidates exactly.
+      # Exact 1 applies the source patch at boot (fail-closed); default 0
+      # changes no bytes. Decode and short chunks always use the stock path.
+      # Replicated DSpark Markov head (drops 12 serialized TP collectives per
+      # decode step). Default 1 = apply; 0 = stock sharded head. Kept gated so
+      # draft acceptance can be A/B'd (2026-09-02: natural-prose acceptance
+      # measured 27% / pos0 0.69 with it on; stock comparison pending).
+      # Adaptive long-prefill chunk cap (1024 only while decode lanes run).
+      # Default 1 = apply; 0 = stock static cap. Gated for A/B.
+      DSPARK_ENABLE_ADAPTIVE_CHUNK: "${DSPARK_ENABLE_ADAPTIVE_CHUNK:-0}"
+      DSPARK_ENABLE_REPLICATE_MARKOV: "${DSPARK_ENABLE_REPLICATE_MARKOV:-0}"
+      DSPARK_ENABLE_SP_INDEXER: "${DSPARK_ENABLE_SP_INDEXER:-0}"
+      DSPARK_SP_INDEXER_MIN_KEYS: "${DSPARK_SP_INDEXER_MIN_KEYS:-8192}"
+      # DeepGEMM SM121 indexer-logits header alias (see
+      # docs/CLAUDE/item8-fp4-kv-design.md §5). The vendored DeepGEMM names
+      # the kernel by exact CC (sm121_*) but ships sm120_* only; production
+      # survives on the persisted JIT cache. Exact 1 writes four alias headers
+      # at boot (fail-closed); default 0 changes no bytes.
+      DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS: "${DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS:-0}"
       # Issue #136: vLLM #52805 XGrammar termination fix. Exact 1 applies
       # source-exact bytes at boot; default 0 leaves the image untouched.
       DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX: "${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}"
@@ -327,7 +358,7 @@ services:
         if [ "$${DSPARK_SKIP_HOTFIX:-0}" != "1" ]; then for _hf in hotfix-dsv4-mtp-buffer-50312.sh hotfix-dsv4-skip-topk-49486.sh hotfix-dsv4-dense-prefill-indexer-48407.sh hotfix-dsv4-skip-empty-c128-48957.sh hotfix-dsv4-flashmla-workspace-50298.sh hotfix-dsv4-grammar-advance.sh; do if [ ! -f /opt/dspark-patches/$${_hf} ]; then echo "FATAL: /opt/dspark-patches/$${_hf} missing" >&2; exit 1; fi; bash /opt/dspark-patches/$${_hf} || exit 1; done; fi;
         if [ "$${_dspark_keys_set}" = "1" ] || [ -n "$${VLLM_API_KEY:-}" ]; then bash /opt/dspark-patches/hotfix-vllm-redact-api-key-log.sh || exit 1; bash /opt/dspark-patches/hotfix-vllm-redact-api-key-log.sh --status || exit 1; fi;
         if [ "$${DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT:-0}" = "1" ]; then python3 /opt/hotfix-vllm-issue138-responses-history.py || exit 1; fi;
-        python3 /opt/hotfix-dsv4-vision-exp.py || exit 1; if [ "$${DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py || exit 1; fi; python3 /opt/hotfix-vllm-empty-encoder-output.py || exit 1; python3 /opt/hotfix-dsv4-issue27-partial-prefill-concurrency.py || exit 1; python3 /opt/hotfix-dsv4-issue43-decode-fairness-and-diag.py || exit 1; python3 /opt/hotfix-dsv4-issue26-hybrid-swa-min.py || exit 1; python3 /opt/hotfix-dsv4-issue133-triton-specialization.py || exit 1; if [ "$${DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX:-0}" != "1" ]; then python3 /opt/hotfix-dsv4-suppress-stops-in-reasoning.py || exit 1; fi; VLLM_QUANTIZATION_ARGS="";
+        python3 /opt/hotfix-dsv4-vision-exp.py || exit 1; if [ "$${DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py || exit 1; fi; if [ "$${DSPARK_ENABLE_SP_INDEXER:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-sp-indexer-prefill.py || exit 1; fi; if [ "$${DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS:-0}" = "1" ]; then bash /opt/dspark-patches/hotfix-deepgemm-sm121-mqa-header-alias.sh || exit 1; fi; python3 /opt/hotfix-vllm-empty-encoder-output.py || exit 1; python3 /opt/hotfix-dsv4-issue27-partial-prefill-concurrency.py || exit 1; if [ "$${DSPARK_ENABLE_ADAPTIVE_CHUNK:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-adaptive-prefill-chunk.py || exit 1; fi; if [ "$${DSPARK_ENABLE_REPLICATE_MARKOV:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-replicate-markov-head.py || exit 1; fi; python3 /opt/hotfix-dsv4-issue43-decode-fairness-and-diag.py || exit 1; python3 /opt/hotfix-dsv4-issue26-hybrid-swa-min.py || exit 1; python3 /opt/hotfix-dsv4-issue133-triton-specialization.py || exit 1; if [ "$${DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX:-0}" != "1" ]; then python3 /opt/hotfix-dsv4-suppress-stops-in-reasoning.py || exit 1; fi; VLLM_QUANTIZATION_ARGS="";
         if [ "$${DSPARK_ENABLE_ASSISTANT_FINAL_HOTFIX:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-assistant-final-continuation.py || exit 1; fi;
         if [ "$${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}" = "1" ]; then python3 /opt/hotfix-vllm-issue136-xgrammar-termination.py || exit 1; fi;
         if [ "$${ENABLE_VLLM_GB10_PATCH:-0}" = "1" ]; then
@@ -370,7 +401,7 @@ services:
         --max-num-seqs ${MAX_NUM_SEQS:-6}
         --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS:-8192}
         --long-prefill-token-threshold ${LONG_PREFILL_TOKEN_THRESHOLD:-1024}
-        --max-cudagraph-capture-size $$(( ${MAX_NUM_SEQS:-6} * (${MTP_NUM_TOKENS:-6} + 1) ))
+        --max-cudagraph-capture-size $$(( ( ${MAX_NUM_SEQS:-6} * (${MTP_NUM_TOKENS:-6} + 1) + 7 ) / 8 * 8 ))
         --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.80}
         --enable-prefix-caching
         --enable-prompt-tokens-details
