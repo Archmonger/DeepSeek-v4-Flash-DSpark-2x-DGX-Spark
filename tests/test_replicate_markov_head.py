@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import py_compile
 import shutil
 import subprocess
@@ -17,6 +18,25 @@ REAL = (
     "qwen3_dspark.py"
 )
 IMAGE = "ghcr.io/anemll/dspark-vllm-gx10:0.1.1"
+
+
+def _image_runnable() -> bool:
+    """True only when the pinned image is already present locally and its
+    architecture matches this host (CI runners are amd64 and must neither pull
+    the 19 GB arm64 image nor try to exec it)."""
+    if shutil.which("docker") is None:
+        return False
+    try:
+        r = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{.Architecture}}", IMAGE],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if r.returncode != 0:
+        return False
+    arch, host = r.stdout.strip(), platform.machine()
+    return (arch, host) in {("arm64", "aarch64"), ("arm64", "arm64"), ("amd64", "x86_64")}
 
 
 def extract_real() -> Path:
@@ -46,6 +66,10 @@ def apply_to(path: Path) -> None:
 
 
 def main() -> int:
+    if not _image_runnable():
+        print(f"SKIP: {IMAGE} not present locally or not runnable on {platform.machine()}; "
+              "run on the GB10 host to exercise the real file")
+        return 0
     tmpd = Path(tempfile.mkdtemp())
     try:
         real = extract_real()

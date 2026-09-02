@@ -15,6 +15,7 @@ import importlib.util
 import os
 import py_compile
 import shutil
+import platform
 import subprocess
 import sys
 import tempfile
@@ -37,14 +38,26 @@ def _load_patch_module():
     return mod
 
 
-def _docker_available() -> bool:
+def _image_runnable() -> bool:
+    """True only when the pinned image is already present locally and its
+    architecture matches this host (CI runners are amd64 and must neither pull
+    the 19 GB arm64 image nor try to exec it)."""
     if shutil.which("docker") is None:
         return False
     try:
-        r = subprocess.run(["docker", "image", "inspect", IMAGE], capture_output=True, timeout=30)
-        return r.returncode == 0
-    except Exception:
+        r = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{.Architecture}}", IMAGE],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
         return False
+    if r.returncode != 0:
+        return False
+    arch, host = r.stdout.strip(), platform.machine()
+    return (arch, host) in {("arm64", "aarch64"), ("arm64", "arm64"), ("amd64", "x86_64")}
+
+
+_docker_available = _image_runnable
 
 
 class PatchApplyTest(unittest.TestCase):
