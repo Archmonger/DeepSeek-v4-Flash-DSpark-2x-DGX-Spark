@@ -14,9 +14,11 @@ from torch import nn
 from .image_processor import (
     IMAGE,
     IMAGE_TOKEN_ID,
+    current_routing_kind,
     is_unregistered_router_bias,
     is_vision_exp_weight_name,
-    token_routing_kind,
+    routing_kind_from_mm,
+    set_pending_routing_kind,
     vision_args_from_config,
 )
 from .processor import IMAGE_PLACEHOLDER, register_vision_exp_processor
@@ -152,6 +154,7 @@ def fused_topk_bias_split_vl(
     input_tokens: Any,
     hash_indices_table: Any,
     routed_scaling_factor: float,
+    kind: Any = None,
 ) -> tuple[Any, Any]:
     """Route image placeholder rows with bias_vl and no hash table (issue #175)."""
     from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
@@ -173,7 +176,8 @@ def fused_topk_bias_split_vl(
         )
 
     vl = _bias_data(e_score_correction_bias_vl)
-    kind = token_routing_kind(input_tokens)
+    if kind is None:
+        kind = current_routing_kind(input_tokens)
     if vl is None or kind == "text":
         return _call(
             hidden_states,
@@ -263,7 +267,14 @@ def _wrap_router_compute_routing(router: Any, gate: Any) -> None:
             capturing = bool(torch.cuda.is_current_stream_capturing())
         except Exception:
             capturing = False
-        if vl is None or capturing or token_routing_kind(input_ids) == "text":
+        # Order matters: capture must never resolve a kind (no host sync,
+        # no .item()) -- decode graphs only ever replay text tokens.
+        if vl is None or capturing:
+            return orig(
+                hidden_states, router_logits, indices_type, input_ids=input_ids
+            )
+        kind = current_routing_kind(input_ids)
+        if kind == "text":
             return orig(
                 hidden_states, router_logits, indices_type, input_ids=input_ids
             )
@@ -279,6 +290,7 @@ def _wrap_router_compute_routing(router: Any, gate: Any) -> None:
             input_tokens=input_ids,
             hash_indices_table=getattr(router, "_hash_indices_table", None),
             routed_scaling_factor=getattr(router, "routed_scaling_factor", 1.0),
+            kind=kind,
         )
         return _append_fused_shared_experts(router, topk_weights, topk_ids)
 
@@ -313,6 +325,70 @@ def embed_multimodal(self, **kwargs: object):
             )
         )
     return out
+
+
+def _num_tokens(input_ids: Any) -> int:
+    """Row count of a token tensor. ``numel`` is metadata: no host sync."""
+    if hasattr(input_ids, "numel"):
+        return int(input_ids.numel())
+    try:
+        return len(input_ids)
+    except TypeError:
+        return 0
+
+
+def make_embed_input_ids(orig_lm_embed):
+    """Wrap the stock ``embed_input_ids`` and classify the batch once (#175).
+
+    This runs once per forward, ahead of every MoE layer, and already knows
+    whether the step carries multimodal embeddings -- so a text-only step is
+    classified with zero device->host syncs.
+    """
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: Any = None,
+        *,
+        is_multimodal: Any = None,
+    ):
+        # Default for every early return below: no mm embeddings == text.
+        set_pending_routing_kind("text")
+        text_embeds = orig_lm_embed(self, input_ids)
+        if multimodal_embeddings is None:
+            return text_embeds
+        try:
+            empty = len(multimodal_embeddings) == 0
+        except TypeError:
+            empty = False
+        if empty:
+            return text_embeds
+        from vllm.model_executor.models.interfaces import _require_is_multimodal
+        from vllm.model_executor.models.utils import _merge_multimodal_embeddings
+
+        is_mm = _require_is_multimodal(is_multimodal)
+        n_placeholders = (
+            int(is_mm.sum().item()) if hasattr(is_mm, "sum") else int(is_mm)
+        )
+        n_embeds = _mm_embed_rows(multimodal_embeddings)
+        if n_placeholders != n_embeds:
+            raise ValueError(
+                "Vision-Exp placeholder/embedding mismatch: "
+                f"{n_embeds} multimodal tokens vs {n_placeholders} placeholders. "
+                "Image block length depends on start_pos%4; a content-only encoder "
+                "cache hit can reuse the wrong compress_pad (issue #172)."
+            )
+        # Reuses the sum above: the image path stays at one sync per forward.
+        set_pending_routing_kind(
+            routing_kind_from_mm(n_placeholders, _num_tokens(input_ids))
+        )
+        return _merge_multimodal_embeddings(
+            inputs_embeds=text_embeds,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_mm,
+        )
+
+    return embed_input_ids
 
 
 @classmethod
@@ -437,42 +513,7 @@ def apply_vision_exp(
 
     orig_lm_embed = DeepseekV4ForCausalLM.embed_input_ids
 
-    def embed_input_ids(
-        self,
-        input_ids: torch.Tensor,
-        multimodal_embeddings: Any = None,
-        *,
-        is_multimodal: Any = None,
-    ):
-        text_embeds = orig_lm_embed(self, input_ids)
-        if multimodal_embeddings is None:
-            return text_embeds
-        try:
-            empty = len(multimodal_embeddings) == 0
-        except TypeError:
-            empty = False
-        if empty:
-            return text_embeds
-        from vllm.model_executor.models.interfaces import _require_is_multimodal
-        from vllm.model_executor.models.utils import _merge_multimodal_embeddings
-
-        is_mm = _require_is_multimodal(is_multimodal)
-        n_placeholders = int(is_mm.sum().item()) if hasattr(is_mm, "sum") else int(is_mm)
-        n_embeds = _mm_embed_rows(multimodal_embeddings)
-        if n_placeholders != n_embeds:
-            raise ValueError(
-                "Vision-Exp placeholder/embedding mismatch: "
-                f"{n_embeds} multimodal tokens vs {n_placeholders} placeholders. "
-                "Image block length depends on start_pos%4; a content-only encoder "
-                "cache hit can reuse the wrong compress_pad (issue #172)."
-            )
-        return _merge_multimodal_embeddings(
-            inputs_embeds=text_embeds,
-            multimodal_embeddings=multimodal_embeddings,
-            is_multimodal=is_mm,
-        )
-
-    DeepseekV4ForCausalLM.embed_input_ids = embed_input_ids
+    DeepseekV4ForCausalLM.embed_input_ids = make_embed_input_ids(orig_lm_embed)
 
     if SupportsMultiModal not in DeepseekV4ForCausalLM.__mro__:
         DeepseekV4ForCausalLM.__bases__ = (

@@ -91,6 +91,93 @@ def token_routing_kind(input_tokens: Any, image_token_id: int = IMAGE_TOKEN_ID) 
     return "mixed"
 
 
+# --- per-forward routing kind (issue #175 host-sync removal) -----------------
+# ``token_routing_kind`` ends in ``.sum().item()``: a device->host sync. It used
+# to run once per MoE gate per forward (43 syncs, and prefill is never captured
+# into a CUDA graph, so plain text prompts paid them too). The runner now
+# classifies the batch once in ``embed_input_ids`` -- which runs before any MoE
+# layer -- and publishes the answer through ``_PENDING_ROUTING_KIND``. The first
+# MoE gate of the step moves it onto vLLM's per-step ``ForwardContext``; every
+# later gate then reads it for free.
+#
+# ``set_forward_context`` builds a fresh ``ForwardContext`` per step, so the
+# attribute cannot leak into the next step. An ``id(input_ids)`` memo would:
+# the runner hands out slices of one preallocated buffer, so each step gets a
+# new view object whose id is silently recycled.
+_ROUTING_KIND_CTX_ATTR = "_dspark_vision_exp_routing_kind"
+_PENDING_ROUTING_KIND = None
+
+
+def routing_kind_from_mm(n_placeholders: int, n_tokens: int) -> str:
+    """Routing kind from the multimodal placeholder count. No host sync.
+
+    ``n_placeholders`` is ``is_multimodal.sum()``, which ``embed_input_ids``
+    already reads for the issue #172 length check, so this costs nothing extra.
+    ``is_multimodal`` is the runner's authoritative "these rows get image
+    embeddings" mask, i.e. exactly the rows that must route with ``bias_vl``.
+    """
+    if n_placeholders <= 0:
+        return "text"
+    if n_placeholders >= n_tokens:
+        return "image"
+    return "mixed"
+
+
+def set_pending_routing_kind(kind: Any) -> None:
+    """Publish the routing kind for the forward that is about to start."""
+    global _PENDING_ROUTING_KIND
+    _PENDING_ROUTING_KIND = kind
+
+
+def _take_pending_routing_kind():
+    """One-shot read, so a stale kind can never be reused by a later forward."""
+    global _PENDING_ROUTING_KIND
+    kind = _PENDING_ROUTING_KIND
+    _PENDING_ROUTING_KIND = None
+    return kind
+
+
+def _forward_context_or_none():
+    """The current ``ForwardContext``, or None outside a vLLM forward."""
+    try:
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+    except Exception:
+        return None
+    try:
+        if not is_forward_context_available():
+            return None
+        return get_forward_context()
+    except Exception:
+        return None
+
+
+def current_routing_kind(
+    input_tokens: Any, image_token_id: int = IMAGE_TOKEN_ID
+) -> str:
+    """Routing kind of the running forward, computed at most once per step.
+
+    Falls back to a fresh ``token_routing_kind`` scan whenever the per-step
+    carrier is missing (no forward context, or a forward that never went
+    through ``embed_input_ids``), so the semantics are unchanged.
+    """
+    ctx = _forward_context_or_none()
+    if ctx is None:
+        return token_routing_kind(input_tokens, image_token_id)
+    kind = getattr(ctx, _ROUTING_KIND_CTX_ATTR, None)
+    if kind is None:
+        kind = _take_pending_routing_kind()
+        if kind is None:
+            kind = token_routing_kind(input_tokens, image_token_id)
+        try:
+            setattr(ctx, _ROUTING_KIND_CTX_ATTR, kind)
+        except Exception:
+            pass
+    return kind
+
+
 def is_vision_exp_weight_name(name: str) -> bool:
     """Checkpoint keys for the ViT/Aligner/image tokens.
 
