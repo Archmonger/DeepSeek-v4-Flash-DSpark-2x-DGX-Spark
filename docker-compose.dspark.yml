@@ -77,6 +77,9 @@ services:
       # output_text items replayed through the Responses API.
       - ${DSPARK_ISSUE138_HOTFIX:-./patches/hotfix-vllm-issue138-responses-history.py}:/opt/hotfix-vllm-issue138-responses-history.py:ro
       - ${DSPARK_PATCHES_DIR:-./patches}:/opt/dspark-patches:ro
+      # TP=3 group-pad patch (no-op unless TP_SIZE=3). Sourced from
+      # localaiguyy/DeepSeek-V4-Flash-DSpark-3x-DGX-Spark.
+      - ${TP3_PATCH_DIR:-./patches/tp3}:/opt/dsv4-tp3:ro
       - ${DSPARK_TMP_HOST:-${HOME}/.cache/dspark-tmp}:/tmp
 
     # Env surface is split by runtime image:
@@ -231,12 +234,16 @@ services:
       # so NCCL selects the RoCEv2/IPv4 GID per HCA.
       # See docs/ENVS.md for what each knob actually controls.
       NCCL_IB_MERGE_NICS: "${NCCL_IB_MERGE_NICS:-}"
+      NCCL_IB_SUBNET_AWARE_ROUTING: "${NCCL_IB_SUBNET_AWARE_ROUTING:-}"
+      NCCL_IB_SUBNET_PREFIX_LEN: "${NCCL_IB_SUBNET_PREFIX_LEN:-}"
       NCCL_NET_GDR_LEVEL: "${NCCL_NET_GDR_LEVEL:-}"
       NCCL_NET_GDR_READ: "${NCCL_NET_GDR_READ:-}"
       NCCL_DMABUF_ENABLE: "${NCCL_DMABUF_ENABLE:-}"
 
       NODE_RANK: "${NODE_RANK}"
       HEADLESS: "${HEADLESS:-}"
+      TP_SIZE: "${TP_SIZE:-2}"
+      NNODES: "${NNODES:-2}"
       MASTER_ADDR: "${MASTER_ADDR}"
       MASTER_PORT: "${MASTER_PORT:-25000}"
       # Checkpoint dspark_block_size is 5; k<5 truncates draft blocks (silent on 0.25.2 image).
@@ -291,6 +298,8 @@ services:
         export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$${LD_LIBRARY_PATH:-}";
         API_KEY_ARGS=(); case "$${DSPARK_API_KEYS:-}" in *[$$'\r\n\v\f']*) echo "error: DSPARK_API_KEYS must be a single-line space-separated list" >&2; exit 2 ;; *\\*) echo "error: DSPARK_API_KEYS must not contain backslashes" >&2; exit 2 ;; esac; _dspark_keys_set=0; case "$${DSPARK_API_KEYS:-}" in *[!$$' \t']*) _dspark_keys_set=1 ;; esac; if [ -n "$${VLLM_API_KEY:-}" ] && [ "$${_dspark_keys_set}" = "1" ]; then echo "error: VLLM_API_KEY and DSPARK_API_KEYS are both set; set exactly one of them" >&2; exit 2; fi; if [ "$${_dspark_keys_set}" = "1" ]; then read -r -a _dspark_keys <<< "$${DSPARK_API_KEYS}"; for _dspark_key in "$${_dspark_keys[@]}"; do case "$${_dspark_key}" in -*) echo "error: DSPARK_API_KEYS contains a token beginning with '-'" >&2; exit 2 ;; esac; done; API_KEY_ARGS=(--api-key "$${_dspark_keys[@]}"); fi;
         if [ -z "$${NCCL_IB_MERGE_NICS:-}" ]; then unset NCCL_IB_MERGE_NICS; fi;
+        if [ -z "$${NCCL_IB_SUBNET_AWARE_ROUTING:-}" ]; then unset NCCL_IB_SUBNET_AWARE_ROUTING; fi;
+        if [ -z "$${NCCL_IB_SUBNET_PREFIX_LEN:-}" ]; then unset NCCL_IB_SUBNET_PREFIX_LEN; fi;
         if [ -z "$${NCCL_NET_GDR_LEVEL:-}" ]; then unset NCCL_NET_GDR_LEVEL; fi;
         if [ -z "$${NCCL_NET_GDR_READ:-}" ]; then unset NCCL_NET_GDR_READ; fi;
         if [ -z "$${NCCL_DMABUF_ENABLE:-}" ]; then unset NCCL_DMABUF_ENABLE; fi;
@@ -325,6 +334,10 @@ services:
           export VLLM_PLUGINS="$${VLLM_PLUGINS:-gb10_hybrid_nvfp4}";
           VLLM_QUANTIZATION_ARGS="--quantization modelopt_gb10_hybrid";
         fi;
+        if [ "${TP_SIZE:-2}" = "3" ]; then
+          if [ ! -f /opt/dsv4-tp3/apply_tp3_patch.py ]; then echo "FATAL: TP_SIZE=3 but /opt/dsv4-tp3/apply_tp3_patch.py is missing" >&2; exit 1; fi;
+          python3 /opt/dsv4-tp3/apply_tp3_patch.py || exit 1;
+        fi;
         case "$${DRAFT_SAMPLE_METHOD:-probabilistic}" in
           probabilistic|greedy) DRAFT_SAMPLE_METHOD="$${DRAFT_SAMPLE_METHOD:-probabilistic}" ;;
           *) echo "DRAFT_SAMPLE_METHOD must be one of: probabilistic, greedy (got: $${DRAFT_SAMPLE_METHOD})" >&2; exit 2 ;;
@@ -348,7 +361,7 @@ services:
         --trust-remote-code
         "$${API_KEY_ARGS[@]}"
         $${VLLM_QUANTIZATION_ARGS}
-        --tensor-parallel-size 2
+        --tensor-parallel-size ${TP_SIZE:-2}
         --pipeline-parallel-size 1
         --kv-cache-dtype nvfp4_ds_mla
         --block-size 256
@@ -374,7 +387,7 @@ services:
         --default-chat-template-kwargs "$${DEFAULT_CHAT_TEMPLATE_KWARGS}"
         --generation-config vllm
         --enable-flashinfer-autotune
-        --nnodes 2
+        --nnodes ${NNODES:-2}
         --node-rank ${NODE_RANK}
         --master-addr ${MASTER_ADDR}
         --master-port ${MASTER_PORT:-25000}

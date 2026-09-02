@@ -13,6 +13,7 @@ bad() { printf '  FAIL %s\n' "$*" >&2; fail=1; }
 echo "== shell syntax =="
 for f in \
   start-deepseek-v4-flash-dspark.sh \
+  start-tp3.sh \
   stop-deepseek-v4-flash-dspark.sh \
   validate-dspark-config.sh \
   prepare-dspark-model-cache.sh \
@@ -28,6 +29,7 @@ for f in \
   scripts/test-nccl-ib-hca-gid-resolve.sh \
   scripts/boot-shape-warmup.sh \
   scripts/test-boot-shape-warmup.sh \
+  scripts/validate_tp3.sh \
   lmcache/run-lmcache-server.sh \
   scripts/test-lmcache-compose-gate.sh \
   patches/*.sh
@@ -304,9 +306,9 @@ if grep -Fq 'hotfix-vllm-issue138-responses-history.py}:/opt/hotfix-vllm-issue13
   && grep -Fq '# Issue #138 Responses history compatibility pre-flight (begin).' start-deepseek-v4-flash-dspark.sh \
   && grep -Fq 'issue138 Responses history compatibility: 0 (stock)' start-deepseek-v4-flash-dspark.sh \
   && grep -Fq 'issue138 Responses history compatibility: 1 (apply)' start-deepseek-v4-flash-dspark.sh \
-  && [ "$issue138_worker_count" -eq 2 ] \
+  && [ "$issue138_worker_count" -eq 4 ] \
   && grep -Fq 'scp "$DSPARK_ISSUE138_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-issue138-responses-history.py"' start-deepseek-v4-flash-dspark.sh; then
-  ok "issue138 hotfix is default-off, exact-1 fail-closed, preflighted, reported, and propagated to both ranks"
+  ok "issue138 hotfix is default-off, exact-1 fail-closed, preflighted, reported, and propagated to worker1 and worker2"
 else
   bad "issue138 Responses history hotfix wiring is incomplete"
 fi
@@ -375,6 +377,40 @@ if grep -Fq 'bash /opt/dspark-patches/hotfix-vllm-redact-api-key-log.sh || exit 
   ok "compose redaction gate is fail-closed and worker sync retains the patch"
 else
   bad "redact-api-key-log must apply + verify outside the optional loop and remain in worker sync"
+fi
+
+# Optional TP=3: pad only at TP_SIZE=3; default start still forces two nodes.
+if [ -f start-tp3.sh ] && grep -Fq 'export DSPARK_TP3=1' start-tp3.sh \
+  && grep -Fq 'exec "$SCRIPT_DIR/start-deepseek-v4-flash-dspark.sh"' start-tp3.sh \
+  && grep -Fq -- '--max-num-seqs' start-tp3.sh; then
+  ok "start-tp3.sh is an opt-in exec wrapper with --max-num-seqs"
+else
+  bad "start-tp3.sh must exec the 2-node start with DSPARK_TP3=1 and --max-num-seqs"
+fi
+
+if grep -Fq 'DSPARK_TP3="${DSPARK_TP3:-0}"' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'TP_SIZE=2' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'NNODES=2' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq ': "${WORKER2_HOST:?WORKER2_HOST must be set' start-deepseek-v4-flash-dspark.sh; then
+  ok "2-node start forces TP=2/NNODES=2; TP=3 requires WORKER2_HOST"
+else
+  bad "start-deepseek-v4-flash-dspark.sh must force TP=2 unless DSPARK_TP3=1"
+fi
+
+if grep -Fq 'if [ "${TP_SIZE:-2}" = "3" ]; then' docker-compose.dspark.yml \
+  && grep -Fq 'python3 /opt/dsv4-tp3/apply_tp3_patch.py' docker-compose.dspark.yml \
+  && grep -Fq -- '--tensor-parallel-size ${TP_SIZE:-2}' docker-compose.dspark.yml \
+  && grep -Fq -- '--nnodes ${NNODES:-2}' docker-compose.dspark.yml \
+  && grep -Fq '/opt/dsv4-tp3:ro' docker-compose.dspark.yml; then
+  ok "compose interpolates TP_SIZE/NNODES and gates the TP=3 pad"
+else
+  bad "compose must interpolate TP_SIZE/NNODES and apply the pad only at TP_SIZE=3"
+fi
+
+if [ -f patches/tp3/apply_tp3_patch.py ] && [ -f patches/dsv4_tp_pad.py ] && [ -f scripts/validate_tp3.sh ]; then
+  ok "TP=3 pad + validate_tp3.sh present"
+else
+  bad "missing patches/tp3/apply_tp3_patch.py, patches/dsv4_tp_pad.py, or scripts/validate_tp3.sh"
 fi
 
 if [ "$fail" -ne 0 ]; then

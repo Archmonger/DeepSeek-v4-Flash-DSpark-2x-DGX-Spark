@@ -133,6 +133,68 @@ nfs_worker_has_model() {
   ssh_worker "docker run --rm -v '${NFS_VOLUME}:/hf:ro' alpine:latest test -d '/hf/${rel}'" >/dev/null 2>&1
 }
 
+# Head CX7 IPv4s on the onboard dual-port (enp1s*), not the 10.0.0.x lo alias
+# and not docker bridges. A 3-node QSFP ring puts each peer on a different /24.
+nfs_head_cx_ipv4s() {
+  ip -4 -o addr show | awk '$2 ~ /^enp1s/ { split($4, a, "/"); print a[1] }'
+}
+
+nfs_pick_server_ip_for_host() {
+  local host="$1"
+  local pinned="${2:-}"
+  local ip
+  if [ -n "$pinned" ]; then
+    printf '%s' "$pinned"
+    return 0
+  fi
+  for ip in $(nfs_head_cx_ipv4s); do
+    if ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" \
+      "ping -c1 -W1 $(printf '%q' "$ip") >/dev/null 2>&1"; then
+      printf '%s' "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+nfs_subnet24() {
+  local ip="$1"
+  printf '%s.0/24' "${ip%.*}"
+}
+
+# Additive: allow a new /24 on an already-running exporter (vllm-fn-nfs or
+# dspark-nfs). Does not recreate the container (Qwen may be using the share).
+nfs_grant_subnet() {
+  local subnet="$1"
+  local c opts line
+  opts="${NFS_OPTS:-ro,sync,no_subtree_check,no_root_squash,insecure,fsid=0}"
+  for c in vllm-fn-nfs "${NFS_CONTAINER:-dspark-nfs}"; do
+    [ -n "$(docker ps -q --filter "name=^/${c}$")" ] || continue
+    line="/export ${subnet}(${opts})"
+    docker exec "$c" sh -c "
+      set -e
+      if grep -Fq '${subnet}(' /etc/exports 2>/dev/null; then
+        echo 'exports already allow ${subnet}'
+        exit 0
+      fi
+      echo '${line}' >> /etc/exports
+      exportfs -rav
+    " || nfs_info "WARN: could not add ${subnet} to ${c} exports"
+  done
+}
+
+nfs_ensure_host_volume() {
+  local host="$1"
+  local server_ip="$2"
+  ssh "$host" "docker volume rm '$NFS_VOLUME' >/dev/null 2>&1 || true"
+  ssh "$host" "docker volume create --driver local \
+    --opt type=nfs \
+    --opt o=addr=${server_ip},nfsvers=4.2,ro,nconnect=8,rsize=1048576,wsize=1048576,hard,timeo=600 \
+    --opt device=:/ \
+    '$NFS_VOLUME' >/dev/null"
+  nfs_ok "Worker volume $NFS_VOLUME on ${host} → nfs://${server_ip}/"
+}
+
 nfs_stop_owned_server() {
   # Only the DSpark-owned container. Never docker rm vllm-fn-nfs — Qwen may
   # still be using that export.
