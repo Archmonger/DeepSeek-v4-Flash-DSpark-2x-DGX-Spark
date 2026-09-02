@@ -13,6 +13,8 @@
 
 ### Changed
 
+- **Fresh deployments now default to `DEFAULT_THINKING=low`**: `.env.dspark.example` matches the compose and launcher fallbacks. Set `high` or `max` for more reasoning effort; request-level `chat_template_kwargs` still overrides the server default.
+
 - **README documents that structured `image_url` on `tool` / `function` is HTTP 400 ([Issue #178](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/178))**: same official user-only-images rule as `system` / `assistant`. Vision-tool results must go on a `user` turn; a 400'd tool image stays in history and blocks the session. Serve behavior is unchanged.
 
 ## 2026-09-01
