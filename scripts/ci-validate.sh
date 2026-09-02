@@ -213,11 +213,11 @@ else
   bad "compose must apply #26 + #27 with || exit 1"
 fi
 # The safe #27 cap must agree across the fresh-clone env and Compose fallback.
-if grep -Fxq 'DSPARK_MAX_INFLIGHT_PREFILLS=1' .env.dspark.example \
-  && grep -Fq 'DSPARK_MAX_INFLIGHT_PREFILLS: "${DSPARK_MAX_INFLIGHT_PREFILLS:-1}"' docker-compose.dspark.yml; then
-  ok "issue27 in-flight prefill cap defaults to 1"
+if grep -Fxq 'DSPARK_MAX_INFLIGHT_PREFILLS=2' .env.dspark.example \
+  && grep -Fq 'DSPARK_MAX_INFLIGHT_PREFILLS: "${DSPARK_MAX_INFLIGHT_PREFILLS:-2}"' docker-compose.dspark.yml; then
+  ok "issue27 in-flight prefill cap defaults to 2 (A/B 2026-09-02)"
 else
-  bad "issue27 in-flight prefill cap must default to 1 in env example and compose"
+  bad "issue27 in-flight prefill cap must default to 2 in env example and compose"
 fi
 if grep -Fq 'hotfix-dsv4-issue133-triton-specialization.py}:/opt/hotfix-dsv4-issue133-triton-specialization.py:ro' docker-compose.dspark.yml \
   && grep -Fq 'python3 /opt/hotfix-dsv4-issue133-triton-specialization.py || exit 1' docker-compose.dspark.yml \
