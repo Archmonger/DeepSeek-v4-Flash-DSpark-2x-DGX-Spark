@@ -372,12 +372,14 @@ if [ "$fail" -ne 0 ]; then
   exit 1
 fi
 
-# Healthcheck present and worker-gated (rank 1 is headless; must not false-unhealthy)
+# Healthcheck present, worker-gated, and probing the compose-time VLLM_HOST
+# (rank 1 is headless; a hardcoded 127.0.0.1 probe is wrong for a LAN-IP bind).
 if grep -q "healthcheck:" docker-compose.dspark.yml \
-  && grep -qF 'if [ -n \"$$HEADLESS\" ]' docker-compose.dspark.yml; then
-  ok "compose healthcheck present and HEADLESS-gated"
+  && grep -qF 'if [ -n \"$$HEADLESS\" ]' docker-compose.dspark.yml \
+  && grep -qF "urlhost='\${VLLM_HOST:-127.0.0.1}'" docker-compose.dspark.yml; then
+  ok "compose healthcheck present, HEADLESS-gated, and VLLM_HOST-aware"
 else
-  bad "compose healthcheck missing or not HEADLESS-gated"
+  bad "compose healthcheck missing, not HEADLESS-gated, or still hardcoded to 127.0.0.1"
 fi
 
 echo "CI validate passed (CPU recipe gates only)."

@@ -16,8 +16,13 @@ services:
     # (double) is evaluated in the container at runtime; ${VLLM_PORT:-8888} is
     # resolved by Compose. start_period covers cold model load (~6 min measured;
     # raise it if your storage is slower).
+    # ${VLLM_HOST:-127.0.0.1} is resolved by Compose too; the in-container guard
+    # maps a wildcard 0.0.0.0 / :: bind back to 127.0.0.1 so LAN-IP deployments
+    # probe the interface the server actually bound (issue #185). Do not defer
+    # $$VLLM_HOST: that env is compose-only and is not in the container
+    # environment: block (only VLLM_HOST_IP is).
     healthcheck:
-      test: ["CMD-SHELL", "if [ -n \"$$HEADLESS\" ]; then exit 0; fi; curl -fsS http://127.0.0.1:${VLLM_PORT:-8888}/health || exit 1"]
+      test: ["CMD-SHELL", "if [ -n \"$$HEADLESS\" ]; then exit 0; fi; urlhost='${VLLM_HOST:-127.0.0.1}'; case \"$$urlhost\" in 0.0.0.0|::|'[::]') urlhost=127.0.0.1 ;; esac; curl -fsS http://$$urlhost:${VLLM_PORT:-8888}/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3

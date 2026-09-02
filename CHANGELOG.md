@@ -1,3 +1,9 @@
+## 2026-09-02
+
+### Fixed
+
+- **Compose healthcheck probes `VLLM_HOST`, not hardcoded `127.0.0.1` ([Issue #185](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/185))**: with `network_mode: host`, vLLM binds only `--host ${VLLM_HOST}`. A LAN-IP bind (not `0.0.0.0` / `127.0.0.1`) left `/health` off loopback, so Docker reported permanent `unhealthy` while the API served. Compose bakes `VLLM_HOST` at config time (it is not in the container `environment:`); wildcards still map to `127.0.0.1`. Recreate (`./stop` then `./start`) so the healthcheck Test is re-baked; a container restart keeps the old probe.
+
 ## 2026-09-01
 
 ### Fixed
