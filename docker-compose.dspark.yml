@@ -223,6 +223,12 @@ services:
       # with overwrite=0 — a defined-empty variable would silently mask them.
       # Configured non-empty values pass through unchanged; an empty value is
       # normalized to absent, so it cannot be used to force an empty setting.
+      # NCCL_IB_GID_INDEX joins the same normalization with one extra reason:
+      # NCCL parses a defined-empty value as GID index 0 (the fe80 link-local
+      # entry), and NCCL_IB_GID_AUTO=1 deliberately leaves it empty — the map
+      # key always renders (the launcher's empty value masks a stale .env
+      # entry) and the entrypoint makes that empty truly absent on both ranks
+      # so NCCL selects the RoCEv2/IPv4 GID per HCA.
       # See docs/ENVS.md for what each knob actually controls.
       NCCL_IB_MERGE_NICS: "${NCCL_IB_MERGE_NICS:-}"
       NCCL_NET_GDR_LEVEL: "${NCCL_NET_GDR_LEVEL:-}"
@@ -285,6 +291,7 @@ services:
         if [ -z "$${NCCL_NET_GDR_LEVEL:-}" ]; then unset NCCL_NET_GDR_LEVEL; fi;
         if [ -z "$${NCCL_NET_GDR_READ:-}" ]; then unset NCCL_NET_GDR_READ; fi;
         if [ -z "$${NCCL_DMABUF_ENABLE:-}" ]; then unset NCCL_DMABUF_ENABLE; fi;
+        if [ -z "$${NCCL_IB_GID_INDEX:-}" ]; then unset NCCL_IB_GID_INDEX; fi;
         if [ -n "$${TORCH_FR_DUMP_TEMP_FILE:-}" ]; then mkdir -p "$$(dirname "$${TORCH_FR_DUMP_TEMP_FILE}")" || echo "warn: cannot create flight-recorder dump dir; dumps will be lost (boot continues)" >&2; fi;
         ENCODING_SOURCE="$${DSPARK_ENCODING_FILE:-}";
         if [ -z "$${ENCODING_SOURCE}" ]; then
