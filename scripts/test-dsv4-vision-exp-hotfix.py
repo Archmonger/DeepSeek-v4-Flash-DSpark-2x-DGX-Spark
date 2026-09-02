@@ -56,6 +56,7 @@ ENC_MARK = _mod.ENC_MARK
 ENC_ROLE_MARK = _mod.ENC_ROLE_MARK
 ENC_ROLE_PAIRED_MARK = _mod.ENC_ROLE_PAIRED_MARK
 ENC_ROLE_TOOL_MARK = _mod.ENC_ROLE_TOOL_MARK
+ENC_ROLE_QUOTE_MARK = _mod.ENC_ROLE_QUOTE_MARK
 MODEL_MARK = _mod.MODEL_MARK
 DSPARK_MARK = _mod.DSPARK_MARK
 
@@ -310,6 +311,7 @@ def _process_image_blocks(blocks):
         self.assertEqual(status, "applied")
         self.assertIn(ENC_MARK, updated)
         self.assertIn(ENC_ROLE_MARK, updated)
+        self.assertIn(ENC_ROLE_QUOTE_MARK, updated)
         skipped, status2 = patch_encoding_text(updated)
         self.assertEqual(status2, "skipped")
         self.assertEqual(updated, skipped)
@@ -353,14 +355,18 @@ def _process_image_blocks(blocks):
         ns["_validate_no_image_sp_tokens"](
             {"role": "assistant", "content": "example: <image> in markdown"}
         )
-        with self.assertRaises(ValueError) as paired_err:
-            ns["_validate_no_image_sp_tokens"](
-                {
-                    "role": "system",
-                    "content": "load <image>/tmp/shot.png</image> now",
-                }
-            )
-        self.assertIn("user messages only", str(paired_err.exception))
+        ns["_validate_no_image_sp_tokens"](
+            {
+                "role": "system",
+                "content": "load <image>/tmp/shot.png</image> now",
+            }
+        )
+        ns["_validate_no_image_sp_tokens"](
+            {
+                "role": "assistant",
+                "content": "yes — OpenAI `image_url` parts and `<image>path</image>` tags",
+            }
+        )
         ns["_validate_no_image_sp_tokens"](
             {
                 "role": "tool",
@@ -458,12 +464,19 @@ def _validate_no_image_sp_tokens(msg):
         self.assertEqual(status2, "applied")
         self.assertIn(ENC_ROLE_PAIRED_MARK, upgraded)
         self.assertIn(ENC_ROLE_TOOL_MARK, upgraded)
+        self.assertIn(ENC_ROLE_QUOTE_MARK, upgraded)
         ns: dict = {}
         exec(compile(upgraded, "encoding.py", "exec"), ns)
         ns["_validate_no_image_sp_tokens"](
             {
                 "role": "system",
                 "content": "Markdown images look like <image> tags.",
+            }
+        )
+        ns["_validate_no_image_sp_tokens"](
+            {
+                "role": "assistant",
+                "content": "yes — `<image>path</image>` tags",
             }
         )
 
@@ -532,6 +545,7 @@ def _validate_no_image_sp_tokens(msg):
         upgraded, status2 = patch_encoding_text(stale)
         self.assertEqual(status2, "applied")
         self.assertIn(ENC_ROLE_TOOL_MARK, upgraded)
+        self.assertIn(ENC_ROLE_QUOTE_MARK, upgraded)
         skipped, status3 = patch_encoding_text(upgraded)
         self.assertEqual(status3, "skipped")
         self.assertEqual(upgraded, skipped)
@@ -540,9 +554,105 @@ def _validate_no_image_sp_tokens(msg):
         ns["_validate_no_image_sp_tokens"](
             {"role": "tool", "content": "mentions " + ns["IMAGE_PLACEHOLDER"]}
         )
+        ns["_validate_no_image_sp_tokens"](
+            {
+                "role": "assistant",
+                "content": "yes — OpenAI `image_url` parts and `<image>path</image>` tags",
+            }
+        )
         with self.assertRaises(ValueError):
             ns["_validate_no_image_sp_tokens"](
                 {"role": "assistant", "content": ns["IMAGE_PLACEHOLDER"]}
+            )
+
+    def test_encoding_role_check_upgrades_quoted_paired_tags(self):
+        src = '''
+IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
+
+def _validate_no_image_sp_tokens(msg):
+    content = msg.get("content")
+    if isinstance(content, str) and IMAGE_PLACEHOLDER in content:
+        raise ValueError("bad")
+    reasoning_content = msg.get("reasoning_content")
+    if isinstance(reasoning_content, str) and IMAGE_PLACEHOLDER in reasoning_content:
+        raise ValueError("bad-reason")
+
+def _process_image_blocks(blocks):
+    text = blocks[0].get("text") or ""
+    if IMAGE_PLACEHOLDER in text:
+        raise ValueError("bad-text")
+'''
+        first, status = patch_encoding_text(src)
+        self.assertEqual(status, "applied")
+        stale_inject = f'''
+{ENC_ROLE_MARK}
+{ENC_ROLE_PAIRED_MARK}
+{ENC_ROLE_TOOL_MARK}
+def _dspark_vision_text_has_image(text: str) -> bool:
+    if IMAGE_PLACEHOLDER in text:
+        return True
+    needle, close = "<image>", "</image>"
+    start = 0
+    while True:
+        i = text.find(needle, start)
+        if i < 0:
+            return False
+        if text.find(close, i + len(needle)) >= 0:
+            return True
+        start = i + len(needle)
+
+
+def _dspark_vision_value_has_image(value, scan_text: bool = True) -> bool:
+    if isinstance(value, str):
+        return bool(scan_text) and _dspark_vision_text_has_image(value)
+    return False
+
+
+def _validate_no_image_sp_tokens(msg):
+    role = msg.get("role")
+    if role in ("user", "developer"):
+        return
+    scan_text = role not in ("tool", "function")
+    if _dspark_vision_value_has_image(msg.get("content"), scan_text):
+        raise ValueError(
+            "Images are supported in user messages only: "
+            "images in " + repr(role) + " messages return a 400 error."
+        )
+'''
+        stale = first[: first.rfind(ENC_ROLE_MARK)] + stale_inject
+        self.assertIn(ENC_ROLE_TOOL_MARK, stale)
+        self.assertNotIn(ENC_ROLE_QUOTE_MARK, stale)
+        ns_stale: dict = {}
+        exec(compile(stale, "encoding.py", "exec"), ns_stale)
+        quoted = "yes — OpenAI `image_url` parts and `<image>path</image>` tags"
+        with self.assertRaises(ValueError):
+            ns_stale["_validate_no_image_sp_tokens"](
+                {"role": "assistant", "content": quoted}
+            )
+        upgraded, status2 = patch_encoding_text(stale)
+        self.assertEqual(status2, "applied")
+        self.assertIn(ENC_ROLE_QUOTE_MARK, upgraded)
+        skipped, status3 = patch_encoding_text(upgraded)
+        self.assertEqual(status3, "skipped")
+        self.assertEqual(upgraded, skipped)
+        ns: dict = {}
+        exec(compile(upgraded, "encoding.py", "exec"), ns)
+        ns["_validate_no_image_sp_tokens"]({"role": "assistant", "content": quoted})
+        ns["_validate_no_image_sp_tokens"](
+            {"role": "system", "content": "load <image>/tmp/shot.png</image> now"}
+        )
+        with self.assertRaises(ValueError):
+            ns["_validate_no_image_sp_tokens"](
+                {"role": "assistant", "content": ns["IMAGE_PLACEHOLDER"]}
+            )
+        with self.assertRaises(ValueError):
+            ns["_validate_no_image_sp_tokens"](
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "http://x/y.png"}}
+                    ],
+                }
             )
 
     def test_dspark_remaps_bias_vl_before_lookup(self):

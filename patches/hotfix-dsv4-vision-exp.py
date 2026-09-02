@@ -17,8 +17,10 @@ startup patch:
    vLLM's chat parser, then restores the official Chat Completions rule:
    images in ``user`` messages only (``system`` / ``assistant`` → 400).
    ``tool`` / ``function`` *result text* is not scanned for image markers
-   (a ``cat`` of this file must not 400). Structured ``image`` /
-   ``image_url`` parts in those roles still 400.
+   (a ``cat`` of this file must not 400). Quoted ``<image>…</image>`` in
+   ``system`` / ``assistant`` prose is also not an image (the served path
+   only accepts structured ``image`` / ``image_url`` parts). Structured
+   parts and the raw placeholder token in those roles still 400.
 
 Video is not wired: the official weights, ``encoding/``, and ``inference/``
 have no video encoder. GIF is decoded as a still RGB frame.
@@ -47,6 +49,9 @@ ENC_MARK = "# [vision-exp-hotfix] allow vLLM-inserted image placeholders"
 ENC_ROLE_MARK = "# [vision-exp-hotfix] images only in user messages"
 ENC_ROLE_PAIRED_MARK = "# [vision-exp-hotfix] paired <image> tag (issue 165)"
 ENC_ROLE_TOOL_MARK = "# [vision-exp-hotfix] tool text is not an image (issue 167)"
+ENC_ROLE_QUOTE_MARK = (
+    "# [vision-exp-hotfix] quoted paired tags are prose (issue 181)"
+)
 DSPARK_MARK = "# [vision-exp-hotfix] remap ffn.gate.bias_vl"
 
 DSPARK_GATE_BIAS_OLD = '''                if name.endswith(".ffn.gate.bias"):
@@ -102,18 +107,11 @@ ENC_ROLE_INJECT = f'''
 {ENC_ROLE_MARK}
 {ENC_ROLE_PAIRED_MARK}
 {ENC_ROLE_TOOL_MARK}
+{ENC_ROLE_QUOTE_MARK}
 def _dspark_vision_text_has_image(text: str) -> bool:
-    if IMAGE_PLACEHOLDER in text:
-        return True
-    needle, close = "<image>", "</image>"
-    start = 0
-    while True:
-        i = text.find(needle, start)
-        if i < 0:
-            return False
-        if text.find(close, i + len(needle)) >= 0:
-            return True
-        start = i + len(needle)
+    # Serve path has no tagged-text expander: only the raw placeholder
+    # token in non-user prose is an image. Quoted <image>…</image> is not.
+    return IMAGE_PLACEHOLDER in text
 
 
 def _dspark_vision_value_has_image(value, scan_text: bool = True) -> bool:
@@ -170,12 +168,19 @@ def patch_model_text(source: str) -> tuple[str, str]:
     return updated, "applied"
 
 
+def _encoding_role_complete(source: str) -> bool:
+    return (
+        ENC_ROLE_MARK in source
+        and ENC_ROLE_PAIRED_MARK in source
+        and ENC_ROLE_TOOL_MARK in source
+        and ENC_ROLE_QUOTE_MARK in source
+    )
+
+
 def patch_encoding_text(source: str) -> tuple[str, str]:
     if (
         ENC_MARK in source
-        and ENC_ROLE_MARK in source
-        and ENC_ROLE_PAIRED_MARK in source
-        and ENC_ROLE_TOOL_MARK in source
+        and _encoding_role_complete(source)
         and CONTENT_CHECK_NEW in source
     ):
         return source, "skipped"
@@ -194,9 +199,7 @@ def patch_encoding_text(source: str) -> tuple[str, str]:
             source = source.replace(old, new, 1)
         if missing:
             return source, "drift:" + ",".join(missing)
-    if ENC_ROLE_MARK in source and (
-        ENC_ROLE_PAIRED_MARK not in source or ENC_ROLE_TOOL_MARK not in source
-    ):
+    if ENC_ROLE_MARK in source and not _encoding_role_complete(source):
         source = source[: source.rfind(ENC_ROLE_MARK)].rstrip() + "\n"
     if ENC_ROLE_MARK not in source:
         source = source.rstrip() + "\n" + ENC_ROLE_INJECT
@@ -237,9 +240,7 @@ def main() -> int:
         print(
             "vision-exp encoding.py                 :",
             "APPLIED"
-            if ENC_MARK in encoding and ENC_ROLE_MARK in encoding
-            and ENC_ROLE_PAIRED_MARK in encoding
-            and ENC_ROLE_TOOL_MARK in encoding
+            if ENC_MARK in encoding and _encoding_role_complete(encoding)
             else "NOT APPLIED",
         )
         print(
@@ -249,9 +250,7 @@ def main() -> int:
         ok = (
             MODEL_MARK in model
             and ENC_MARK in encoding
-            and ENC_ROLE_MARK in encoding
-            and ENC_ROLE_PAIRED_MARK in encoding
-            and ENC_ROLE_TOOL_MARK in encoding
+            and _encoding_role_complete(encoding)
             and DSPARK_MARK in dspark
         )
         return 0 if ok else 1
