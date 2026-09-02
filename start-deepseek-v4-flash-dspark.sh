@@ -254,6 +254,22 @@ if [ "$DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT" = "1" ] && [ ! -f "$DSPA
   exit 1
 fi
 # Issue #138 Responses history compatibility pre-flight (end).
+# Codex agent_message compatibility pre-flight (begin).
+case "${DSPARK_ENABLE_CODEX_AGENT_MESSAGE_COMPAT:-0}" in
+  1) DSPARK_ENABLE_CODEX_AGENT_MESSAGE_COMPAT=1 ;;
+  *) DSPARK_ENABLE_CODEX_AGENT_MESSAGE_COMPAT=0 ;;
+esac
+DSPARK_CODEX_AGENT_MESSAGE_HOTFIX="${DSPARK_CODEX_AGENT_MESSAGE_HOTFIX:-patches/hotfix-vllm-codex-agent-message.py}"
+case "$DSPARK_CODEX_AGENT_MESSAGE_HOTFIX" in
+  /*) ;;
+  *) DSPARK_CODEX_AGENT_MESSAGE_HOTFIX="$SCRIPT_DIR/$DSPARK_CODEX_AGENT_MESSAGE_HOTFIX" ;;
+esac
+export DSPARK_ENABLE_CODEX_AGENT_MESSAGE_COMPAT DSPARK_CODEX_AGENT_MESSAGE_HOTFIX
+if [ "$DSPARK_ENABLE_CODEX_AGENT_MESSAGE_COMPAT" = "1" ] && [ ! -f "$DSPARK_CODEX_AGENT_MESSAGE_HOTFIX" ]; then
+  echo "error: Codex agent_message compatibility is enabled but patcher is missing: $DSPARK_CODEX_AGENT_MESSAGE_HOTFIX" >&2
+  exit 1
+fi
+# Codex agent_message compatibility pre-flight (end).
 # Issue #141 is exact-1 and default-off. Normalize the effective switch once so
 # head and worker receive the same 0/1 value, and fail before remote side effects
 # when an enabled start cannot mount the selected local patch source.
@@ -822,6 +838,11 @@ print_resolved_profile() {
   else
     echo "  issue138 Responses history compatibility: 0 (stock)"
   fi
+  if [ "$DSPARK_ENABLE_CODEX_AGENT_MESSAGE_COMPAT" = "1" ]; then
+    echo "  Codex agent_message compatibility: 1 (apply)"
+  else
+    echo "  Codex agent_message compatibility: 0 (stock)"
+  fi
   echo "  issue136 XGrammar termination hotfix: ${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0} (0=stock / 1=preflight+apply)"
   if [ "${DSPARK_SKIP_ISSUE117_RECHECK_HOTFIX:-0}" = "1" ]; then
     echo "  issue117 SHM ring hotfix: skipped (issue79 remains independent)"
@@ -884,7 +905,7 @@ validate_compose() {
   echo "Validating head compose config..."
   compose_base 0 "" config --quiet
   echo "Validating worker compose config..."
-  remote_compose "NODE_RANK=1 HEADLESS=1 $WORKER_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK='$DSPARK_ISSUE141_EFFECTIVE' DSPARK_ISSUE141_HOTFIX='./patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT='$DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT' DSPARK_ISSUE138_HOTFIX='./patches/hotfix-vllm-issue138-responses-history.py' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER_COMPOSE_FILES config --quiet"
+  remote_compose "NODE_RANK=1 HEADLESS=1 $WORKER_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK='$DSPARK_ISSUE141_EFFECTIVE' DSPARK_ISSUE141_HOTFIX='./patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT='$DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT' DSPARK_ISSUE138_HOTFIX='./patches/hotfix-vllm-issue138-responses-history.py' DSPARK_ENABLE_CODEX_AGENT_MESSAGE_COMPAT='$DSPARK_ENABLE_CODEX_AGENT_MESSAGE_COMPAT' DSPARK_CODEX_AGENT_MESSAGE_HOTFIX='./patches/hotfix-vllm-codex-agent-message.py' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER_COMPOSE_FILES config --quiet"
 }
 
 need_cmd docker
@@ -1090,6 +1111,11 @@ if [ -f "$DSPARK_ISSUE138_HOTFIX" ]; then
   ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
   scp "$DSPARK_ISSUE138_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-issue138-responses-history.py"
 fi
+if [ -f "$DSPARK_CODEX_AGENT_MESSAGE_HOTFIX" ]; then
+  echo "Syncing Codex agent_message compatibility patcher to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_CODEX_AGENT_MESSAGE_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-codex-agent-message.py"
+fi
 if [ -f "$DSPARK_ISSUE136_XGRAMMAR_HOTFIX" ] && [ ! -L "$DSPARK_ISSUE136_XGRAMMAR_HOTFIX" ]; then
   echo "Syncing Issue #136 XGrammar termination hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
   ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
@@ -1141,7 +1167,7 @@ if [ "${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}" = "1" ]; then
 fi
 
 echo "Starting DSpark worker on ${WORKER_HOST}..."
-remote_compose "NODE_RANK=1 HEADLESS=1 $WORKER_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK='$DSPARK_ISSUE141_EFFECTIVE' DSPARK_ISSUE141_HOTFIX='./patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT='$DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT' DSPARK_ISSUE138_HOTFIX='./patches/hotfix-vllm-issue138-responses-history.py' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER_COMPOSE_FILES up -d"
+remote_compose "NODE_RANK=1 HEADLESS=1 $WORKER_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK='$DSPARK_ISSUE141_EFFECTIVE' DSPARK_ISSUE141_HOTFIX='./patches/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT='$DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT' DSPARK_ISSUE138_HOTFIX='./patches/hotfix-vllm-issue138-responses-history.py' DSPARK_ENABLE_CODEX_AGENT_MESSAGE_COMPAT='$DSPARK_ENABLE_CODEX_AGENT_MESSAGE_COMPAT' DSPARK_CODEX_AGENT_MESSAGE_HOTFIX='./patches/hotfix-vllm-codex-agent-message.py' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER_COMPOSE_FILES up -d"
 
 echo "Starting DSpark head..."
 compose_base 0 "" up -d

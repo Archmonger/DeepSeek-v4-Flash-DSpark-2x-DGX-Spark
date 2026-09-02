@@ -13,6 +13,8 @@
 
 ### Changed
 
+- **Opt-in Codex `agent_message` Responses history compatibility**: `DSPARK_ENABLE_CODEX_AGENT_MESSAGE_COMPAT=1` converts only the evidenced exact-key item with one string `input_text` part into assistant history. Stock rejection remains the default; routing and attribution metadata are intentionally dropped. The issue #138 and Codex patchers source-lock their exact combined postimage, so the configured apply order is byte-idempotent across same-container restarts.
+
 - **README documents that structured `image_url` on `tool` / `function` is HTTP 400 ([Issue #178](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/178))**: same official user-only-images rule as `system` / `assistant`. Vision-tool results must go on a `user` turn; a 400'd tool image stays in history and blocks the session. Serve behavior is unchanged.
 
 ## 2026-09-01
