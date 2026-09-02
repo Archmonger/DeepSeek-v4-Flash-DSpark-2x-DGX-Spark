@@ -105,7 +105,20 @@ def token_routing_kind(input_tokens: Any, image_token_id: int = IMAGE_TOKEN_ID) 
 # the runner hands out slices of one preallocated buffer, so each step gets a
 # new view object whose id is silently recycled.
 _ROUTING_KIND_CTX_ATTR = "_dspark_vision_exp_routing_kind"
+# (kind, owner_id, seq) published by embed_input_ids, or None once consumed.
 _PENDING_ROUTING_KIND = None
+_PENDING_SEQ = 0
+_FORWARD_CONTEXT_HOOKS = None
+_WARNED = set()
+
+
+def _warn_once(msg: str, *args: Any) -> None:
+    if msg in _WARNED:
+        return
+    _WARNED.add(msg)
+    import logging
+
+    logging.getLogger(__name__).warning(msg, *args)
 
 
 def routing_kind_from_mm(n_placeholders: int, n_tokens: int) -> str:
@@ -116,6 +129,11 @@ def routing_kind_from_mm(n_placeholders: int, n_tokens: int) -> str:
     ``is_multimodal`` is the runner's authoritative "these rows get image
     embeddings" mask, i.e. exactly the rows that must route with ``bias_vl``.
     """
+    if n_tokens <= 0:
+        raise ValueError(
+            f"Vision-Exp routing kind needs a token count, got n_tokens={n_tokens!r} "
+            f"with n_placeholders={n_placeholders!r}"
+        )
     if n_placeholders <= 0:
         return "text"
     if n_placeholders >= n_tokens:
@@ -123,58 +141,87 @@ def routing_kind_from_mm(n_placeholders: int, n_tokens: int) -> str:
     return "mixed"
 
 
-def set_pending_routing_kind(kind: Any) -> None:
-    """Publish the routing kind for the forward that is about to start."""
-    global _PENDING_ROUTING_KIND
-    _PENDING_ROUTING_KIND = kind
+def set_pending_routing_kind(kind: Any, owner_id: Any = None) -> None:
+    """Publish the routing kind for the forward that is about to start.
+
+    ``owner_id`` is ``id()`` of the ``embed_input_ids`` receiver. Only MoE
+    gates tagged with the same owner may consume it: the DSpark drafter builds
+    its own ``DeepseekV4DecoderLayer``/``DeepseekV4MoE`` stack and opens its own
+    ``ForwardContext``, so an unstamped value could be eaten by another model.
+    """
+    global _PENDING_ROUTING_KIND, _PENDING_SEQ
+    _PENDING_SEQ += 1
+    _PENDING_ROUTING_KIND = None if kind is None else (kind, owner_id, _PENDING_SEQ)
 
 
-def _take_pending_routing_kind():
-    """One-shot read, so a stale kind can never be reused by a later forward."""
+def _take_pending_routing_kind(owner_id: Any):
+    """One-shot, owner-checked read. None when there is nothing of ours."""
     global _PENDING_ROUTING_KIND
-    kind = _PENDING_ROUTING_KIND
+    pending = _PENDING_ROUTING_KIND
+    if pending is None:
+        return None
+    kind, pending_owner, seq = pending
+    if pending_owner != owner_id:
+        # Not ours: leave it for its real owner and scan instead. Loud, because
+        # a scan here is 43 host syncs per forward coming back.
+        _warn_once(
+            "vision_exp: routing kind seq=%s published by owner %s reached "
+            "owner %s; falling back to a per-layer token scan (issue #175)",
+            seq,
+            pending_owner,
+            owner_id,
+        )
+        return None
     _PENDING_ROUTING_KIND = None
     return kind
 
 
 def _forward_context_or_none():
-    """The current ``ForwardContext``, or None outside a vLLM forward."""
-    try:
-        from vllm.forward_context import (
-            get_forward_context,
-            is_forward_context_available,
+    """The current ``ForwardContext``, or None when no forward is running.
+
+    Resolved once and cached. A missing symbol is a hard failure, exactly like
+    this patch's dependency on ``_require_is_multimodal``: degrading quietly
+    would put 43 host syncs per forward back with nothing to show for it. The
+    import stays lazy so the CPU test suite can import this module without vLLM.
+    """
+    global _FORWARD_CONTEXT_HOOKS
+    if _FORWARD_CONTEXT_HOOKS is None:
+        from vllm import forward_context as _fc
+
+        _FORWARD_CONTEXT_HOOKS = (
+            _fc.is_forward_context_available,
+            _fc.get_forward_context,
         )
-    except Exception:
+    available, get_ctx = _FORWARD_CONTEXT_HOOKS
+    if not available():
         return None
-    try:
-        if not is_forward_context_available():
-            return None
-        return get_forward_context()
-    except Exception:
-        return None
+    return get_ctx()
 
 
 def current_routing_kind(
-    input_tokens: Any, image_token_id: int = IMAGE_TOKEN_ID
+    input_tokens: Any,
+    image_token_id: int = IMAGE_TOKEN_ID,
+    owner_id: Any = None,
 ) -> str:
     """Routing kind of the running forward, computed at most once per step.
 
     Falls back to a fresh ``token_routing_kind`` scan whenever the per-step
-    carrier is missing (no forward context, or a forward that never went
-    through ``embed_input_ids``), so the semantics are unchanged.
+    carrier is missing (no forward context, a forward that never went through
+    ``embed_input_ids``, another model's pending value), so the semantics are
+    unchanged -- only the sync count differs.
     """
     ctx = _forward_context_or_none()
     if ctx is None:
         return token_routing_kind(input_tokens, image_token_id)
     kind = getattr(ctx, _ROUTING_KIND_CTX_ATTR, None)
     if kind is None:
-        kind = _take_pending_routing_kind()
+        kind = _take_pending_routing_kind(owner_id)
         if kind is None:
             kind = token_routing_kind(input_tokens, image_token_id)
-        try:
-            setattr(ctx, _ROUTING_KIND_CTX_ATTR, kind)
-        except Exception:
-            pass
+        # Deliberately unguarded: if ForwardContext ever stops accepting
+        # attributes this must fail at warmup, not silently restore 43 syncs
+        # per forward. _dummy_run reaches this before the server is healthy.
+        setattr(ctx, _ROUTING_KIND_CTX_ATTR, kind)
     return kind
 
 

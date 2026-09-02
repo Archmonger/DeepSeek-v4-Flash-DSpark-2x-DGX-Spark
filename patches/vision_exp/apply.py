@@ -155,6 +155,7 @@ def fused_topk_bias_split_vl(
     hash_indices_table: Any,
     routed_scaling_factor: float,
     kind: Any = None,
+    owner_id: Any = None,
 ) -> tuple[Any, Any]:
     """Route image placeholder rows with bias_vl and no hash table (issue #175)."""
     from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
@@ -177,7 +178,7 @@ def fused_topk_bias_split_vl(
 
     vl = _bias_data(e_score_correction_bias_vl)
     if kind is None:
-        kind = current_routing_kind(input_tokens)
+        kind = current_routing_kind(input_tokens, owner_id=owner_id)
     if vl is None or kind == "text":
         return _call(
             hidden_states,
@@ -273,7 +274,9 @@ def _wrap_router_compute_routing(router: Any, gate: Any) -> None:
             return orig(
                 hidden_states, router_logits, indices_type, input_ids=input_ids
             )
-        kind = current_routing_kind(input_ids)
+        kind = current_routing_kind(
+            input_ids, owner_id=getattr(router, "_dspark_routing_owner", None)
+        )
         if kind == "text":
             return orig(
                 hidden_states, router_logits, indices_type, input_ids=input_ids
@@ -327,14 +330,41 @@ def embed_multimodal(self, **kwargs: object):
     return out
 
 
+def tag_routing_owner(root: nn.Module, owner_id: int) -> int:
+    """Mark the MoE layers that may consume ``owner_id``'s published kind.
+
+    The DSpark drafter builds its own ``DeepseekV4DecoderLayer`` stack (so its
+    ``ffn`` gates are wrapped too) and runs them under its own
+    ``ForwardContext``. Tagging by object graph -- not by module name -- keeps
+    each model's gates bound to its own ``embed_input_ids``.
+    """
+    tagged = 0
+    for mod in root.modules():
+        gate = getattr(mod, "gate", None)
+        if gate is None or getattr(gate, "e_score_correction_bias_vl", None) is None:
+            continue
+        mod._dspark_routing_owner = owner_id
+        router = getattr(getattr(mod, "experts", None), "router", None)
+        if router is not None:
+            router._dspark_routing_owner = owner_id
+        tagged += 1
+    return tagged
+
+
 def _num_tokens(input_ids: Any) -> int:
-    """Row count of a token tensor. ``numel`` is metadata: no host sync."""
+    """Row count of a token tensor. ``numel`` is metadata: no host sync.
+
+    Never guesses: a 0 here would make any non-empty placeholder count look
+    like a full-image batch.
+    """
     if hasattr(input_ids, "numel"):
         return int(input_ids.numel())
     try:
         return len(input_ids)
-    except TypeError:
-        return 0
+    except TypeError as exc:
+        raise TypeError(
+            f"Vision-Exp cannot size input_ids of type {type(input_ids).__name__}"
+        ) from exc
 
 
 def make_embed_input_ids(orig_lm_embed):
@@ -353,7 +383,7 @@ def make_embed_input_ids(orig_lm_embed):
         is_multimodal: Any = None,
     ):
         # Default for every early return below: no mm embeddings == text.
-        set_pending_routing_kind("text")
+        set_pending_routing_kind("text", id(self))
         text_embeds = orig_lm_embed(self, input_ids)
         if multimodal_embeddings is None:
             return text_embeds
@@ -380,7 +410,7 @@ def make_embed_input_ids(orig_lm_embed):
             )
         # Reuses the sum above: the image path stays at one sync per forward.
         set_pending_routing_kind(
-            routing_kind_from_mm(n_placeholders, _num_tokens(input_ids))
+            routing_kind_from_mm(n_placeholders, _num_tokens(input_ids)), id(self)
         )
         return _merge_multimodal_embeddings(
             inputs_embeds=text_embeds,
@@ -489,7 +519,9 @@ def apply_vision_exp(
                     "issue #175 mega-MoE wrap expects fused_topk_bias keyword args"
                 )
             return fused_topk_bias_split_vl(
-                e_score_correction_bias_vl=vl, **kwargs
+                e_score_correction_bias_vl=vl,
+                owner_id=getattr(self, "_dspark_routing_owner", None),
+                **kwargs,
             )
 
         nvidia_mod.fused_topk_bias = _split_ftb
@@ -505,6 +537,14 @@ def apply_vision_exp(
     def lm_init(self, *, vllm_config, prefix: str = ""):
         orig_lm_init(self, vllm_config=vllm_config, prefix=prefix)
         self.hf_to_vllm_mapper = _extend_weights_mapper(self.hf_to_vllm_mapper)
+        tagged = tag_routing_owner(self, id(self))
+        if getattr(vllm_config.model_config.hf_config, "vision_n_layers", 0) > 0:
+            if tagged == 0:
+                raise RuntimeError(
+                    "Vision-Exp found no bias_vl MoE gate to bind to this model; "
+                    "the per-forward routing kind would never be consumed and "
+                    "every gate would host-sync again (issue #175)"
+                )
 
     DeepseekV4ForCausalLM.__init__ = lm_init
     DeepseekV4ForCausalLM.hf_to_vllm_mapper = _extend_weights_mapper(
