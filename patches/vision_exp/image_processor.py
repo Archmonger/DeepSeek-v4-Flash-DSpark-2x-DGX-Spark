@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import io
+import logging
 import math
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -109,16 +110,15 @@ _ROUTING_KIND_CTX_ATTR = "_dspark_vision_exp_routing_kind"
 _PENDING_ROUTING_KIND = None
 _PENDING_SEQ = 0
 _FORWARD_CONTEXT_HOOKS = None
-_WARNED = set()
+_LOGGED_ONCE = set()
+_LOGGER = logging.getLogger(__name__)
 
 
-def _warn_once(msg: str, *args: Any) -> None:
-    if msg in _WARNED:
+def _log_once(level: int, msg: str, *args: Any) -> None:
+    if msg in _LOGGED_ONCE:
         return
-    _WARNED.add(msg)
-    import logging
-
-    logging.getLogger(__name__).warning(msg, *args)
+    _LOGGED_ONCE.add(msg)
+    _LOGGER.log(level, msg, *args)
 
 
 def routing_kind_from_mm(n_placeholders: int, n_tokens: int) -> str:
@@ -162,15 +162,36 @@ def _take_pending_routing_kind(owner_id: Any):
         return None
     kind, pending_owner, seq = pending
     if pending_owner != owner_id:
-        # Not ours: leave it for its real owner and scan instead. Loud, because
-        # a scan here is 43 host syncs per forward coming back.
-        _warn_once(
-            "vision_exp: routing kind seq=%s published by owner %s reached "
-            "owner %s; falling back to a per-layer token scan (issue #175)",
-            seq,
-            pending_owner,
-            owner_id,
-        )
+        # Not ours: leave it for its real owner and scan instead.
+        if owner_id is None:
+            # Expected, and it happens on ordinary steps: an untagged gate does
+            # not belong to a model that publishes kinds. The DSpark drafter
+            # builds its own DeepseekV4DecoderLayer stack and opens its own
+            # ForwardContext, and a target step that replayed a full CUDA graph
+            # ran no Python in its gates, so its value is still sitting here.
+            # The drafter scanning for itself is correct pre-#175 behaviour and
+            # the target model is unaffected -- this is not a fault.
+            _log_once(
+                logging.DEBUG,
+                "vision_exp: routing kind seq=%s (owner %s) was read by an "
+                "untagged gate; expected spec-decode drafter path, that gate "
+                "scans for itself and the target model is unaffected",
+                seq,
+                pending_owner,
+            )
+        else:
+            # A tagged gate belongs to a model that does publish kinds, so two
+            # of them crossed. Unexpected, and it costs 43 host syncs per
+            # forward -- say so.
+            _log_once(
+                logging.WARNING,
+                "vision_exp: routing kind seq=%s published by owner %s reached "
+                "tagged owner %s; unexpected, falling back to a per-layer token "
+                "scan (issue #175)",
+                seq,
+                pending_owner,
+                owner_id,
+            )
         return None
     _PENDING_ROUTING_KIND = None
     return kind

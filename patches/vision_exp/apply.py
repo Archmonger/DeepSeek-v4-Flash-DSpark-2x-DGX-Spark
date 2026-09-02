@@ -337,6 +337,13 @@ def tag_routing_owner(root: nn.Module, owner_id: int) -> int:
     ``ffn`` gates are wrapped too) and runs them under its own
     ``ForwardContext``. Tagging by object graph -- not by module name -- keeps
     each model's gates bound to its own ``embed_input_ids``.
+
+    The unit tagged is the MoE layer that owns ``e_score_correction_bias_vl``,
+    not the wrapped router: ``_init_mega_moe_experts`` builds
+    ``DeepseekV4MegaMoEExperts``, which has no ``.router``, and that config
+    routes through ``moe_forward`` / ``_split_ftb`` off the MoE module itself.
+    Counting wrapped routers instead would return 0 there and trip the
+    fail-closed check in ``lm_init``.
     """
     tagged = 0
     for mod in root.modules():

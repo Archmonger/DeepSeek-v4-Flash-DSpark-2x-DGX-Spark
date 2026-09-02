@@ -10,6 +10,7 @@ Run inside the container:
 """
 from __future__ import annotations
 
+import logging
 import sys
 import types
 from pathlib import Path
@@ -42,10 +43,31 @@ def syncs():
     return _counter["n"]
 
 
+class _Records(logging.Handler):
+    """Captures what vision_exp actually logs, at what level."""
+
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+    def levels(self):
+        return [r.levelno for r in self.records]
+
+
+_LOGS = _Records()
+ip._LOGGER.addHandler(_LOGS)
+ip._LOGGER.setLevel(logging.DEBUG)
+ip._LOGGER.propagate = False
+
+
 def reset():
     _counter["n"] = 0
     ip.set_pending_routing_kind(None)
-    ip._WARNED.clear()
+    ip._LOGGED_ONCE.clear()
+    _LOGS.records.clear()
 
 
 FAILURES = []
@@ -218,25 +240,40 @@ reset()
 target, drafter = FakeLM(), FakeLM()
 embed = embed_fn()
 img_ids = torch.full((4,), ID, dtype=torch.long)
-with override_forward_context(None):
-    embed(
-        target,
-        img_ids,
-        multimodal_embeddings=[torch.ones((4, 4))],
-        is_multimodal=torch.ones(4, dtype=torch.bool),
-    )
-reset_syncs = _counter["n"]
-# The drafter opens its own ForwardContext and runs its own wrapped MoE gates.
+
+
+def publish_image():
+    with override_forward_context(None):
+        embed(
+            target,
+            img_ids,
+            multimodal_embeddings=[torch.ones((4, 4))],
+            is_multimodal=torch.ones(4, dtype=torch.bool),
+        )
+
+
+# 9a. The routine case: the target replayed a full CUDA graph (no Python in its
+# gates, so nobody consumed the value), then the drafter's untagged gates run
+# under their own ForwardContext.
+publish_image()
 with override_forward_context(fake_ctx()):
-    stolen = ip.current_routing_kind(torch.tensor([1, 2, 3]), owner_id=id(drafter))
-check("drafter gets its own answer, not 'image'", stolen, "text")
+    stolen = ip.current_routing_kind(torch.tensor([1, 2, 3]), owner_id=None)
+check("untagged drafter gate scans for itself", stolen, "text")
 check("pending survives for its owner", ip._PENDING_ROUTING_KIND[0], "image")
-check("owner mismatch warned (not silent)", len(ip._WARNED), 1)
+check("expected drafter fallback is not a warning", _LOGS.levels(), [logging.DEBUG])
 with override_forward_context(fake_ctx()):
     mine = ip.current_routing_kind(img_ids, owner_id=id(target))
 check("target still gets 'image'", mine, "image")
 
-# --------------------------------------------------------------------------
+# 9b. Two tagged models crossing is a real anomaly and must stay loud.
+reset()
+publish_image()
+with override_forward_context(fake_ctx()):
+    crossed = ip.current_routing_kind(torch.tensor([1, 2, 3]), owner_id=id(drafter))
+check("tagged cross-owner falls back", crossed, "text")
+check("tagged cross-owner warns", _LOGS.levels(), [logging.WARNING])
+check("pending still survives", ip._PENDING_ROUTING_KIND[0], "image")
+
 print("10. CUDA-graph capture short-circuits before any kind resolution")
 reset()
 calls = {"orig": 0}
