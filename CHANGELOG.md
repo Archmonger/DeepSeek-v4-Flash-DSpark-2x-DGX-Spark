@@ -6,6 +6,8 @@
 
 - **Vision-Exp role check no longer 400s when assistant/system prose quotes `<image>…</image>` ([Issue #181](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/181))**: the #165 paired-tag scan ran on replayed assistant text, so a reply that documented the tag poisoned the session. Outside `user`, only a structured `image` / `image_url` part or the raw placeholder token is an image. Recreate both containers after pull (`./stop` then `./start`); restart keeps the old encoder bytes.
 
+- **`./build-dspark-vllm-runtime.sh` no longer passes a digest-pinned `DSPARK_VLLM_IMAGE` to `docker build -t` ([Issue #173](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/173))**: BuildKit rejects `name:tag@sha256:…`. The Anemll serve pin is left alone; Stage-C is tagged `vllm-dspark-runtime:dspark-nvfp4-stage-c`. Point `DSPARK_VLLM_IMAGE` at that tag only if you intend to serve the local build.
+
 ### Changed
 
 - **README documents that structured `image_url` on `tool` / `function` is HTTP 400 ([Issue #178](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/178))**: same official user-only-images rule as `system` / `assistant`. Vision-tool results must go on a `user` turn; a 400'd tool image stays in history and blocks the session. Serve behavior is unchanged.

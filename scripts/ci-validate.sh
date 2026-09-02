@@ -16,6 +16,7 @@ for f in \
   stop-deepseek-v4-flash-dspark.sh \
   validate-dspark-config.sh \
   prepare-dspark-model-cache.sh \
+  build-dspark-vllm-runtime.sh \
   files/nfs-share.sh \
   files/nfs-server/entrypoint.sh \
   smoke-deepseek-v4-flash-dspark.sh \
@@ -35,6 +36,12 @@ do
   bash -n "$f" || bad "bash -n $f"
   ok "bash -n $f"
 done
+
+if "$ROOT/build-dspark-vllm-runtime.sh" --tag-selftest; then
+  ok "build-dspark-vllm-runtime digest is not a docker -t (issue #173)"
+else
+  bad "build-dspark-vllm-runtime --tag-selftest"
+fi
 
 echo "== python compile (patches + unit scripts) =="
 mapfile -t py_files < <(find patches -name '*.py' -not -path '*/__pycache__/*' | sort)
