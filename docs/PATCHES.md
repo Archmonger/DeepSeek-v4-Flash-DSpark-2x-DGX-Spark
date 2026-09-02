@@ -614,3 +614,64 @@ flag, fixtures/tests, sync/preflight, and documentation together.
 
 Evidence currently checked in is CPU/source-exact only. Do not claim the live
 incident closed until the two-rank canary and log/health gate above pass.
+
+---
+
+## Issue #117 — bounded SHM dispatch-ring reader recovery
+
+### Scope and upstream fix
+
+The mid-serve failure addressed here is a local `MessageQueue` reader parked in
+`SpinCondition.wait()` after a PUB/SUB notification is missed. The dispatch is
+already authoritative in shared memory, but an indefinite socket poll prevents
+the reader from checking that slot again.
+
+`patches/hotfix-vllm-issue117-shm-ring-buffer.py` backports both changes from
+upstream vLLM PR #45224, merge
+`10c75477b07c2f1a361f54b7357af1019bba5fd8`:
+
+- `ReadTimeoutWithWarnings.timeout_ms()` is capped by the upstream
+  `SHM_READER_RECHECK_INTERVAL_MS = 5000`, including indefinite/no-warning
+  reads, so the authoritative written flag is checked again;
+- `acquire_read()` releases the reader slot, advances the ring index, and
+  records the read in `finally` even when the consumer raises.
+
+This is not an orphaned-SHM lifecycle fix. It does not enumerate, unlink, or
+reuse `/dev/shm/psm_*` objects and does not claim to fix the separate
+stop/start API-readiness failure associated with ownerless segments.
+
+### Compatibility and publication
+
+The patcher accepts only
+`vllm==0.25.2.dev0+g752a3a504.d20260714` and one of four complete-file
+identities: exact issue-117 stock or patched bytes, each with either the exact
+stock `busy_loop_s = 1` line or the independent issue #79
+`busy_loop_s = 0.002` overlay. It never changes that issue #79 line.
+
+Marker-only, partial, mixed, duplicated, independently drifted, symlinked, and
+unsupported-version states are incompatible. Compatibility checks are
+unconditional under `PYTHONOPTIMIZE=1`. A stock post-image is built and
+compiled in memory; rollback and candidate images are staged beside the
+target with retained mode/owner/group and file `fsync`, then one atomic rename
+publishes the candidate. The directory and published bytes are fsynced and
+re-read. Any post-publication failure atomically restores and verifies the
+original bytes and metadata. An exact patched image is verified without a
+write.
+
+### Startup and rollback
+
+The launcher syncs the dedicated patcher, checks worker then head without
+mutation, and only then starts either service. Each container applies the
+patcher and requires a successful `--status` before `exec vllm`.
+
+The backport is default-on. Set
+`DSPARK_SKIP_ISSUE117_RECHECK_HOTFIX=1`, then stop/remove and recreate both
+service containers, to restore image stock for issue #117 without changing the
+separate issue #79 spin-wait setting. A process or Docker restart reuses the
+writable layer and is not rollback.
+
+The hermetic behavior/source/transaction/startup suite is:
+
+```bash
+python3 scripts/test-issue117-shm-ring-buffer.py
+```

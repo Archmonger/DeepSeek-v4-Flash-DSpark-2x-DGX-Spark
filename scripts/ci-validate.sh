@@ -67,6 +67,7 @@ py_files+=(
   scripts/test-dsv4-vision-exp-hotfix.py
   scripts/test-issue141-sparse-mla-decode-chunk.py
   scripts/test-issue136-xgrammar-termination.py
+  scripts/test-issue117-shm-ring-buffer.py
   scripts/verify-issue136-xgrammar-live.py
   scripts/test-empty-encoder-output-hotfix.py
   scripts/ruler-lite.py
@@ -120,6 +121,8 @@ python3 scripts/test-issue141-sparse-mla-decode-chunk.py -q
 ok "test-issue141-sparse-mla-decode-chunk"
 python3 scripts/test-issue136-xgrammar-termination.py -q
 ok "test-issue136-xgrammar-termination"
+python3 scripts/test-issue117-shm-ring-buffer.py -q
+ok "test-issue117-shm-ring-buffer"
 python3 scripts/test-empty-encoder-output-hotfix.py -q
 ok "test-empty-encoder-output-hotfix"
 python3 tests/test_issue27_inflight_cap.py -q
