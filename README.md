@@ -100,7 +100,7 @@ Qwen3.8-Flash-vLLM).
    One-shot bind override: `./start-deepseek-v4-flash-dspark.sh --host 0.0.0.0 --port 9000`.
    After a reboot, dockerd may already have restored the ranks (`restart: unless-stopped`); start then exits **3** (already running), not 1. That is expected — do not `./stop` unless you want a cold start. systemd: `SuccessExitStatus=3`.
 
-   Optional **three Sparks (TP=3)** is a separate launcher so `.env` cannot flip the 2-node path: `./start-tp3.sh` (needs `WORKER2_HOST`; see [docs/TP3.md](docs/TP3.md)).
+   Optional **three Sparks (TP=3)** is a separate launcher so `.env` cannot flip the 2-node path: `./start-tp3.sh` (needs `WORKER2_HOST`; see [Optional: three Sparks (TP=3)](#optional-three-sparks-tp3) and [docs/TP3.md](docs/TP3.md)).
 
 6. **Check it is up**
 
@@ -326,6 +326,8 @@ On the **default Anemll 1M/6** stack:
 | **Six short chats** (hundreds of tokens), 1M still *allowed* | **~160–190 tok/s aggregate** (~30–37 per stream) |
 | Six **cold 32K–128K** prompts at once | Prefills are chunked (issue #27), **two in flight** (`DSPARK_MAX_INFLIGHT_PREFILLS=2`), the rest queue. A 4 × 8K wave gets its first tokens at 7.4 / 9.0 / 15.7 / 16.5 s (was 4.7 / 9.4 / 14.3 / 19.3 s at `1`). ~8 tok/s decode floor while prefills run; 128K × 6 TTFT minutes |
 
+| **Three Sparks (TP=3, `./start-tp3.sh`, 16 slots)** | Decode ≈ +4–13 % per stream and **≈ 200 tok/s aggregate at 16 streams**; prefill 4–13 % slower to 64K and ≈ 22 % slower at 128K–256K (5.0 / 18.6 / 91 / 202 s TTFT at 8K / 32K / 128K / 256K vs 4.4 / 18.0 / 75 / 165 s on two nodes). See [Optional: three Sparks (TP=3)](#optional-three-sparks-tp3). |
+
 That ~170–190 c=6 number is **six streams generating**, not six huge prefills.
 Live 2026-08-14 on this cluster: 256 × c=6 = **162** agg; 128K × c=1 still
 **75 tok/s** / **80 s** TTFT.
@@ -496,6 +498,53 @@ Validate **direct** `:8888` first, then the agent harness.
 
 If direct vLLM is clean and the agent is not, fix the harness — do not switch
 to fp8 or a smaller model to hide it.
+
+---
+
+## Optional: three Sparks (TP=3)
+
+The default lane stays two nodes. A third DGX Spark is opt-in through its own
+launcher, so nothing in `.env.dspark` can flip the 2-node path by accident.
+Full details, fabric notes and the reasoning: [docs/TP3.md](docs/TP3.md).
+
+**Before the first boot** (the launcher checks these, but does not do them):
+
+- passwordless SSH from the head to spark3;
+- the pinned `DSPARK_VLLM_IMAGE` already pulled on spark3 (≈ 19 GB; the
+  launcher exits with the exact `docker pull` command otherwise);
+- a ConnectX link head ↔ spark3 on its own `/24` (e.g. `10.0.23.1` ↔ `10.0.23.3`)
+  plus a LAN interface all three nodes share for the bootstrap (default `enP7s7`).
+
+Spark3 needs no local checkpoint: it mounts the head's HF cache over NFS, and
+the launcher creates its directory and syncs compose, env and `patches/`.
+
+```bash
+# .env.dspark — in addition to the 2-node settings
+WORKER2_HOST=10.0.0.3
+WORKER2_VLLM_HOST_IP=10.0.0.3
+WORKER2_NFS_SERVER_IP=10.0.23.1        # head IP on the spark1<->spark3 link
+WORKER2_NCCL_IB_HCA=rocep1s0f1         # spark3's port facing the head
+WORKER2_NCCL_SOCKET_IFNAME=enp1s0f1np1
+WORKER2_TP_SOCKET_IFNAME=enp1s0f1np1
+WORKER2_GLOO_SOCKET_IFNAME=enp1s0f1np1
+TP3_MAX_NUM_SEQS=16                    # slots on the 3-node lane only
+
+./start-tp3.sh                         # or: ./start-tp3.sh --max-num-seqs 16
+scripts/validate_tp3.sh 127.0.0.1:8888 # proves the shard, not just HTTP
+./stop-deepseek-v4-flash-dspark.sh     # tears down all three ranks
+```
+
+The first boot compiles for several minutes (empty JIT cache on spark3, new
+shard shapes everywhere); wait for the health check rather than restarting.
+Boot log must show `DSv4 TP pad: heads 64 -> 72 for TP=3` on every rank.
+
+**What you get:** 16 slots, about three times the KV cache (≈ 35 GiB per
+rank, ≈ 5 M cached tokens), ≈ 200 tok/s aggregate at 16 streams and slightly
+faster decode per stream. **What it costs:** prefill latency, 4–13 % up to
+64K and ≈ 22 % at 128K–256K, because in DeepSeek's MLA every rank holds the
+full latent KV and the indexer, so attention does not shrink with a third GPU,
+while the head pad and the three-node all-reduce add work. Single-user
+long-context work is better served by the 2-node lane.
 
 ---
 
