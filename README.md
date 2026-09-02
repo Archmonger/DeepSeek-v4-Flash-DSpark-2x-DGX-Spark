@@ -222,8 +222,15 @@ python3 scripts/overlay-vision-exp-ablit-cache.py
 The 0731 abliterated freeze stays on branch `0731-ablit`.
 
 Images: OpenAI `image_url` (JPEG/PNG/GIF/WebP; GIF is still-frame). No video.
-Images belong in **`user` messages only** — `system` or `assistant` returns HTTP 400.
-Default cap 8 images (`LIMIT_MM_PER_PROMPT` is JSON `{"image":8}`; `image=8` is converted). Example:
+Images belong in **`user` messages only**. A structured `image` / `image_url`
+part (or the raw `<｜deepseek_image｜>` token) on `system`, `assistant`,
+`tool`, or `function` returns HTTP 400. Tool/function *text* that quotes
+`<image>` tags is allowed; putting a vision-tool result on `role: "tool"` as
+`image_url` is not. That 400 is not retried by typical OpenAI clients, and
+the rejected turn stays in history, so later messages keep failing until
+that tool message is dropped ([issue #178](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/178)).
+Put screenshots on a **`user`** turn instead. Default cap 8 images
+(`LIMIT_MM_PER_PROMPT` is JSON `{"image":8}`; `image=8` is converted). Example:
 
 ```json
 {"model":"deepseek-v4-flash-vision-exp","messages":[{"role":"user","content":[
