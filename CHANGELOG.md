@@ -1,5 +1,9 @@
 ## 2026-09-02
 
+### Added
+
+- **Optional 3-node TP=3 via `./start-tp3.sh`**: default `./start-deepseek-v4-flash-dspark.sh` still forces TP=2 / nnodes=2. Three Sparks pad attention groups 8→9 (vendored from localaiguyy, MIT), SSH a third rank (`WORKER2_HOST`), and on a QSFP ring use a second NFS `/24`, Gloo on `enP7s7` (not `lo`), both CX HCAs, and NCCL subnet-aware routing at prefix 24. CLI `--max-num-seqs` / `TP3_MAX_NUM_SEQS` apply only on that path. Recreate after overlay or seqs changes. See [docs/TP3.md](docs/TP3.md).
+
 ### Fixed
 
 - **`NCCL_IB_GID_AUTO=1` now validates sysfs GIDs and leaves `NCCL_IB_GID_INDEX` unset instead of pinning a resolved "common" index (tonyd2wild #38)**: a pin is one global value per rank, while the usable RoCEv2 GID index differs per HCA and drifts after link/fw events — any pin, including the previously resolved intersection pick, can later wedge NCCL init (`ibv_modify_qp 61`) on dual-HCA nodes. Auto mode keeps the per-member fail-closed validation (a selected HCA/port with no usable RoCEv2/IPv4 GID still aborts the launch, with per-member usable-set logs) but no longer requires members to share an index — disjoint usable sets are accepted — and clears `NCCL_IB_GID_INDEX` / `WORKER_NCCL_IB_GID_INDEX` so NCCL selects the GID per HCA; stale pins in `.env.dspark` are reported and ignored. `NCCL_IB_GID_AUTO=0` still pins verbatim. Empty is not absent for NCCL (a defined-empty value reads as GID index 0 and would mask `/etc/nccl.conf`), so `remote_nccl_env` keeps emitting the key — empty — so a stale worker `.env.dspark` pin is masked instead of resurfacing, and the shared compose entrypoint normalization now also unsets a defined-empty `NCCL_IB_GID_INDEX` on both ranks. Recreate both ranks (`./stop` then `./start`) so the in-container pin disappears.

@@ -100,6 +100,8 @@ Qwen3.8-Flash-vLLM).
    One-shot bind override: `./start-deepseek-v4-flash-dspark.sh --host 0.0.0.0 --port 9000`.
    After a reboot, dockerd may already have restored the ranks (`restart: unless-stopped`); start then exits **3** (already running), not 1. That is expected — do not `./stop` unless you want a cold start. systemd: `SuccessExitStatus=3`.
 
+   Optional **three Sparks (TP=3)** is a separate launcher so `.env` cannot flip the 2-node path: `./start-tp3.sh` (needs `WORKER2_HOST`; see [docs/TP3.md](docs/TP3.md)).
+
 6. **Check it is up**
 
    ```bash

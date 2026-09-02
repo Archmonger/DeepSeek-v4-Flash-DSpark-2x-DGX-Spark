@@ -303,11 +303,15 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
             "DSPARK_ISSUE138_HOTFIX='./patches/"
             "hotfix-vllm-issue138-responses-history.py'"
         )
-        self.assertEqual(source.count(worker_env), 2)
+        self.assertEqual(source.count(worker_env), 4)
         self.assertIn(
             'scp "$DSPARK_ISSUE138_HOTFIX" "${WORKER_HOST}:'
             '${REMOTE_WORKER_DIR}/patches/'
             'hotfix-vllm-issue138-responses-history.py"',
+            source,
+        )
+        self.assertIn(
+            "NODE_RANK=2 HEADLESS=1 $WORKER2_HF_COMPOSE_ENV",
             source,
         )
 
