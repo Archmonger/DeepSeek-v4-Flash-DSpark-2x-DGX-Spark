@@ -10,6 +10,8 @@
 
 ### Changed
 
+- **`DSPARK_MAX_INFLIGHT_PREFILLS` default is now `2`** (compose and `.env.dspark.example`): the same-day A/B on the 2x GB10 TP=2 lane (`docs/CLAUDE/ab-results-2026-09-03.md`) measured c=4 x 8K waves at 2 vs 1: per-stream TTFT spread 9.1 s vs 14.6 s, worst stream 16.5 s vs 19.3 s, wave aggregate +12 %, with c=1/c=2/c=6 decode, 32K TTFT, draft acceptance and host memory unchanged. Set `1` to restore the previous fairness default. The same sequence rejected static prefill chunk 2048 (−1.5 GB head MemAvailable), found greedy drafting and a 512 MB indexer-logits workspace to be ties, and confirmed cudagraph capture 48 over 42 (c=6 aggregate 139 vs 122). New helpers: `scripts/ab-boot.sh` (one-knob boot + measure driver), `scripts/ab-measure.sh`, `scripts/ab-fairness.py`.
+
 - **README documents that structured `image_url` on `tool` / `function` is HTTP 400 ([Issue #178](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/178))**: same official user-only-images rule as `system` / `assistant`. Vision-tool results must go on a `user` turn; a 400'd tool image stays in history and blocks the session. Serve behavior is unchanged.
 
 ## 2026-09-01
