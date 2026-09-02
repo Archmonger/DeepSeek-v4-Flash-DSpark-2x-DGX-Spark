@@ -309,9 +309,10 @@ WORKER_NCCL_IB_HCA="${WORKER_NCCL_IB_HCA:-$NCCL_IB_HCA}"
 WORKER_NCCL_SOCKET_IFNAME="${WORKER_NCCL_SOCKET_IFNAME:-$NCCL_SOCKET_IFNAME}"
 WORKER_TP_SOCKET_IFNAME="${WORKER_TP_SOCKET_IFNAME:-${TP_SOCKET_IFNAME:-$WORKER_NCCL_SOCKET_IFNAME}}"
 WORKER_GLOO_SOCKET_IFNAME="${WORKER_GLOO_SOCKET_IFNAME:-${GLOO_SOCKET_IFNAME:-$WORKER_NCCL_SOCKET_IFNAME}}"
-# RoCEv2 GID index differs per node and drifts after reboot/link events.
-# Default: resolve from sysfs at launch (NCCL_IB_GID_AUTO=1). Do not reuse one
-# literal for both ranks — that wedges NCCL with "unhandled system error".
+# RoCEv2 GID index differs per node/HCA and drifts after reboot/link events.
+# Default (NCCL_IB_GID_AUTO=1): validate every selected HCA/port from sysfs,
+# then leave NCCL_IB_GID_INDEX unset on both ranks — a pin is one global value
+# per rank, and NCCL selects the RoCEv2/IPv4 GID per HCA when it is absent.
 # Set NCCL_IB_GID_AUTO=0 and pin NCCL_IB_GID_INDEX / WORKER_NCCL_IB_GID_INDEX
 # only if you need a manual override.
 NCCL_IB_GID_AUTO="${NCCL_IB_GID_AUTO:-1}"
@@ -408,13 +409,11 @@ iface_ipv4() {
 # tree, validates every selected member against its own local address (one
 # shared match IP must not silently drop a member that uses another link
 # address), and fails closed - exit 1 when a selected member has no usable
-# RoCEv2 GID, exit 3 when the selected members share no usable index.
-#
-# Members are reconciled by intersecting each member's *set* of usable RoCEv2
-# GID indexes. A member often has more than one usable index, so picking a
-# single winner per member and comparing those would report a disagreement even
-# when a common global index exists. NCCL_IB_GID_INDEX is one value per rank, so
-# only a genuinely empty intersection is fatal.
+# RoCEv2 GID. It stops there: usable index sets are reported per member and
+# never reconciled, because auto mode pins nothing. NCCL selects the
+# RoCEv2/IPv4 GID per HCA when NCCL_IB_GID_INDEX is absent, so members whose
+# usable sets are disjoint are still fine; only a member with no usable GID
+# at all is fatal.
 #
 # Body is a quoted heredoc (nothing expands here); resolve_rocev2_gid_index
 # prepends the inputs as printf %q assignments, so selector tokens are
@@ -566,8 +565,6 @@ fi
 
 fail_members=""
 mem_n=0
-have_common=0
-common=""
 for pair in $selected; do
   dev=${pair%%:*}
   port=${pair##*:}
@@ -600,68 +597,33 @@ for pair in $selected; do
     fail_members="$fail_members $dev:$port"
     continue
   fi
-  if [ "$have_common" = 0 ]; then
-    common=$usable
-    have_common=1
-  else
-    newcommon=""
-    for a in $common; do
-      for b in $usable; do
-        if [ "$a" = "$b" ]; then newcommon="$newcommon $a"; break; fi
-      done
-    done
-    common=$newcommon
-  fi
 done
 if [ -n "$fail_members" ]; then
   echo "FATAL: no usable RoCEv2 GID on selected member(s):$fail_members (no GID matches $match_ip or an IPv4 on the member's own netdev)" >&2
   exit 1
 fi
-if [ -z "$common" ]; then
-  detail=""
-  i=1
-  while [ "$i" -le "$mem_n" ]; do
-    eval "pair=\$mem_pair_$i"
-    eval "u=\$mem_usable_$i"
-    csv=""
-    for x in $u; do csv="$csv,$x"; done
-    detail="$detail $pair=${csv#,}"
-    i=$((i + 1))
-  done
-  echo "FATAL: selected members share no common RoCEv2 GID index:$detail" >&2
-  exit 3
-fi
-# Deterministic pick from the intersection: lowest index, preferring one that
-# at least one member reached through the preferred match IP.
-chosen=""
-fallback=""
-for g in $(printf '%s\n' $common | sort -n); do
-  [ -n "$fallback" ] || fallback=$g
-  i=1
-  while [ "$i" -le "$mem_n" ]; do
-    eval "s=\${src_${i}_$g:-}"
-    case "$s" in "match-ip "*) chosen=$g ;; esac
-    [ -n "$chosen" ] && break
-    i=$((i + 1))
-  done
-  [ -n "$chosen" ] && break
-done
-[ -n "$chosen" ] || chosen=$fallback
+# Validation-only outcome: audit each member's whole usable set. No index is
+# chosen and nothing is written to stdout - the caller leaves
+# NCCL_IB_GID_INDEX unset so NCCL selects the RoCEv2/IPv4 GID per HCA.
 i=1
 while [ "$i" -le "$mem_n" ]; do
   eval "pair=\$mem_pair_$i"
-  eval "s=\${src_${i}_$chosen:-}"
-  echo "  member $pair -> RoCEv2 gid index $chosen (via $s)" >&2
+  eval "u=\$mem_usable_$i"
+  for g in $u; do
+    eval "s=\${src_${i}_$g:-}"
+    echo "  member $pair -> RoCEv2 gid index $g (via $s)" >&2
+  done
   i=$((i + 1))
 done
-echo "$chosen"
 exit 0
 RESOLVER
 )"
 
-# Resolve the RoCEv2 GID index for every member an NCCL_IB_HCA selector picks
-# on the target node. stdout: the single agreed index. Exit 1 = a selected
-# member is missing/unresolvable (fail closed), exit 3 = members disagree.
+# Validate that every member an NCCL_IB_HCA selector picks on the target node
+# exposes a usable RoCEv2 GID (RoCE v2 type whose address matches the preferred
+# IPv4 or an IPv4 on the member's own netdev). Per-member usable indexes are
+# audited on stderr; nothing is written to stdout. Exit 1 = a selected member
+# is missing/unresolvable (fail closed).
 # $1=ssh target (empty=local)  $2=NCCL_IB_HCA selector  $3=preferred IPv4
 resolve_rocev2_gid_index() {
   local ssh_target="$1" hca_spec="$2" match_ip="$3"
@@ -705,7 +667,7 @@ pick_gid_match_ip() {
 }
 
 resolve_nccl_gid_indexes() {
-  local head_match worker_match resolved_head resolved_worker rc
+  local head_match worker_match
 
   if [ "$NCCL_IB_GID_AUTO" = "0" ]; then
     NCCL_IB_GID_INDEX="${ENV_NCCL_IB_GID_INDEX:-}"
@@ -727,54 +689,37 @@ resolve_nccl_gid_indexes() {
     exit 1
   }
 
-  echo "Resolving RoCEv2 GID indexes from sysfs (head if=$NCCL_SOCKET_IFNAME ip=$head_match selector=$NCCL_IB_HCA; worker if=$WORKER_NCCL_SOCKET_IFNAME ip=$worker_match selector=$WORKER_NCCL_IB_HCA)..."
-  resolved_head="$(resolve_rocev2_gid_index "" "$NCCL_IB_HCA" "$head_match")" || {
-    rc=$?
-    if [ "$rc" -eq 3 ]; then
-      echo "FATAL: HCA/ports selected by NCCL_IB_HCA=$NCCL_IB_HCA on the head share no common RoCEv2 GID index (see the per-member usable sets above)." >&2
-      echo "NCCL_IB_GID_INDEX is one global value per rank, so no single pin can satisfy that selection - narrow NCCL_IB_HCA to members that share an index." >&2
-    else
-      echo "FATAL: could not resolve head RoCEv2 GID index (NCCL_IB_HCA=$NCCL_IB_HCA, match $head_match)." >&2
-      echo "Check: ibstat ; show_gids   # every selected member must exist under /sys/class/infiniband with a usable RoCE v2 GID" >&2
-    fi
+  echo "Validating RoCEv2 GIDs from sysfs (head if=$NCCL_SOCKET_IFNAME ip=$head_match selector=$NCCL_IB_HCA; worker if=$WORKER_NCCL_SOCKET_IFNAME ip=$worker_match selector=$WORKER_NCCL_IB_HCA)..."
+  resolve_rocev2_gid_index "" "$NCCL_IB_HCA" "$head_match" || {
+    echo "FATAL: could not validate head RoCEv2 GIDs (NCCL_IB_HCA=$NCCL_IB_HCA, match $head_match)." >&2
+    echo "Check: ibstat ; show_gids   # every selected member must exist under /sys/class/infiniband with a usable RoCE v2 GID" >&2
     exit 1
   }
-  if ! [[ "$resolved_head" =~ ^[0-9]+$ ]]; then
-    echo "FATAL: head RoCEv2 GID resolver returned invalid output." >&2
-    exit 1
-  fi
-
-  resolved_worker="$(resolve_rocev2_gid_index "$WORKER_HOST" "$WORKER_NCCL_IB_HCA" "$worker_match")" || {
-    rc=$?
-    if [ "$rc" -eq 3 ]; then
-      echo "FATAL: HCA/ports selected by WORKER_NCCL_IB_HCA=$WORKER_NCCL_IB_HCA on the worker share no common RoCEv2 GID index (see the per-member usable sets above)." >&2
-      echo "NCCL_IB_GID_INDEX is one global value per rank, so no single pin can satisfy that selection - narrow WORKER_NCCL_IB_HCA to members that share an index." >&2
-    else
-      echo "FATAL: could not resolve worker RoCEv2 GID index (WORKER_NCCL_IB_HCA=$WORKER_NCCL_IB_HCA, match $worker_match)." >&2
-      echo "Check on worker: ibstat ; show_gids" >&2
-    fi
+  resolve_rocev2_gid_index "$WORKER_HOST" "$WORKER_NCCL_IB_HCA" "$worker_match" || {
+    echo "FATAL: could not validate worker RoCEv2 GIDs (WORKER_NCCL_IB_HCA=$WORKER_NCCL_IB_HCA, match $worker_match)." >&2
+    echo "Check on worker: ibstat ; show_gids" >&2
     exit 1
   }
 
-  if ! [[ "$resolved_worker" =~ ^[0-9]+$ ]]; then
-    echo "FATAL: worker RoCEv2 GID resolver returned invalid output." >&2
-    exit 1
+  # AUTO=1 pins nothing: report and drop any stale pins from the env file.
+  if [ -n "$ENV_NCCL_IB_GID_INDEX" ]; then
+    echo "Note: ignoring NCCL_IB_GID_INDEX=$ENV_NCCL_IB_GID_INDEX from $ENV_FILE (NCCL_IB_GID_AUTO=1 leaves GID selection to NCCL per HCA)."
   fi
-
-  if [ -n "$ENV_NCCL_IB_GID_INDEX" ] && [ "$ENV_NCCL_IB_GID_INDEX" != "$resolved_head" ]; then
-    echo "Note: $ENV_FILE has NCCL_IB_GID_INDEX=$ENV_NCCL_IB_GID_INDEX but sysfs resolved head=$resolved_head (using resolved)."
+  if [ -n "$ENV_WORKER_NCCL_IB_GID_INDEX" ]; then
+    echo "Note: ignoring WORKER_NCCL_IB_GID_INDEX=$ENV_WORKER_NCCL_IB_GID_INDEX from $ENV_FILE (NCCL_IB_GID_AUTO=1 leaves GID selection to NCCL per HCA)."
   fi
-  if [ -n "$ENV_WORKER_NCCL_IB_GID_INDEX" ] && [ "$ENV_WORKER_NCCL_IB_GID_INDEX" != "$resolved_worker" ]; then
-    echo "Note: $ENV_FILE has WORKER_NCCL_IB_GID_INDEX=$ENV_WORKER_NCCL_IB_GID_INDEX but sysfs resolved worker=$resolved_worker (using resolved)."
-  fi
-
-  NCCL_IB_GID_INDEX="$resolved_head"
-  WORKER_NCCL_IB_GID_INDEX="$resolved_worker"
-  echo "RoCEv2 GID index: head=$NCCL_IB_GID_INDEX (match $head_match) worker=$WORKER_NCCL_IB_GID_INDEX (match $worker_match)"
+  NCCL_IB_GID_INDEX=""
+  WORKER_NCCL_IB_GID_INDEX=""
+  echo "RoCEv2 GIDs validated on both ranks; NCCL_IB_GID_INDEX left unset so NCCL selects the RoCEv2/IPv4 GID per HCA."
 }
 
 remote_nccl_env() {
   # Rebuild each call so GID resolve after early init is visible on the worker.
+  # NCCL_IB_GID_INDEX is always emitted, even empty under NCCL_IB_GID_AUTO=1:
+  # the empty process-env value overrides a stale worker .env.dspark entry at
+  # compose interpolation, and the shared entrypoint normalization makes the
+  # defined-empty variable truly absent in the container (NCCL would parse a
+  # defined-empty value as GID index 0).
   printf "NCCL_IB_HCA='%s' NCCL_SOCKET_IFNAME='%s' TP_SOCKET_IFNAME='%s' GLOO_SOCKET_IFNAME='%s' NCCL_IB_GID_INDEX='%s' VLLM_HOST='%s' VLLM_PORT='%s'" \
     "$WORKER_NCCL_IB_HCA" \
     "$WORKER_NCCL_SOCKET_IFNAME" \
@@ -893,8 +838,8 @@ print_resolved_profile() {
   echo "  head NCCL HCA/if: $NCCL_IB_HCA / $NCCL_SOCKET_IFNAME"
   echo "  worker NCCL HCA/if: $WORKER_NCCL_IB_HCA / $WORKER_NCCL_SOCKET_IFNAME"
   echo "  NCCL_IB_GID_AUTO: $NCCL_IB_GID_AUTO"
-  echo "  head NCCL_IB_GID_INDEX: ${NCCL_IB_GID_INDEX:-}"
-  echo "  worker NCCL_IB_GID_INDEX: ${WORKER_NCCL_IB_GID_INDEX:-}"
+  echo "  head NCCL_IB_GID_INDEX: ${NCCL_IB_GID_INDEX:-<unset>}"
+  echo "  worker NCCL_IB_GID_INDEX: ${WORKER_NCCL_IB_GID_INDEX:-<unset>}"
   echo "  worker dir: $WORKER_DIR"
   if [ "$DSPARK_WORKER_HF_NFS" = "1" ]; then
     echo "  worker weights: NFS $NFS_VOLUME from ${NFS_SERVER_IP:-$IFACE} (head $HF_CACHE_DIR, no worker copy)"
