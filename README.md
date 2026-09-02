@@ -271,10 +271,11 @@ generous `max_tokens` or that budget hotfix, or thinking won't end. See
 | `MAX_MODEL_LEN` | `1048576` | Per-request ceiling (1M). `200000` is the high-concurrency / Keys profile. |
 | `MAX_NUM_SEQS` | `6` | Concurrent slots. `16` only with the 200K + Stage-C path. |
 | `MAX_NUM_BATCHED_TOKENS` | `8192` | Prefill tokens per step. `16384` for big-prompt coding. |
-| `LONG_PREFILL_TOKEN_THRESHOLD` | `1024` | Issue **#27** chunk cap. `0` lets one prefill eat the whole batch (decode starves). |
+| `LONG_PREFILL_TOKEN_THRESHOLD` | `1024` | Issue **#27** chunk cap. `0` lets one prefill eat the whole batch (decode starves). `2048` costs ~1.5 GB of head-node host RAM on GB10 (measured 2026-09-02), keep 1024. |
+| `DSPARK_MAX_INFLIGHT_PREFILLS` | `2` | Issue **#27** in-flight partial prefills (1–3). `2` since the 2026-09-02 A/B ([docs/CLAUDE/ab-results-2026-09-03.md](docs/CLAUDE/ab-results-2026-09-03.md)): a 4 × 8K wave sees first-token spread 9.1 s vs 14.6 s and +12 % aggregate, single-stream and c=6 decode unchanged. `1` restores the strictly serialized default. |
 | `GPU_MEMORY_UTILIZATION_TEXT` | `0.835` | Main GPU util / KV pool size. Larger = bigger KV pool. |
 | `LIMIT_MM_PER_PROMPT` | `{"image":8}` | Max images per request (Vision-Exp native `image_url`). `image=8` is converted to JSON for Anemll argparse. No video. |
-| `MTP_NUM_TOKENS` | `6` | DSpark draft depth. Vision-Exp `n_predict=3` so k must be ≥ 5 and divisible by 3. Capture size = `seqs * (k+1)`. |
+| `MTP_NUM_TOKENS` | `6` | DSpark draft depth. Vision-Exp `n_predict=3` so k must be ≥ 5 and divisible by 3. Capture size = `seqs * (k+1)` padded up to a multiple of 8 (48 at 6×6). |
 | `VLLM_USE_BREAKABLE_CUDAGRAPH` | `0` | **Keep 0.** Unset enables Anemll’s slower breakable graphs. |
 | `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` | `4096` | Issue **#26** SWA prefix-cache spacing. Leave unless you are debugging warm-cache hits. |
 
@@ -319,11 +320,17 @@ On the **default Anemll 1M/6** stack:
 | --- | --- |
 | One chat, any prompt length through 128K | ~62–83 decode tok/s after first token |
 | **Six short chats** (hundreds of tokens), 1M still *allowed* | **~160–190 tok/s aggregate** (~30–37 per stream) |
-| Six **cold 32K–128K** prompts at once | Prefills **queue** (issue #27). ~8 tok/s decode floor; 128K × 6 TTFT minutes |
+| Six **cold 32K–128K** prompts at once | Prefills are chunked (issue #27), **two in flight** (`DSPARK_MAX_INFLIGHT_PREFILLS=2`), the rest queue. A 4 × 8K wave gets its first tokens at 7.4 / 9.0 / 15.7 / 16.5 s (was 4.7 / 9.4 / 14.3 / 19.3 s at `1`). ~8 tok/s decode floor while prefills run; 128K × 6 TTFT minutes |
 
 That ~170–190 c=6 number is **six streams generating**, not six huge prefills.
 Live 2026-08-14 on this cluster: 256 × c=6 = **162** agg; 128K × c=1 still
 **75 tok/s** / **80 s** TTFT.
+
+Live 2026-09-02, same lane, sp-indexer on, capture 48, inflight 2
+([docs/CLAUDE/ab-results-2026-09-03.md](docs/CLAUDE/ab-results-2026-09-03.md)): 256 × c=1 = **56** tok/s
+(8-trial median, 51–67), 256 × c=6 = **139** agg, 128K × c=1 TTFT **78.5 s**.
+Decode is 15–25 % under the 14 Aug figures above and no `.env.dspark` knob
+accounts for it; treat the 14 Aug numbers as the best seen, not the norm.
 
 **315 / 205 tok/s** (200K context, 16 slots) needs the **Stage-C + Keys**
 path. The ~182 1M/6 microbench was also measured with that Keys mask; the
@@ -517,7 +524,7 @@ Compose is Anemll-shaped (`/usr/local/bin/vllm`, hotfixes under
 - `--kv-cache-dtype nvfp4_ds_mla` · `--block-size 256`
 - `--max-model-len 1048576` · `--max-num-seqs 6` · `--max-num-batched-tokens 8192`
 - `--long-prefill-token-threshold 1024` · `--enable-chunked-prefill` · `--async-scheduling`
-- `--max-cudagraph-capture-size` = `MAX_NUM_SEQS * (MTP_NUM_TOKENS + 1)` → 42 at 6×6 (engine may truncate to 32)
+- `--max-cudagraph-capture-size` = `MAX_NUM_SEQS * (MTP_NUM_TOKENS + 1)` padded to a multiple of 8 → 48 at 6×6 (plain 42 truncates to 40 and costs 12 % at c=6, measured 2026-09-02)
 - `--moe-backend flashinfer_b12x` · `--generation-config vllm`
 - DSpark: `{"method":"dspark","num_speculative_tokens":6,"draft_sample_method":"probabilistic"}`
 
