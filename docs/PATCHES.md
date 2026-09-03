@@ -210,14 +210,22 @@ docker exec <container> bash /path/to/hotfix-nvfp4-ds-mla-issue22.sh
 waiting-admission loop once in-flight partial prefills reach
 `DSPARK_MAX_INFLIGHT_PREFILLS` (1–3; fallback
 `SchedulerConfig.max_num_partial_prefills`). The count is derived directly
-from `self.running` (`num_computed_tokens < num_prompt_tokens`), not from the
-`_inflight_prefills` set, whose add/discard bookkeeping is shared with
-async-KV loads and is retained only for `_inflight_prefill_reserved_blocks`
-(issue #154 defense). Each `Scheduler` construction logs
-`[issue27-hotfix] in-flight prefill cap=N env=<raw>` once; a bounded tripwire
-(≤16 warnings per process) logs `in-flight prefill undercount` whenever the
-set undercounts the running prefills; verbose `[issue27-adm]` admission lines
-require the existing `DSPARK_ISSUE43_SCHED_DIAG=1` knob.
+from `self.running`: a request counts while `num_computed_tokens +
+num_scheduled_tokens.get(request_id, 0) < num_tokens +
+num_output_placeholders` — still partially prefilled after this step's
+scheduled tokens (the stock set's add predicate / `is_prefill_chunk`). A
+request whose whole prompt or last chunk is scheduled this step does not
+count, so single-chunk same-step bursts are not throttled and a finished
+prefill's slot is released one step earlier than the `_inflight_prefills` set
+discards it; the set itself is retained only for
+`_inflight_prefill_reserved_blocks` (issue #154 defense). Each `Scheduler`
+construction logs `[issue27-hotfix] in-flight prefill cap=N env=<raw>` once; a
+bounded tripwire (≤16 warnings per process) logs `in-flight prefill
+undercount` only when the set truly loses a running partial prefill; verbose
+`[issue27-adm]` admission lines require the existing
+`DSPARK_ISSUE43_SCHED_DIAG=1` knob. An older `[issue27-hotfix]` application
+without the `[issue27-r2]` marker is refused (exit 1); `--status` reports
+`APPLIED (r2)` / `APPLIED (pre-r2, stale)` / `NOT APPLIED`.
 
 ---
 

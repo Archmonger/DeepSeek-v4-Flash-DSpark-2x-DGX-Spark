@@ -20,13 +20,20 @@ compose) because this image rejects ``--max-num-partial-prefills``. It is
 parsed once during ``Scheduler`` construction; unset, blank, nonpositive, or
 malformed values fall back to ``SchedulerConfig.max_num_partial_prefills``
 (stock 1), and malformed values emit one warning. The in-flight count is
-derived directly from ``self.running`` (requests with ``num_computed_tokens <
-num_prompt_tokens``); ``self._inflight_prefills`` bookkeeping is retained for
-``_inflight_prefill_reserved_blocks`` but is no longer load-bearing for
-admission. Every ``Scheduler`` construction logs the resolved cap once
+derived directly from ``self.running``: a request counts while
+``num_computed_tokens + num_scheduled_tokens.get(request_id, 0) < num_tokens +
+num_output_placeholders`` — i.e. it will still be partially prefilled after
+this step's scheduled tokens are applied (the stock set's add predicate and
+``is_prefill_chunk``). A request whose whole prompt or last chunk is scheduled
+this step is therefore not counted: single-chunk same-step admission bursts
+are not throttled, and a finished prefill's slot is released one step earlier
+than the ``_inflight_prefills`` set discards it (intended; "partial" = does
+not finish this step). The set is retained for
+``_inflight_prefill_reserved_blocks`` but is not load-bearing for admission.
+Every ``Scheduler`` construction logs the resolved cap once
 (``[issue27-hotfix] in-flight prefill cap=N env=<raw>``); if the tracked set
-ever undercounts the running prefills a bounded tripwire logs at most 16
-warnings per process, and verbose per-admission lines (``[issue27-adm]``)
+ever undercounts the running partial prefills a bounded tripwire logs at most
+16 warnings per process, and verbose per-admission lines (``[issue27-adm]``)
 appear only under the existing ``DSPARK_ISSUE43_SCHED_DIAG`` knob. This
 restores the documented concurrency cap of 1 by default, so at most one
 request prefill-chunks per step and decode lanes behind it in ``self.running``
@@ -34,7 +41,9 @@ always receive budget (chunk cap via ``--long-prefill-token-threshold`` keeps
 that one chunk below ``max_num_batched_tokens`` leaving room for decode
 tokens).
 
-Idempotent: re-applying is a no-op once the marker is present.
+Idempotent: re-applying is a no-op once the r2 marker is present. An older
+(pre-r2) issue27 gate without ``[issue27-r2]`` is refused with exit 1;
+``--status`` reports APPLIED (r2) / APPLIED (pre-r2, stale) / NOT APPLIED.
 
 Patches /usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py
 in-place inside the container (called from the compose entrypoint before
@@ -45,15 +54,24 @@ import sys
 
 P = Path("/usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py")
 MARK = "# [issue27-hotfix] enforce max_num_partial_prefills on admission"
+R2_MARK = "# [issue27-r2]"
 if len(sys.argv) > 1 and sys.argv[1] == "--status":
     status_src = P.read_text() if P.is_file() else ""
-    print("issue27 partial-prefill cap        :",
-          "APPLIED" if MARK in status_src else "NOT APPLIED")
+    if MARK in status_src and R2_MARK in status_src:
+        status = "APPLIED (r2)"
+    elif MARK in status_src:
+        status = "APPLIED (pre-r2, stale)"
+    else:
+        status = "NOT APPLIED"
+    print("issue27 partial-prefill cap        :", status)
     raise SystemExit(0)
 src = P.read_text()
 if MARK in src:
-    print(f"[issue27-hotfix] already applied to {P}")
-    raise SystemExit(0)
+    if R2_MARK in src:
+        print(f"[issue27-hotfix] already applied to {P}")
+        raise SystemExit(0)
+    print("[issue27-hotfix] older issue27 gate present (pre-r2); refusing to patch")
+    raise SystemExit(1)
 
 INIT_ANCHOR = (
     "        # In-flight requests still prefilling (prefill chunks + in-progress\n"
@@ -108,17 +126,27 @@ INJECT = ADMISSION_ANCHOR + (
     "                # max_num_batched_tokens each step; decode-active requests behind\n"
     "                # them get num_new_tokens==0 and are skipped (continue, not preempt)\n"
     "                # -> zero-preemption decode starvation (issue #27). Admission\n"
-    "                # is counted directly from self.running (requests with\n"
-    "                # num_computed_tokens < num_prompt_tokens), not from the\n"
-    "                # _inflight_prefills set, whose add/discard bookkeeping is\n"
-    "                # shared with async-KV loads and is not load-bearing here\n"
-    "                # (kept for _inflight_prefill_reserved_blocks).\n"
+    "                # is counted directly from self.running (still-partial prefills,\n"
+    "                # see [issue27-r2] below), not from the _inflight_prefills set,\n"
+    "                # whose add/discard bookkeeping is shared with async-KV loads\n"
+    "                # and is not load-bearing here (kept for\n"
+    "                # _inflight_prefill_reserved_blocks).\n"
     "                # DSPARK_MAX_INFLIGHT_PREFILLS is parsed and cached once\n"
     "                # during Scheduler construction, never in this hot loop.\n"
     "                if self._dspark_max_inflight_prefills > 0:\n"
     "                    _pp_running = 0\n"
+    "                    # [issue27-r2] count requests still partially prefilled AFTER\n"
+    "                    # this step's scheduled tokens (stock set add predicate l.995 /\n"
+    "                    # is_prefill_chunk l.1181). num_computed_tokens is advanced only\n"
+    "                    # in _update_after_schedule; a whole-prompt-this-step admission\n"
+    "                    # is not a partial prefill and must not block same-step\n"
+    "                    # admissions or trip the undercount tripwire.\n"
     "                    for _r in self.running:\n"
-    "                        if _r.num_computed_tokens < _r.num_prompt_tokens:\n"
+    "                        if (\n"
+    "                            _r.num_computed_tokens\n"
+    "                            + num_scheduled_tokens.get(_r.request_id, 0)\n"
+    "                            < _r.num_tokens + _r.num_output_placeholders\n"
+    "                        ):\n"
     "                            _pp_running += 1\n"
     "                    _pp_tracked = len(self._inflight_prefills)\n"
     "                    if _pp_tracked < _pp_running:\n"
