@@ -13,6 +13,9 @@ COMPOSE = ROOT / "docker-compose.dspark.yml"
 START = ROOT / "start-deepseek-v4-flash-dspark.sh"
 ENCODING_TOKEN = "python3 /opt/hotfix-encoding-dsv4-issue21.py"
 RUNTIME_TOKEN = "python3 /opt/hotfix-dsv4-issue27-partial-prefill-concurrency.py"
+RESPONSES_STORE_TOKEN = "python3 /opt/hotfix-dsv4-responses-store.py"
+RESPONSES_LAUNCHER_BEGIN = "# Bounded Responses API store pre-flight (begin)."
+RESPONSES_LAUNCHER_END = "# Bounded Responses API store pre-flight (end)."
 ISSUE138_TOKEN = "python3 /opt/hotfix-vllm-issue138-responses-history.py"
 LAUNCHER_BEGIN = "# Issue #138 Responses history compatibility pre-flight (begin)."
 LAUNCHER_END = "# Issue #138 Responses history compatibility pre-flight (end)."
@@ -69,11 +72,15 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
     def setUpClass(cls):
         cls.encoding_line = _compose_line(ENCODING_TOKEN)
         cls.runtime_line = _compose_line(RUNTIME_TOKEN)
+        cls.responses_store_line = _compose_line(RESPONSES_STORE_TOKEN)
         cls.issue138_line = _compose_line(ISSUE138_TOKEN)
         start_source = START.read_text()
         cls.launcher_preflight = start_source.split(LAUNCHER_BEGIN, 1)[1].split(
             LAUNCHER_END, 1
         )[0]
+        cls.responses_launcher_preflight = start_source.split(
+            RESPONSES_LAUNCHER_BEGIN, 1
+        )[1].split(RESPONSES_LAUNCHER_END, 1)[0]
         cls.codex_agent_line = _optional_compose_line(CODEX_AGENT_TOKEN)
         if CODEX_LAUNCHER_BEGIN in start_source and CODEX_LAUNCHER_END in start_source:
             cls.codex_launcher_preflight = start_source.split(
@@ -90,6 +97,7 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
         fail_step: str | None = None,
         env_extra: dict[str, str | None] | None = None,
         missing_encoding: bool = False,
+        after_command: str | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], list[str], bool]:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -108,6 +116,8 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
                 encoding.write_text("# fixture\n")
 
             command = line.replace("$$", "$")
+            if after_command is not None:
+                command += "\n" + after_command
             command += f'\nprintf x > "{reached}"\n'
             env = dict(os.environ)
             env.update(
@@ -128,6 +138,9 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
             env.pop("DSPARK_ISSUE138_HOTFIX", None)
             env.pop("DSPARK_ENABLE_CODEX_AGENT_MESSAGE_COMPAT", None)
             env.pop("DSPARK_CODEX_AGENT_MESSAGE_HOTFIX", None)
+            env.pop("VLLM_ENABLE_RESPONSES_API_STORE", None)
+            env.pop("DSPARK_RESPONSES_STORE_MAX_ENTRIES", None)
+            env.pop("DSPARK_RESPONSES_STORE_HOTFIX", None)
             env.pop("DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK", None)
             if fail_step is not None:
                 env["FAIL_STEP"] = fail_step
@@ -150,6 +163,43 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
                 timeout=30,
             )
             return proc, invocations.read_text().splitlines(), reached.exists()
+    def _run_responses_preflight(
+        self,
+        *,
+        enabled: str | None,
+        capacity: str | None,
+        patch_exists: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            patch = root / "hotfix.py"
+            if patch_exists:
+                patch.touch()
+            env = dict(os.environ)
+            env["SCRIPT_DIR"] = str(root)
+            env["DSPARK_RESPONSES_STORE_HOTFIX"] = str(patch)
+            if enabled is None:
+                env.pop("VLLM_ENABLE_RESPONSES_API_STORE", None)
+            else:
+                env["VLLM_ENABLE_RESPONSES_API_STORE"] = enabled
+            if capacity is None:
+                env.pop("DSPARK_RESPONSES_STORE_MAX_ENTRIES", None)
+            else:
+                env["DSPARK_RESPONSES_STORE_MAX_ENTRIES"] = capacity
+            command = (
+                self.responses_launcher_preflight
+                + "\nprintf '%s\\n%s\\n' "
+                + '"$VLLM_ENABLE_RESPONSES_API_STORE" '
+                + '"$DSPARK_RESPONSES_STORE_MAX_ENTRIES"'
+            )
+            return subprocess.run(
+                ["bash", "-c", command],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=30,
+            )
+
 
     def test_encoding_line_runs_enabled_steps_in_order(self):
         proc, invocations, reached = self._run_line(self.encoding_line)
@@ -227,6 +277,74 @@ class PythonHotfixFailClosedTest(unittest.TestCase):
             ],
         )
         self.assertTrue(reached)
+
+    def test_responses_store_only_invokes_for_exact_one(self):
+        for value in (None, "0", "true", "2"):
+            with self.subTest(value=value):
+                extra = (
+                    {}
+                    if value is None
+                    else {"VLLM_ENABLE_RESPONSES_API_STORE": value}
+                )
+                proc, invocations, reached = self._run_line(
+                    self.responses_store_line,
+                    env_extra=extra,
+                    after_command=(
+                        'printf "normalized=%s\\n" '
+                        '"$VLLM_ENABLE_RESPONSES_API_STORE"'
+                    ),
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(invocations, [])
+                self.assertTrue(reached)
+                self.assertEqual(proc.stdout, "normalized=0\n")
+
+        proc, invocations, reached = self._run_line(
+            self.responses_store_line,
+            env_extra={"VLLM_ENABLE_RESPONSES_API_STORE": "1"},
+            after_command=(
+                'printf "normalized=%s\\n" '
+                '"$VLLM_ENABLE_RESPONSES_API_STORE"'
+            ),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(invocations, ["hotfix-dsv4-responses-store.py"])
+        self.assertTrue(reached)
+        self.assertEqual(proc.stdout, "normalized=1\n")
+
+        proc, invocations, reached = self._run_line(
+            self.responses_store_line,
+            fail_step="hotfix-dsv4-responses-store.py",
+            env_extra={"VLLM_ENABLE_RESPONSES_API_STORE": "1"},
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(invocations, ["hotfix-dsv4-responses-store.py"])
+        self.assertFalse(reached)
+
+    def test_responses_store_preflight_is_fail_closed(self):
+        disabled = self._run_responses_preflight(
+            enabled="true", capacity="not-an-int", patch_exists=False
+        )
+        self.assertEqual(disabled.returncode, 0, disabled.stdout + disabled.stderr)
+        self.assertEqual(disabled.stdout.splitlines(), ["0", "256"])
+
+        enabled = self._run_responses_preflight(
+            enabled="1", capacity="7", patch_exists=True
+        )
+        self.assertEqual(enabled.returncode, 0, enabled.stdout + enabled.stderr)
+        self.assertEqual(enabled.stdout.splitlines(), ["1", "7"])
+
+        missing = self._run_responses_preflight(
+            enabled="1", capacity="7", patch_exists=False
+        )
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("patcher is missing", missing.stderr)
+
+        invalid = self._run_responses_preflight(
+            enabled="1", capacity="0", patch_exists=True
+        )
+        self.assertEqual(invalid.returncode, 2)
+        self.assertIn("must be a positive integer", invalid.stderr)
 
     def test_issue138_unset_zero_and_non_one_values_do_not_invoke_patcher(self):
         for value in (None, "0", "true", "2"):

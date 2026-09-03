@@ -297,6 +297,44 @@ gated-ON/OFF boot proof on both ranks before relying on it in production.
 python3 scripts/test-assistant-final-continuation.py
 ```
 
+## Bounded Responses API store
+
+`VLLM_ENABLE_RESPONSES_API_STORE=1` enables the pinned vLLM process-local
+response store. The stock implementation never evicts. The launcher therefore
+checks and applies `patches/hotfix-dsv4-responses-store.py` on every rank before
+engine startup; missing, drifted, invalid, or failed patching aborts the start.
+Default `0` does not invoke the patcher and leaves `serving.py` byte-identical.
+
+The target is pinned vLLM `752a3a504`:
+
+```text
+/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/responses/serving.py
+stock SHA-256  fe3a48ab09c516835ce6dd1471c06cc784ae7504eaa7af7f10574704106830d8
+patched SHA-256 1b0033131a34e03a2e129743258f5da81b3e60e979072920153f6d09bf4e5d8f
+```
+
+`DSPARK_RESPONSES_STORE_MAX_ENTRIES` is a positive terminal-entry cap
+(default `256`). Response, rendered-message, and background-event state is one
+eviction bundle. Retrieval and `previous_response_id` continuation refresh LRU
+recency. Continuation preprocessing pins its bundle against concurrent
+eviction; tracked background producers are retained until their synchronous
+completion callback terminalizes status, signals waiting streams, and prunes.
+Background event state is published before the lazy reader is returned, and
+readers capture that state so later dictionary eviction cannot truncate replay.
+Foreground stream messages are retained only after iteration begins and are
+removed on error or early close unless a terminal response was stored.
+
+Queued, in-progress, pinned, and tracked-producer entries can temporarily exceed
+the terminal cap. The setting bounds entry count, not bytes or concurrent
+request admission. Stored state remains memory-only and is lost on any process
+restart. Recreate every rank when changing either setting; a Docker restart
+preserves the patched writable layer, not stored Responses state.
+
+The patcher accepts only the exact stock or patched full-file hash, compiles the
+postimage, preserves file mode, publishes through a same-directory atomic
+rename, verifies the result, and rolls back on failed post-publication
+verification. `--check`/`--status` are non-mutating.
+
 ## Issue #138 — type-less assistant `output_text` history replay
 
 ### Scope and source identity

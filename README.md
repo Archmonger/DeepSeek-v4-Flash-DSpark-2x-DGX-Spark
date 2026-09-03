@@ -592,15 +592,24 @@ is **CPU-only** (`scripts/ci-validate.sh`). Live tok/s still needs the 2× Spark
 
 ### Strict Responses API verification
 
-Stateful `previous_response_id` continuation requires starting vLLM with
-`VLLM_ENABLE_RESPONSES_API_STORE=1`. vLLM keeps the Responses API store off
-by default; when enabled, stored response state consumes memory and is retained
-until the server restarts. A continuation `response_id` 404 while the other
-gates pass indicates this configuration is off, not a verifier regression.
+Stateful `previous_response_id` continuation requires enabling the in-memory
+store and its exact-source bounded-store backport:
 
-Existing live evidence: the stock configuration passed 3/4 gates, with only
-the known configuration 404; a controlled
-`VLLM_ENABLE_RESPONSES_API_STORE=1` run passed all four gates.
+```env
+VLLM_ENABLE_RESPONSES_API_STORE=1
+DSPARK_RESPONSES_STORE_MAX_ENTRIES=256
+```
+
+Enabled starts source-check and apply the patch fail-closed on every rank.
+The cap covers terminal response/message/event bundles; active work can
+temporarily exceed it, and it is not a retained-byte limit. Retrieval and
+`previous_response_id` use refresh LRU recency. Stored state is process-local
+and is lost on any process restart. Recreate every rank when changing either
+value; a Docker restart preserves patched writable-layer bytes, not state.
+
+The store remains off by default. The verifier treats a continuation
+`response_id` 404 as an explicit store-configuration failure rather than
+silently accepting a stateless run.
 
 After the server is ready, run the dependency-free live verifier to check
 Responses text/SSE, stateful tool continuation, strict JSON schema, reasoning,
@@ -612,6 +621,11 @@ python3 scripts/verify-responses-api-live.py \
   --model deepseek-v4-flash-vision-exp \
   --output results/responses-api-live.json
 ```
+
+To exercise the terminal LRU contract, recreate every rank with
+`DSPARK_RESPONSES_STORE_MAX_ENTRIES=2` and add `--store-capacity 2` to the
+command. The argument must equal the server cap; values are intentionally
+limited to `2..16` to prevent an accidental large generation sweep.
 
 The verifier above is the store/tool/cache and broad no-regression gate. Issue
 #138 has a separate mode-strict verifier for stateless **full-history replay**;
@@ -659,7 +673,7 @@ only when the corresponding live behavior is outside the test scope.
 | `docker-compose.dspark-nfs.override.yml` | Worker: named NFS volume + local JIT overlays |
 | `scripts/overlay-vision-exp-ablit-cache.py` | Hardlink official Vision-Exp blobs + copy the 26 ablit shards |
 | `scripts/benchmark-0731.py` | Prompt × concurrency sweep |
-| `scripts/verify-responses-api-live.py` | Strict Responses, multi-turn cache, and disconnect gates |
+| `scripts/verify-responses-api-live.py` | Strict Responses, store LRU, multi-turn cache, and disconnect gates |
 | `scripts/verify-issue138-responses-history-live.py` | Mode-strict stock/enabled full-history replay gate |
 | [docs/ENVS.md](docs/ENVS.md) | Anemll vs Stage-C env matrix |
 | [docs/PATCHES.md](docs/PATCHES.md) | Keys / #27 / #22 notes |

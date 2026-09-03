@@ -52,6 +52,7 @@ py_files+=(
   scripts/test-issue26-swa-min-v2.py
   scripts/test-issue31-thinking-budget-gpu.py
   scripts/test-issue55-tool-truncation.py
+  scripts/test-responses-store-hotfix.py
   scripts/test-responses-api-live.py
   scripts/verify-issue138-responses-history-live.py
   scripts/test-issue138-responses-history-hotfix.py
@@ -92,6 +93,8 @@ python3 scripts/test-issue31-thinking-budget-gpu.py -q
 ok "test-issue31-thinking-budget-gpu"
 python3 scripts/test-issue55-tool-truncation.py -q
 ok "test-issue55-tool-truncation"
+python3 scripts/test-responses-store-hotfix.py -q
+ok "test-responses-store-hotfix"
 python3 scripts/test-responses-api-live.py -q
 ok "test-responses-api-live"
 python3 scripts/test-issue138-responses-history-hotfix.py -q
@@ -389,6 +392,22 @@ if grep -Fq 'DSPARK_WORKER_HF_NFS="${DSPARK_WORKER_HF_NFS:-0}"' start-deepseek-v
 else
   bad "worker HF NFS wiring is incomplete"
 fi
+if grep -Fq 'hotfix-dsv4-responses-store.py}:/opt/hotfix-dsv4-responses-store.py:ro' docker-compose.dspark.yml \
+  && grep -Fq 'VLLM_ENABLE_RESPONSES_API_STORE: "${VLLM_ENABLE_RESPONSES_API_STORE:-0}"' docker-compose.dspark.yml \
+  && grep -Fq 'DSPARK_RESPONSES_STORE_MAX_ENTRIES: "${DSPARK_RESPONSES_STORE_MAX_ENTRIES:-256}"' docker-compose.dspark.yml \
+  && grep -Fq 'if [ "$${VLLM_ENABLE_RESPONSES_API_STORE:-0}" != "1" ]; then export VLLM_ENABLE_RESPONSES_API_STORE=0; fi;' docker-compose.dspark.yml \
+  && grep -Fq 'if [ "$${VLLM_ENABLE_RESPONSES_API_STORE}" = "1" ]; then python3 /opt/hotfix-dsv4-responses-store.py || exit 1; fi;' docker-compose.dspark.yml \
+  && grep -Fxq 'VLLM_ENABLE_RESPONSES_API_STORE=0' .env.dspark.example \
+  && grep -Fxq 'DSPARK_RESPONSES_STORE_MAX_ENTRIES=256' .env.dspark.example \
+  && grep -Fq '# Bounded Responses API store pre-flight (begin).' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'Responses API store: disabled (stock source)' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'Responses API store: enabled (terminal cap $DSPARK_RESPONSES_STORE_MAX_ENTRIES)' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'scp "$DSPARK_RESPONSES_STORE_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-responses-store.py"' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq '/opt/hotfix-dsv4-responses-store.py --check' start-deepseek-v4-flash-dspark.sh; then
+  ok "Responses store is exact-1, fail-closed, source-checked, reported, and propagated to every rank"
+else
+  bad "bounded Responses store wiring is incomplete"
+fi
 if grep -q 'restart: ${DSPARK_RESTART_POLICY:-unless-stopped}' docker-compose.dspark.yml; then
   ok "compose restart unless-stopped"
 else
@@ -407,6 +426,7 @@ for p in \
   patches/hotfix-encoding-dsv4-issue21.py \
   patches/hotfix-dsv4-issue31-v2-thinking-budget-gpu.py \
   patches/hotfix-dsv4-issue55-tool-truncation.py \
+  patches/hotfix-dsv4-responses-store.py \
   patches/hotfix-dsv4-issue26-hybrid-swa-min.py \
   patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py \
   patches/hotfix-dsv4-adaptive-prefill-chunk.py \
