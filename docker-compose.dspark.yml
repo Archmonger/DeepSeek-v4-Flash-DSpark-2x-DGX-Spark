@@ -83,6 +83,8 @@ services:
       # Issue #138: opt-in compatibility for singleton type-less assistant
       # output_text items replayed through the Responses API.
       - ${DSPARK_ISSUE138_HOTFIX:-./patches/hotfix-vllm-issue138-responses-history.py}:/opt/hotfix-vllm-issue138-responses-history.py:ro
+      # Codex-only agent_message history compatibility (opt-in).
+      - ${DSPARK_CODEX_AGENT_MESSAGE_HOTFIX:-./patches/hotfix-vllm-codex-agent-message.py}:/opt/hotfix-vllm-codex-agent-message.py:ro
       - ${DSPARK_PATCHES_DIR:-./patches}:/opt/dspark-patches:ro
       # TP=3 group-pad patch (no-op unless TP_SIZE=3). Sourced from
       # localaiguyy/DeepSeek-V4-Flash-DSpark-3x-DGX-Spark.
@@ -277,6 +279,8 @@ services:
       # Issue #138: 0/non-1 = stock Responses validation; exact 1 applies
       # the pinned-source compatibility patch and fails boot on any error.
       DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT: "${DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT:-0}"
+      # Codex agent_message: exact 1 applies the narrow compatibility patch.
+      DSPARK_ENABLE_CODEX_AGENT_MESSAGE_COMPAT: "${DSPARK_ENABLE_CODEX_AGENT_MESSAGE_COMPAT:-0}"
       # Issue #141 stochastic TP=2 sparse-MLA stall workaround. Only exact 1
       # applies the pinned-source, fixed-64-row patch; default 0 changes no bytes.
       DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK: "${DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK:-0}"
@@ -358,6 +362,7 @@ services:
         if [ "$${DSPARK_SKIP_HOTFIX:-0}" != "1" ]; then for _hf in hotfix-dsv4-mtp-buffer-50312.sh hotfix-dsv4-skip-topk-49486.sh hotfix-dsv4-dense-prefill-indexer-48407.sh hotfix-dsv4-skip-empty-c128-48957.sh hotfix-dsv4-flashmla-workspace-50298.sh hotfix-dsv4-grammar-advance.sh; do if [ ! -f /opt/dspark-patches/$${_hf} ]; then echo "FATAL: /opt/dspark-patches/$${_hf} missing" >&2; exit 1; fi; bash /opt/dspark-patches/$${_hf} || exit 1; done; fi;
         if [ "$${_dspark_keys_set}" = "1" ] || [ -n "$${VLLM_API_KEY:-}" ]; then bash /opt/dspark-patches/hotfix-vllm-redact-api-key-log.sh || exit 1; bash /opt/dspark-patches/hotfix-vllm-redact-api-key-log.sh --status || exit 1; fi;
         if [ "$${DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT:-0}" = "1" ]; then python3 /opt/hotfix-vllm-issue138-responses-history.py || exit 1; fi;
+        if [ "$${DSPARK_ENABLE_CODEX_AGENT_MESSAGE_COMPAT:-0}" = "1" ]; then python3 /opt/hotfix-vllm-codex-agent-message.py || exit 1; fi;
         python3 /opt/hotfix-dsv4-vision-exp.py || exit 1; if [ "$${DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py || exit 1; fi; if [ "$${DSPARK_ENABLE_SP_INDEXER:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-sp-indexer-prefill.py || exit 1; fi; if [ "$${DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS:-0}" = "1" ]; then bash /opt/dspark-patches/hotfix-deepgemm-sm121-mqa-header-alias.sh || exit 1; fi; python3 /opt/hotfix-vllm-empty-encoder-output.py || exit 1; python3 /opt/hotfix-dsv4-issue27-partial-prefill-concurrency.py || exit 1; if [ "$${DSPARK_ENABLE_ADAPTIVE_CHUNK:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-adaptive-prefill-chunk.py || exit 1; fi; if [ "$${DSPARK_ENABLE_REPLICATE_MARKOV:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-replicate-markov-head.py || exit 1; fi; python3 /opt/hotfix-dsv4-issue43-decode-fairness-and-diag.py || exit 1; python3 /opt/hotfix-dsv4-issue26-hybrid-swa-min.py || exit 1; python3 /opt/hotfix-dsv4-issue133-triton-specialization.py || exit 1; if [ "$${DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX:-0}" != "1" ]; then python3 /opt/hotfix-dsv4-suppress-stops-in-reasoning.py || exit 1; fi; VLLM_QUANTIZATION_ARGS="";
         if [ "$${DSPARK_ENABLE_ASSISTANT_FINAL_HOTFIX:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-assistant-final-continuation.py || exit 1; fi;
         if [ "$${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}" = "1" ]; then python3 /opt/hotfix-vllm-issue136-xgrammar-termination.py || exit 1; fi;

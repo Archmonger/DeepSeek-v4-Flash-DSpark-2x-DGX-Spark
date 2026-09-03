@@ -19,6 +19,8 @@ Usage:
 """
 from __future__ import annotations
 
+import ast
+import hashlib
 import os
 import stat
 import sys
@@ -32,6 +34,12 @@ TAG = "[issue138-hotfix]"
 MARKER = (
     "# [issue138-hotfix] Normalize the observed singleton type-less "
     "assistant output replay."
+)
+CODEX_MARKER = (
+    "# [codex-agent-message-hotfix] Convert the evidenced Codex agent_message."
+)
+CODEX_COMBINED_METHOD_SHA256 = (
+    "a5af28655454f4f1cdd22e89eaaa0c5400578cdd0efbb6498412d0b8639efc7e"
 )
 TYPE_ALIAS_GUARD = (
     "ResponseInputOutputItem: TypeAlias = "
@@ -276,6 +284,33 @@ def _compile(source: str, target: Path) -> None:
     except (SyntaxError, ValueError, TypeError) as error:
         raise PatchError(f"target does not compile: {type(error).__name__}: {error}") from error
 
+def _extract_method(source: str, target: Path) -> str:
+    try:
+        tree = ast.parse(source, filename=str(target))
+    except SyntaxError as error:
+        raise PatchError(f"target does not parse: {error}") from error
+
+    matches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "input_item_parsing"
+    ]
+    if len(matches) != 1:
+        raise PatchError(
+            f"expected one input_item_parsing method, found {len(matches)}"
+        )
+    method_node = matches[0]
+    if not method_node.decorator_list or method_node.end_lineno is None:
+        raise PatchError("input_item_parsing method boundaries are unavailable")
+    start_line = min(decorator.lineno for decorator in method_node.decorator_list)
+    lines = source.splitlines(keepends=True)
+    method = "".join(lines[start_line - 1 : method_node.end_lineno])
+    if not method.endswith("\n") or source.count(method) != 1:
+        raise PatchError("input_item_parsing method boundary is not exact")
+    return method
+
+
 
 def _source_state(source: str, target: Path) -> str:
     alias_count = source.count(TYPE_ALIAS_GUARD)
@@ -291,20 +326,32 @@ def _source_state(source: str, target: Path) -> str:
     old_count = source.count(OLD_METHOD)
     new_count = source.count(NEW_METHOD)
     marker_count = source.count(MARKER)
+    codex_marker_count = source.count(CODEX_MARKER)
     if not alias_at < field_at:
         raise PatchError("outer Responses input-union guards are out of order")
 
     state = (old_count, new_count, marker_count)
-    if state == (1, 0, 0):
+    if state == (1, 0, 0) and codex_marker_count == 0:
         method_at = source.find(OLD_METHOD)
         result = "stock"
-    elif state == (0, 1, 1):
+    elif state == (0, 1, 1) and codex_marker_count == 0:
         method_at = source.find(NEW_METHOD)
         result = "applied"
+    elif state == (0, 0, 1) and codex_marker_count == 1:
+        method = _extract_method(source, target)
+        digest = hashlib.sha256(method.encode("utf-8")).hexdigest()
+        if digest != CODEX_COMBINED_METHOD_SHA256:
+            raise PatchError(
+                "combined issue138/Codex method source lock mismatch "
+                f"(sha256={digest})"
+            )
+        method_at = source.find(method)
+        result = "applied-with-codex"
     else:
         raise PatchError(
             "complete input_item_parsing source lock mismatch "
-            f"(old={old_count}, new={new_count}, marker={marker_count})"
+            f"(old={old_count}, new={new_count}, marker={marker_count}, "
+            f"codex_marker={codex_marker_count})"
         )
     if field_at >= method_at:
         raise PatchError("outer Responses input-union guards are out of order")
@@ -388,7 +435,7 @@ def apply(target: Path) -> int:
         print(f"[FAIL] {TAG} {error}", file=sys.stderr)
         return 1
 
-    if state == "applied":
+    if state in ("applied", "applied-with-codex"):
         print(f"[OK] {TAG} already applied and verified: {target}")
         return 0
 

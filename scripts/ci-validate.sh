@@ -56,6 +56,7 @@ py_files+=(
   scripts/verify-issue138-responses-history-live.py
   scripts/test-issue138-responses-history-hotfix.py
   scripts/test-issue138-responses-history-live.py
+  scripts/test-codex-agent-message-compat.py
   scripts/test-encoding-dsv4-issue21.py
   scripts/test-suppress-stops-in-reasoning.py
   scripts/test-assistant-final-continuation.py
@@ -63,6 +64,7 @@ py_files+=(
   scripts/test-spec-acceptance.py
   scripts/test-ruler-lite-pad.py
   scripts/test-env-normalisation.py
+  scripts/test-served-model-alias.py
   scripts/test-dspark-api-keys.py
   scripts/test-redact-api-key-log.py
   scripts/test-hotfix-atomic-transaction.py
@@ -96,6 +98,8 @@ python3 scripts/test-issue138-responses-history-hotfix.py -q
 ok "test-issue138-responses-history-hotfix"
 python3 scripts/test-issue138-responses-history-live.py -q
 ok "test-issue138-responses-history-live"
+python3 scripts/test-codex-agent-message-compat.py -q
+ok "test-codex-agent-message-compat"
 python3 scripts/test-encoding-dsv4-issue21.py -q
 ok "test-encoding-dsv4-issue21"
 python3 scripts/test-suppress-stops-in-reasoning.py -q
@@ -110,6 +114,8 @@ python3 scripts/test-numeric-knob-validation.py -q
 ok "test-numeric-knob-validation"
 python3 scripts/test-env-normalisation.py -q
 ok "test-env-normalisation"
+python3 scripts/test-served-model-alias.py -q
+ok "test-served-model-alias"
 python3 scripts/test-dspark-api-keys.py -q
 ok "test-dspark-api-keys"
 python3 scripts/test-redact-api-key-log.py -q
@@ -350,6 +356,22 @@ if grep -Fq 'hotfix-vllm-issue138-responses-history.py}:/opt/hotfix-vllm-issue13
 else
   bad "issue138 Responses history hotfix wiring is incomplete"
 fi
+# Codex agent_message replay: default OFF, exact-1/fail-closed, applied after
+# issue138, and propagated to both ranks.
+codex_agent_worker_env="DSPARK_CODEX_AGENT_MESSAGE_HOTFIX='./patches/hotfix-vllm-codex-agent-message.py'"
+codex_agent_worker_count="$(grep -Fc "$codex_agent_worker_env" start-deepseek-v4-flash-dspark.sh || true)"
+if grep -Fq 'hotfix-vllm-codex-agent-message.py}:/opt/hotfix-vllm-codex-agent-message.py:ro' docker-compose.dspark.yml \
+  && grep -Fq 'DSPARK_ENABLE_CODEX_AGENT_MESSAGE_COMPAT: "${DSPARK_ENABLE_CODEX_AGENT_MESSAGE_COMPAT:-0}"' docker-compose.dspark.yml \
+  && grep -Fq 'if [ "$${DSPARK_ENABLE_CODEX_AGENT_MESSAGE_COMPAT:-0}" = "1" ]; then python3 /opt/hotfix-vllm-codex-agent-message.py || exit 1; fi;' docker-compose.dspark.yml \
+  && grep -Fq '# Codex agent_message compatibility pre-flight (begin).' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'Codex agent_message compatibility: 0 (stock)' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'Codex agent_message compatibility: 1 (apply)' start-deepseek-v4-flash-dspark.sh \
+  && [ "$codex_agent_worker_count" -eq 4 ] \
+  && grep -Fq 'scp "$DSPARK_CODEX_AGENT_MESSAGE_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-codex-agent-message.py"' start-deepseek-v4-flash-dspark.sh; then
+  ok "Codex agent_message hotfix is default-off, exact-1 fail-closed, and propagated to worker1 and worker2"
+else
+  bad "Codex agent_message hotfix wiring is incomplete"
+fi
 if grep -q 'VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"' docker-compose.dspark.yml \
   && grep -q 'TILELANG_CACHE_DIR: "${TILELANG_CACHE_DIR:-/cache/huggingface/tilelang-cache}"' docker-compose.dspark.yml; then
   ok "compose JIT timeout 1800s + persistent TileLang cache (#65/#87)"
@@ -399,6 +421,7 @@ for p in \
   patches/hotfix-dsv4-suppress-stops-in-reasoning.py \
   patches/hotfix-dsv4-assistant-final-continuation.py \
   patches/hotfix-vllm-issue138-responses-history.py \
+  patches/hotfix-vllm-codex-agent-message.py \
   patches/hotfix-vllm-redact-api-key-log.sh
 do
   if [ -f "$p" ]; then
