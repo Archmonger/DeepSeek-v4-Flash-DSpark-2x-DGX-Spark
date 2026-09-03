@@ -600,16 +600,10 @@ VLLM_ENABLE_RESPONSES_API_STORE=1
 DSPARK_RESPONSES_STORE_MAX_ENTRIES=256
 ```
 
-Enabled starts source-check and apply the patch fail-closed on every rank.
-The cap covers terminal response/message/event bundles; active work can
-temporarily exceed it, and it is not a retained-byte limit. Retrieval and
-`previous_response_id` use refresh LRU recency. Stored state is process-local
-and is lost on any process restart. Recreate every rank when changing either
-value; a Docker restart preserves patched writable-layer bytes, not state.
-
-The store remains off by default. The verifier treats a continuation
-`response_id` 404 as an explicit store-configuration failure rather than
-silently accepting a stateless run.
+Enabled startup is fail-closed on every rank; the default remains off. See
+[Bounded Responses API store](docs/PATCHES.md#bounded-responses-api-store) for
+cap, LRU, failure, and restart semantics. The verifier treats a continuation
+404 as configuration failure, not a stateless pass.
 
 After the server is ready, run the dependency-free live verifier to check
 Responses text/SSE, stateful tool continuation, strict JSON schema, reasoning,

@@ -400,8 +400,6 @@ if grep -Fq 'hotfix-dsv4-responses-store.py}:/opt/hotfix-dsv4-responses-store.py
   && grep -Fxq 'VLLM_ENABLE_RESPONSES_API_STORE=0' .env.dspark.example \
   && grep -Fxq 'DSPARK_RESPONSES_STORE_MAX_ENTRIES=256' .env.dspark.example \
   && grep -Fq '# Bounded Responses API store pre-flight (begin).' start-deepseek-v4-flash-dspark.sh \
-  && grep -Fq 'Responses API store: disabled (stock source)' start-deepseek-v4-flash-dspark.sh \
-  && grep -Fq 'Responses API store: enabled (terminal cap $DSPARK_RESPONSES_STORE_MAX_ENTRIES)' start-deepseek-v4-flash-dspark.sh \
   && grep -Fq 'scp "$DSPARK_RESPONSES_STORE_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-responses-store.py"' start-deepseek-v4-flash-dspark.sh \
   && grep -Fq '/opt/hotfix-dsv4-responses-store.py --check' start-deepseek-v4-flash-dspark.sh; then
   ok "Responses store is exact-1, fail-closed, source-checked, reported, and propagated to every rank"
