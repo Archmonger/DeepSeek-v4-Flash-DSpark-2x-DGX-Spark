@@ -178,7 +178,7 @@ cluster wiring, not product switches. Full Anemll vs Stage-C matrix:
 | `DSPARK_REVISION` | `86f746b36186f0e567729a5c06a8c918caba82a9` | Official Vision-Exp pin. Empty = tip of `main`. |
 | `DSPARK_REVISION_ABLITERATED` | empty | Abliterated pin. Empty = tip of that repo. |
 | `DSPARK_MODEL_OFFICIAL` / `DSPARK_MODEL_ABLITERATED` | the two HF ids above | Override only if you intentionally swap the repo id. Do not point this at the 0731 ablit dump — that drops `image_url`. |
-| `SERVED_MODEL_NAME` | `deepseek-v4-flash-vision-exp` | Name clients send as `model`. |
+| `SERVED_MODEL_NAME` | `deepseek-v4-flash-vision-exp` | Space-separated aliases; clients may send any alias as `model`. Startup probes, warmup, and smoke use the first alias. |
 | `HF_HUB_OFFLINE` | `1` | `1` after the hub cache is warm. Prepare forces online for the download. |
 | `DSPARK_WORKER_HF_NFS` | `0` | **`0`** (default) = bind `WORKER_HF_CACHE` as a second copy (`prepare` downloads on the worker). **`1`** = worker mounts head `HF_CACHE` over NFSv4 on ConnectX (no local checkpoint). |
 
