@@ -353,5 +353,18 @@ if [ "${PREPARE_WORKER:-1}" = "1" ]; then
     scp "$SCRIPT_DIR/prepare-dspark-model-cache.sh" "${WORKER_HOST}:${WORKER_DIR}/prepare-dspark-model-cache.sh"
     scp "$ENV_FILE" "${WORKER_HOST}:${WORKER_DIR}/.env.dspark"
     ssh "$WORKER_HOST" "cd '$WORKER_DIR' && chmod +x ./prepare-dspark-model-cache.sh && env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS ENV_FILE='.env.dspark' THIS_NODE_HF_CACHE='$WORKER_HF_CACHE' PREPARE_WORKER=0 ABLITERATED='$ABLITERATED' DSPARK_REVISION='${DSPARK_REVISION:-}' DSPARK_REVISION_ABLITERATED='${DSPARK_REVISION_ABLITERATED:-}' ${WORKER_HF_TOKEN_ENV} ./prepare-dspark-model-cache.sh --yes"
+    if [ -n "${WORKER2_HOST:-}" ]; then
+      WORKER2_DIR="${WORKER2_SCRIPT_DIR:-${WORKER2_DIR:-$WORKER_DIR}}"
+      WORKER2_HF_CACHE="${WORKER2_HF_CACHE:-$WORKER_HF_CACHE}"
+      echo "prepare: also downloading onto worker2 $WORKER2_HOST → $WORKER2_HF_CACHE"
+      ssh -o BatchMode=yes -o ConnectTimeout=10 "$WORKER2_HOST" "docker image inspect '$DSPARK_VLLM_IMAGE' >/dev/null" || {
+        echo "Missing worker2 Docker image $DSPARK_VLLM_IMAGE." >&2
+        exit 1
+      }
+      ssh -o BatchMode=yes -o ConnectTimeout=10 "$WORKER2_HOST" "mkdir -p '$WORKER2_DIR' '$WORKER2_HF_CACHE'"
+      scp "$SCRIPT_DIR/prepare-dspark-model-cache.sh" "${WORKER2_HOST}:${WORKER2_DIR}/prepare-dspark-model-cache.sh"
+      scp "$ENV_FILE" "${WORKER2_HOST}:${WORKER2_DIR}/.env.dspark"
+      ssh "$WORKER2_HOST" "cd '$WORKER2_DIR' && chmod +x ./prepare-dspark-model-cache.sh && env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS ENV_FILE='.env.dspark' THIS_NODE_HF_CACHE='$WORKER2_HF_CACHE' PREPARE_WORKER=0 ABLITERATED='$ABLITERATED' DSPARK_REVISION='${DSPARK_REVISION:-}' DSPARK_REVISION_ABLITERATED='${DSPARK_REVISION_ABLITERATED:-}' ${WORKER_HF_TOKEN_ENV} ./prepare-dspark-model-cache.sh --yes"
+    fi
   fi
 fi
