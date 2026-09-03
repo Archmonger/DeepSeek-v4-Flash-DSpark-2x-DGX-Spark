@@ -139,7 +139,7 @@ hosts or it can kill vLLM under deep-context load.
 | Batch tokens | `MAX_NUM_BATCHED_TOKENS=8192` |
 | KV | `nvfp4_ds_mla`, **17.04 GiB / 2,331,430 tokens** on this cluster (util 0.83; Vision-Exp ViT takes more weight RAM than 0731) |
 | Spec | `MTP_NUM_TOKENS=6` (≥ `dspark_block_size` 5 and divisible by Vision-Exp `n_predict=3`) |
-| Thinking | `DEFAULT_THINKING=max` (`off` / `low` / `high` / `max`) |
+| Thinking | `DEFAULT_THINKING=low` (`off` / `low` / `high` / `max`) |
 | Graphs | `VLLM_USE_BREAKABLE_CUDAGRAPH=0` (keep this; unset is slower) |
 
 `start-*.sh` exports `GPU_MEMORY_UTILIZATION` from
@@ -256,7 +256,7 @@ DSPARK_REVISION=<commit>
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| **`DEFAULT_THINKING`** | `max` | `off` / `low` / `high` / `max`. Request-level `chat_template_kwargs` still wins. |
+| **`DEFAULT_THINKING`** | `low` | `off` / `low` / `high` / `max`. Request-level `chat_template_kwargs` still wins. |
 | `VLLM_HOST` | `0.0.0.0` | `127.0.0.1` for head-only tests. |
 | `VLLM_PORT` | `8888` | Or `./start-… --port 9000` for one launch. |
 
