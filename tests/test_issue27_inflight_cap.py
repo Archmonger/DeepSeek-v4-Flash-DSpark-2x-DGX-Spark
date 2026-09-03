@@ -23,9 +23,17 @@ class Request:
 class _Logger:
     def __init__(self):
         self.warnings = []
+        self.infos = []
 
-    def warning(self, message):
-        self.warnings.append(message)
+    @staticmethod
+    def _fmt(message, args):
+        return message % args if args else message
+
+    def warning(self, message, *args):
+        self.warnings.append(self._fmt(message, args))
+
+    def info(self, message, *args):
+        self.infos.append(self._fmt(message, args))
 
 
 logger = _Logger()
@@ -42,6 +50,7 @@ class Scheduler:
         self.num_waiting_for_streaming_input = 0
         self.running = []
         self.waiting = [object()]
+        self.current_step = 0
 
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
@@ -93,6 +102,19 @@ def _load_scheduler(raw: str | None, config_cap: int = 1):
     return scheduler, namespace["logger"], patched
 
 
+class _RunningReq:
+    """Fake running request exposing the pinned Request prefill counters."""
+
+    def __init__(self, num_computed_tokens, num_prompt_tokens):
+        self.num_computed_tokens = num_computed_tokens
+        self.num_prompt_tokens = num_prompt_tokens
+
+
+def _mid_prefill():
+    return _RunningReq(0, 1024)
+
+
+
 class Issue27InflightCapTest(unittest.TestCase):
     def test_valid_and_fallback_values_are_cached(self):
         cases = (
@@ -140,6 +162,25 @@ class Issue27InflightCapTest(unittest.TestCase):
         scheduler, _, _ = _load_scheduler("1")
         scheduler._inflight_prefills.add(object())
         self.assertEqual(scheduler.schedule(), 0)
+
+    def test_init_logs_resolved_cap_and_env_once(self):
+        scheduler, logger, _ = _load_scheduler("1")
+        expected = "[issue27-hotfix] in-flight prefill cap=1 env='1' sched=%x" % id(
+            scheduler
+        )
+        self.assertEqual(
+            [line for line in logger.infos if "in-flight prefill cap=" in line],
+            [expected],
+        )
+
+    def test_undercount_tripwire_is_bounded_at_sixteen(self):
+        scheduler, logger, _ = _load_scheduler("1")
+        scheduler.running.append(_mid_prefill())
+        for _ in range(17):
+            scheduler.waiting.append(object())
+            scheduler.schedule()
+        self.assertEqual(len(logger.warnings), 16)
+        self.assertIn("undercount: tracked=0 running=1", logger.warnings[0])
 
     def test_apply_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmpdir:
