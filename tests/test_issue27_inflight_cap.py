@@ -15,23 +15,26 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 HOTFIX = ROOT / "patches" / "hotfix-dsv4-issue27-partial-prefill-concurrency.py"
 ENV_NAME = "DSPARK_MAX_INFLIGHT_PREFILLS"
+DIAG_NAME = "DSPARK_ISSUE43_SCHED_DIAG"
 PATH_MARKER = 'Path("/usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py")'
+GATE_MARK = "# [issue27-hotfix] enforce max_num_partial_prefills on admission"
 R2_MARK = "# [issue27-r2]"
-# Pre-r2 revisions of the patcher: any application carrying MARK without the
-# r2 marker must be refused by the current patcher (fail-closed).
-PRE_R2_REVS = (
-    "89caf6877537144ce2a1161786e05f435853f1d1",
-    "c444d7032957f5a5437261d5366fd06b27a01760",
-)
+R3_MARK = "# [issue27-r3]"
+# Pre-r3 revisions of the patcher: any application carrying GATE_MARK without
+# the r3 marker must be refused by the current patcher (fail-closed).
+R2_REV = "403878af8844c53bd7a5db4be268e134b2172167"
+R_REV = "89caf6877537144ce2a1161786e05f435853f1d1"
+PRE_R_REV = "c444d7032957f5a5437261d5366fd06b27a01760"
 
 FIXTURE = """\
 class Request:
     def __init__(self, request_id, num_computed_tokens, num_tokens,
-                 num_output_placeholders=0):
+                 num_output_placeholders=0, num_prompt_tokens=None):
         self.request_id = request_id
         self.num_computed_tokens = num_computed_tokens
         self.num_tokens = num_tokens
-        self.num_prompt_tokens = num_tokens  # R-era gate compatibility
+        self.num_prompt_tokens = num_tokens if num_prompt_tokens is None \\
+            else num_prompt_tokens
         self.num_output_placeholders = num_output_placeholders
 
 
@@ -67,6 +70,8 @@ class Scheduler:
         self.waiting = [Request("w0", 0, 512)]
         self.current_step = 0
         self.step_scheduled = {}
+        self.step_new = []
+        self.step_resumed = []
 
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
@@ -77,6 +82,8 @@ class Scheduler:
         admitted = 0
         can_schedule_waiting = True
         num_scheduled_tokens = dict(self.step_scheduled)
+        scheduled_new_reqs = list(self.step_new)
+        scheduled_resumed_reqs = list(self.step_resumed)
         if can_schedule_waiting:
             while self.waiting and token_budget > 0:
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
@@ -89,6 +96,7 @@ class Scheduler:
                 )
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 self.running.append(request)
+                scheduled_new_reqs.append(request)
                 if (
                     request.num_computed_tokens + num_new_tokens
                     < request.num_tokens
@@ -122,7 +130,19 @@ def _status_of(path: Path) -> str:
     return buf.getvalue()
 
 
-def _load_scheduler(raw: str | None, config_cap: int = 1):
+def _git_patcher(ref: str) -> str | None:
+    try:
+        got = subprocess.run(
+            ["git", "-C", str(ROOT), "show",
+             f"{ref}:patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except subprocess.CalledProcessError:
+        return None
+    return got if GATE_MARK in got and R3_MARK not in got else None
+
+
+def _load_scheduler(raw: str | None, config_cap: int = 1, diag: bool = False):
     with tempfile.TemporaryDirectory() as tmpdir:
         path = Path(tmpdir) / "scheduler.py"
         path.write_text(FIXTURE)
@@ -136,6 +156,10 @@ def _load_scheduler(raw: str | None, config_cap: int = 1):
             os.environ.pop(ENV_NAME, None)
         else:
             os.environ[ENV_NAME] = raw
+        if diag:
+            os.environ[DIAG_NAME] = "1"
+        else:
+            os.environ.pop(DIAG_NAME, None)
         scheduler = namespace["Scheduler"](config_cap)
     return scheduler, namespace["logger"], patched
 
@@ -144,11 +168,12 @@ class _RunningReq:
     """Fake request exposing the pinned Request prefill counters."""
 
     def __init__(self, request_id, num_computed_tokens, num_tokens,
-                 num_output_placeholders=0):
+                 num_output_placeholders=0, num_prompt_tokens=None):
         self.request_id = request_id
         self.num_computed_tokens = num_computed_tokens
         self.num_tokens = num_tokens
-        self.num_prompt_tokens = num_tokens  # R-era gate compatibility
+        self.num_prompt_tokens = num_tokens if num_prompt_tokens is None \
+            else num_prompt_tokens
         self.num_output_placeholders = num_output_placeholders
 
 
@@ -266,27 +291,22 @@ class Issue27InflightCapTest(unittest.TestCase):
 
     def test_t6_single_chunk_same_step_not_counted(self):
         scheduler, logger, _ = _load_scheduler("1")
-        scheduler.running.append(_RunningReq("a", 0, 100))
+        just_admitted = _RunningReq("a", 0, 100)
+        scheduler.running.append(just_admitted)
+        scheduler.step_new = [just_admitted]
         scheduler.step_scheduled = {"a": 100}
         self.assertEqual(scheduler.schedule(), 1)
         self.assertEqual(logger.warnings, [])
 
-    def test_t7_last_chunk_this_step_releases_slot(self):
+    def test_t7_last_chunk_this_step_still_blocks_parity(self):
+        # Flipped at R3: exact set parity — the request stays counted until the
+        # end of its last-chunk step (set discard happens after the loop).
         scheduler, logger, _ = _load_scheduler("1")
         last = _RunningReq("a", 21805, 22829)
         scheduler.running.append(last)
         scheduler.step_scheduled = {"a": 1024}
         scheduler._inflight_prefills.add(last)
-        self.assertEqual(scheduler.schedule(), 1)
-        self.assertEqual(logger.warnings, [])
-
-    def test_t8_decoder_never_counted(self):
-        scheduler, logger, _ = _load_scheduler("1")
-        scheduler.running.append(
-            _RunningReq("d", 1007, 1000, num_output_placeholders=7)
-        )
-        scheduler.step_scheduled = {"d": 7}
-        self.assertEqual(scheduler.schedule(), 1)
+        self.assertEqual(scheduler.schedule(), 0)
         self.assertEqual(logger.warnings, [])
 
     def test_t9_mid_prefill_skipped_this_step_blocks_and_warns(self):
@@ -299,10 +319,12 @@ class Issue27InflightCapTest(unittest.TestCase):
 
     def test_t10_mixed_burst_cap_two(self):
         scheduler, logger, _ = _load_scheduler("2")
-        scheduler.running.append(_RunningReq("a", 0, 100))
-        scheduler.running.append(_RunningReq("b", 0, 22829))
+        short = _RunningReq("a", 0, 100)
+        long = _RunningReq("b", 0, 22829)
+        scheduler.running.extend([short, long])
+        scheduler.step_new = [short, long]
         scheduler.step_scheduled = {"a": 100, "b": 1024}
-        scheduler._inflight_prefills.add(scheduler.running[1])
+        scheduler._inflight_prefills.add(long)
         scheduler.waiting = [_RunningReq("x", 0, 5000), _RunningReq("y", 0, 5000)]
         self.assertEqual(scheduler.schedule(), 1)
         self.assertEqual(logger.warnings, [])
@@ -315,52 +337,130 @@ class Issue27InflightCapTest(unittest.TestCase):
         self.assertEqual(len(logger.warnings), 1)
 
         scheduler, logger, _ = _load_scheduler("1")
-        scheduler.running.append(_RunningReq("a", 0, 100))
+        just_admitted = _RunningReq("a", 0, 100)
+        scheduler.running.append(just_admitted)
+        scheduler.step_new = [just_admitted]
         scheduler.step_scheduled = {"a": 100}
         scheduler.schedule()
         self.assertEqual(logger.warnings, [])
 
-    def test_t12_refuses_pre_r2_gate_and_status_labels(self):
-        stale_text = None
-        for ref in PRE_R2_REVS:
-            try:
-                got = subprocess.run(
-                    ["git", "-C", str(ROOT), "show",
-                     f"{ref}:patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py"],
-                    capture_output=True, text=True, check=True,
-                ).stdout
-            except subprocess.CalledProcessError:
-                continue
-            if R2_MARK not in got and "issue27-hotfix" in got:
-                stale_text = got
-                break
+    def test_t13_unscheduled_decoder_not_counted(self):
+        # boot-6 step 298: decoder hit the max-tokens skip, stayed in running
+        # with no scheduled tokens this step.
+        scheduler, logger, _ = _load_scheduler("1")
+        mid = _RunningReq("a", 1024, 22829)
+        scheduler.running.extend([mid, _RunningReq("d", 356, 350,
+                                                   num_output_placeholders=7)])
+        scheduler.step_scheduled = {"a": 1024}
+        scheduler._inflight_prefills.add(mid)
+        self.assertEqual(scheduler.schedule(), 0)
+        self.assertEqual(logger.warnings, [])
 
+    def test_t14_drained_decoder_alone_does_not_block(self):
+        scheduler, logger, _ = _load_scheduler("1")
+        scheduler.running.append(_RunningReq("d", 349, 350,
+                                             num_prompt_tokens=300))
+        scheduler.step_scheduled = {}
+        self.assertEqual(scheduler.schedule(), 1)
+        self.assertEqual(logger.warnings, [])
+
+    def test_t15_last_chunk_parity_with_set(self):
+        scheduler, logger, _ = _load_scheduler("1")
+        last = _RunningReq("a", 21805, 22829)
+        scheduler.running.append(last)
+        scheduler.step_scheduled = {"a": 1024}
+        scheduler._inflight_prefills.add(last)
+        self.assertEqual(scheduler.schedule(), 0)
+        self.assertEqual(logger.warnings, [])
+
+    def test_t16_single_chunk_same_step_positional(self):
+        scheduler, logger, _ = _load_scheduler("1")
+        decoder = _RunningReq("d", 356, 350, num_output_placeholders=7)
+        just_admitted = _RunningReq("n", 0, 100)
+        scheduler.running.extend([decoder, just_admitted])
+        scheduler.step_new = [just_admitted]
+        scheduler.step_scheduled = {"d": 7, "n": 100}
+        self.assertEqual(scheduler.schedule(), 1)
+        self.assertEqual(logger.warnings, [])
+
+    def test_t17_multichunk_admitted_this_step_blocks_next(self):
+        scheduler, logger, _ = _load_scheduler("1")
+        just_admitted = _RunningReq("n", 0, 22829)
+        scheduler.running.append(just_admitted)
+        scheduler.step_new = [just_admitted]
+        scheduler.step_scheduled = {"n": 1024}
+        scheduler._inflight_prefills.add(just_admitted)
+        self.assertEqual(scheduler.schedule(), 0)
+        self.assertEqual(logger.warnings, [])
+
+    def test_t18_set_loss_on_earlier_step_prefill(self):
+        scheduler, logger, _ = _load_scheduler("1")
+        scheduler.running.append(_RunningReq("a", 1024, 22829))
+        scheduler.step_scheduled = {}
+        self.assertEqual(scheduler.schedule(), 0)
+        self.assertEqual(len(logger.warnings), 1)
+        self.assertIn("undercount: tracked=0 running=1", logger.warnings[0])
+
+    def test_t19_tripwire_silent_at_last_chunk_step(self):
+        scheduler, logger, _ = _load_scheduler("1", diag=True)
+        last = _RunningReq("a", 21805, 22829)
+        scheduler.running.append(last)
+        scheduler.step_scheduled = {"a": 1024}
+        scheduler._inflight_prefills.add(last)
+        self.assertEqual(scheduler.schedule(), 0)
+        adm = [line for line in logger.infos if line.startswith("[issue27-adm]")]
+        self.assertEqual(len(adm), 1)
+        self.assertIn("tracked=1 running=1", adm[0])
+        self.assertEqual(logger.warnings, [])
+
+    def test_t20_resumed_request_suffix_branch(self):
+        scheduler, logger, _ = _load_scheduler("1")
+        resumed = _RunningReq("p", 0, 300, num_prompt_tokens=100)
+        scheduler.running.append(resumed)
+        scheduler.step_resumed = [resumed]
+        scheduler.step_scheduled = {"p": 100}
+        scheduler._inflight_prefills.add(resumed)
+        self.assertEqual(scheduler.schedule(), 0)
+        self.assertEqual(logger.warnings, [])
+
+    def test_t21_marker_migration_refusal_and_status(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "scheduler.py"
+
+            # r2-era stale gate: real R2 patcher if reachable, else synthetic.
             path.write_text(FIXTURE)
-            self.assertIn("NOT APPLIED", _status_of(path))
-
-            if stale_text is not None:
-                _apply_to(path, stale_text)
+            r2_text = _git_patcher(R2_REV)
+            if r2_text is not None:
+                _apply_to(path, r2_text)
             else:
-                # No pre-r2 patcher reachable in history: synthesize the
-                # stale state (gate marker present, no r2 marker).
-                path.write_text(
-                    FIXTURE + "\n# [issue27-hotfix] enforce "
-                    "max_num_partial_prefills on admission\n"
-                )
-            self.assertIn("APPLIED (pre-r2, stale)", _status_of(path))
+                path.write_text(FIXTURE + f"\n{GATE_MARK}\n{R2_MARK}\n")
+            self.assertIn("APPLIED (r2, stale)", _status_of(path))
             stale_bytes = path.read_bytes()
-
             with self.assertRaises(SystemExit) as ctx:
                 _apply_to(path)
             self.assertEqual(ctx.exception.code, 1)
             self.assertEqual(path.read_bytes(), stale_bytes)
 
+            # pre-r2 stale gate (R or pre-R patcher), else synthetic.
             path.write_text(FIXTURE)
+            old_text = _git_patcher(R_REV) or _git_patcher(PRE_R_REV)
+            if old_text is not None:
+                _apply_to(path, old_text)
+            else:
+                path.write_text(FIXTURE + f"\n{GATE_MARK}\n")
+            self.assertIn("APPLIED (pre-r2, stale)", _status_of(path))
+            stale_bytes = path.read_bytes()
+            with self.assertRaises(SystemExit) as ctx:
+                _apply_to(path)
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertEqual(path.read_bytes(), stale_bytes)
+
+            # clean fixture: NOT APPLIED -> apply -> APPLIED (r3), idempotent.
+            path.write_text(FIXTURE)
+            self.assertIn("NOT APPLIED", _status_of(path))
             _apply_to(path)
             first = path.read_bytes()
-            self.assertIn("APPLIED (r2)", _status_of(path))
+            self.assertIn("APPLIED (r3)", _status_of(path))
             _apply_to(path)
             self.assertEqual(path.read_bytes(), first)
 
