@@ -72,6 +72,8 @@ services:
       - ${DSPARK_SP_INDEXER_HOTFIX:-./patches/hotfix-dsv4-sp-indexer-prefill.py}:/opt/hotfix-dsv4-sp-indexer-prefill.py:ro
       # Issue #136: exact vLLM #52805 XGrammar termination backport (opt-in).
       - ${DSPARK_ISSUE136_XGRAMMAR_HOTFIX:-./patches/hotfix-vllm-issue136-xgrammar-termination.py}:/opt/hotfix-vllm-issue136-xgrammar-termination.py:ro
+      # Issue #191: fail-closed named/required tool_choice contract (opt-in).
+      - ${DSPARK_ISSUE191_TOOLCALL_HOTFIX:-./patches/hotfix-vllm-issue191-toolcall-failclosed.py}:/opt/hotfix-vllm-issue191-toolcall-failclosed.py:ro
       # Client stop strings stay dormant until </think> (Tony/Capicua25x Patch 5).
       - ${DSPARK_SUPPRESS_STOPS_HOTFIX:-./patches/hotfix-dsv4-suppress-stops-in-reasoning.py}:/opt/hotfix-dsv4-suppress-stops-in-reasoning.py:ro
       # A request ending with an assistant message must still get a generation
@@ -309,6 +311,19 @@ services:
       # Issue #136: vLLM #52805 XGrammar termination fix. Exact 1 applies
       # source-exact bytes at boot; default 0 leaves the image untouched.
       DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX: "${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}"
+      # Issue #191: fail-closed named/required tool_choice contract on the
+      # non-streaming Chat path. Exact 1 applies the serving-layer check plus
+      # bounded regeneration (RETRIES, MODE=failclosed|log); default 0 is stock.
+      DSPARK_ENABLE_ISSUE191_TOOLCALL_FAILCLOSED: "${DSPARK_ENABLE_ISSUE191_TOOLCALL_FAILCLOSED:-0}"
+      DSPARK_ISSUE191_TOOLCALL_RETRIES: "${DSPARK_ISSUE191_TOOLCALL_RETRIES:-2}"
+      DSPARK_ISSUE191_TOOLCALL_MODE: "${DSPARK_ISSUE191_TOOLCALL_MODE:-failclosed}"
+      # 1 (default): the last failclosed retry regenerates with thinking off
+      # (prompt <think> -> </think>), so reasoning that outran max_tokens still
+      # yields a grammar-constrained call. 0 keeps every retry identical.
+      DSPARK_ISSUE191_TOOLCALL_THINKOFF_FALLBACK: "${DSPARK_ISSUE191_TOOLCALL_THINKOFF_FALLBACK:-1}"
+      # Issue #191 A/B: 1 (default) keeps --async-scheduling; 0 removes it on
+      # both ranks (engine args must match across the TP pair).
+      DSPARK_ASYNC_SCHEDULING: "${DSPARK_ASYNC_SCHEDULING:-1}"
       # Issue #66: GPU V2 thinking_token_budget hotfix. 0 (default) = stock
       # sampler (HTTP 400 if a client sends the field). 1 = apply at boot
       # (fail-closed) so explicit thinking_token_budget works. Omit-field
@@ -366,6 +381,8 @@ services:
         python3 /opt/hotfix-dsv4-vision-exp.py || exit 1; if [ "$${DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py || exit 1; fi; if [ "$${DSPARK_ENABLE_SP_INDEXER:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-sp-indexer-prefill.py || exit 1; fi; if [ "$${DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS:-0}" = "1" ]; then bash /opt/dspark-patches/hotfix-deepgemm-sm121-mqa-header-alias.sh || exit 1; fi; python3 /opt/hotfix-vllm-empty-encoder-output.py || exit 1; python3 /opt/hotfix-dsv4-issue27-partial-prefill-concurrency.py || exit 1; if [ "$${DSPARK_ENABLE_ADAPTIVE_CHUNK:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-adaptive-prefill-chunk.py || exit 1; fi; if [ "$${DSPARK_ENABLE_REPLICATE_MARKOV:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-replicate-markov-head.py || exit 1; fi; python3 /opt/hotfix-dsv4-issue43-decode-fairness-and-diag.py || exit 1; python3 /opt/hotfix-dsv4-issue26-hybrid-swa-min.py || exit 1; python3 /opt/hotfix-dsv4-issue133-triton-specialization.py || exit 1; if [ "$${DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX:-0}" != "1" ]; then python3 /opt/hotfix-dsv4-suppress-stops-in-reasoning.py || exit 1; fi; VLLM_QUANTIZATION_ARGS="";
         if [ "$${DSPARK_ENABLE_ASSISTANT_FINAL_HOTFIX:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-assistant-final-continuation.py || exit 1; fi;
         if [ "$${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}" = "1" ]; then python3 /opt/hotfix-vllm-issue136-xgrammar-termination.py || exit 1; fi;
+        if [ "$${DSPARK_ENABLE_ISSUE191_TOOLCALL_FAILCLOSED:-0}" = "1" ]; then python3 /opt/hotfix-vllm-issue191-toolcall-failclosed.py || exit 1; fi;
+        case "$${DSPARK_ASYNC_SCHEDULING:-1}" in 1) ASYNC_SCHEDULING_ARGS="--async-scheduling" ;; 0) ASYNC_SCHEDULING_ARGS="" ;; *) echo "DSPARK_ASYNC_SCHEDULING must be 0 or 1 (got $${DSPARK_ASYNC_SCHEDULING})" >&2; exit 1 ;; esac;
         if [ "$${ENABLE_VLLM_GB10_PATCH:-0}" = "1" ]; then
           python3 -m pip install -e /opt/vllm-gb10-hybrid-nvfp4 --no-deps;
           export VLLM_PLUGINS="$${VLLM_PLUGINS:-gb10_hybrid_nvfp4}";
@@ -410,7 +427,7 @@ services:
         --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.80}
         --enable-prefix-caching
         --enable-prompt-tokens-details
-        --async-scheduling
+        $${ASYNC_SCHEDULING_ARGS}
         --enable-chunked-prefill
         --speculative-config "$${SPECULATIVE_CONFIG}"
         --tokenizer-mode deepseek_v4

@@ -345,6 +345,16 @@ if [ "${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}" = "1" ] && { [ ! -f "$DSPARK
   exit 1
 fi
 export DSPARK_ISSUE136_XGRAMMAR_HOTFIX DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX
+DSPARK_ISSUE191_TOOLCALL_HOTFIX="${DSPARK_ISSUE191_TOOLCALL_HOTFIX:-$SCRIPT_DIR/patches/hotfix-vllm-issue191-toolcall-failclosed.py}"
+if [ "${DSPARK_ENABLE_ISSUE191_TOOLCALL_FAILCLOSED:-0}" = "1" ] && { [ ! -f "$DSPARK_ISSUE191_TOOLCALL_HOTFIX" ] || [ -L "$DSPARK_ISSUE191_TOOLCALL_HOTFIX" ]; }; then
+  echo "Issue #191 tool-call fail-closed hotfix is enabled but its local patcher is missing or not a regular file: $DSPARK_ISSUE191_TOOLCALL_HOTFIX" >&2
+  exit 1
+fi
+case "${DSPARK_ASYNC_SCHEDULING:-1}" in
+  0|1) ;;
+  *) echo "DSPARK_ASYNC_SCHEDULING must be 0 or 1 (got '${DSPARK_ASYNC_SCHEDULING:-}')" >&2; exit 1 ;;
+esac
+export DSPARK_ISSUE191_TOOLCALL_HOTFIX DSPARK_ENABLE_ISSUE191_TOOLCALL_FAILCLOSED DSPARK_ISSUE191_TOOLCALL_RETRIES DSPARK_ISSUE191_TOOLCALL_MODE DSPARK_ISSUE191_TOOLCALL_THINKOFF_FALLBACK DSPARK_ASYNC_SCHEDULING
 
 : "${WORKER_HOST:?WORKER_HOST must be set in $ENV_FILE}"
 : "${MASTER_ADDR:?MASTER_ADDR must be set in $ENV_FILE}"
@@ -426,6 +436,11 @@ REMOTE_COMPOSE_FILE="$REMOTE_WORKER_DIR/docker-compose.dspark.yml"
 REMOTE_ENV_FILE="$REMOTE_WORKER_DIR/.env.dspark"
 REMOTE_VLLM_GB10_PATCH_DIR="$REMOTE_WORKER_DIR/vllm_patch_gb10"
 REMOTE_ISSUE136_ENABLE="$(printf '%q' "${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}")"
+REMOTE_ISSUE191_ENABLE="$(printf '%q' "${DSPARK_ENABLE_ISSUE191_TOOLCALL_FAILCLOSED:-0}")"
+REMOTE_ISSUE191_RETRIES="$(printf '%q' "${DSPARK_ISSUE191_TOOLCALL_RETRIES:-2}")"
+REMOTE_ISSUE191_MODE="$(printf '%q' "${DSPARK_ISSUE191_TOOLCALL_MODE:-failclosed}")"
+REMOTE_ISSUE191_THINKOFF="$(printf '%q' "${DSPARK_ISSUE191_TOOLCALL_THINKOFF_FALLBACK:-1}")"
+REMOTE_ASYNC_SCHEDULING="$(printf '%q' "${DSPARK_ASYNC_SCHEDULING:-1}")"
 REMOTE_COMPOSE="cd $REMOTE_WORKER_DIR && env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS COMPOSE_DISABLE_ENV_FILE=1"
 STARTUP_LOG_SINCE=""
 
@@ -914,11 +929,11 @@ remote_nccl_env2() {
 remote_compose() {
   # The head may use an absolute local mount override; the worker always uses
   # the canonical synced relative path.
-  ssh "$WORKER_HOST" "$REMOTE_COMPOSE DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX=$REMOTE_ISSUE136_ENABLE DSPARK_ISSUE136_XGRAMMAR_HOTFIX='./patches/hotfix-vllm-issue136-xgrammar-termination.py' TP_SIZE='$TP_SIZE' NNODES='$NNODES' TP3_PATCH_DIR='./patches/tp3' $(remote_nccl_env) $*"
+  ssh "$WORKER_HOST" "$REMOTE_COMPOSE DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX=$REMOTE_ISSUE136_ENABLE DSPARK_ISSUE136_XGRAMMAR_HOTFIX='./patches/hotfix-vllm-issue136-xgrammar-termination.py' DSPARK_ENABLE_ISSUE191_TOOLCALL_FAILCLOSED=$REMOTE_ISSUE191_ENABLE DSPARK_ISSUE191_TOOLCALL_HOTFIX='./patches/hotfix-vllm-issue191-toolcall-failclosed.py' DSPARK_ISSUE191_TOOLCALL_RETRIES=$REMOTE_ISSUE191_RETRIES DSPARK_ISSUE191_TOOLCALL_MODE=$REMOTE_ISSUE191_MODE DSPARK_ISSUE191_TOOLCALL_THINKOFF_FALLBACK=$REMOTE_ISSUE191_THINKOFF DSPARK_ASYNC_SCHEDULING=$REMOTE_ASYNC_SCHEDULING TP_SIZE='$TP_SIZE' NNODES='$NNODES' TP3_PATCH_DIR='./patches/tp3' $(remote_nccl_env) $*"
 }
 
 remote_compose2() {
-  ssh "$WORKER2_HOST" "$REMOTE_COMPOSE2 DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX=$REMOTE_ISSUE136_ENABLE DSPARK_ISSUE136_XGRAMMAR_HOTFIX='./patches/hotfix-vllm-issue136-xgrammar-termination.py' TP_SIZE='$TP_SIZE' NNODES='$NNODES' TP3_PATCH_DIR='./patches/tp3' $(remote_nccl_env2) $*"
+  ssh "$WORKER2_HOST" "$REMOTE_COMPOSE2 DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX=$REMOTE_ISSUE136_ENABLE DSPARK_ISSUE136_XGRAMMAR_HOTFIX='./patches/hotfix-vllm-issue136-xgrammar-termination.py' DSPARK_ENABLE_ISSUE191_TOOLCALL_FAILCLOSED=$REMOTE_ISSUE191_ENABLE DSPARK_ISSUE191_TOOLCALL_HOTFIX='./patches/hotfix-vllm-issue191-toolcall-failclosed.py' DSPARK_ISSUE191_TOOLCALL_RETRIES=$REMOTE_ISSUE191_RETRIES DSPARK_ISSUE191_TOOLCALL_MODE=$REMOTE_ISSUE191_MODE DSPARK_ISSUE191_TOOLCALL_THINKOFF_FALLBACK=$REMOTE_ISSUE191_THINKOFF DSPARK_ASYNC_SCHEDULING=$REMOTE_ASYNC_SCHEDULING TP_SIZE='$TP_SIZE' NNODES='$NNODES' TP3_PATCH_DIR='./patches/tp3' $(remote_nccl_env2) $*"
 }
 
 log_since() {
@@ -992,6 +1007,8 @@ print_resolved_profile() {
   echo "  max batched tokens: ${MAX_NUM_BATCHED_TOKENS:-8192}"
   echo "  gpu memory utilization: ${GPU_MEMORY_UTILIZATION:-0.835} (from GPU_MEMORY_UTILIZATION_TEXT=${GPU_MEMORY_UTILIZATION_TEXT:-0.835})"
   echo "  mtp speculative tokens: ${MTP_NUM_TOKENS:-6} (Vision-Exp: >=5 and divisible by 3)"
+  echo "  issue191 tool-call fail-closed hotfix: ${DSPARK_ENABLE_ISSUE191_TOOLCALL_FAILCLOSED:-0} (0=stock / 1=preflight+apply; mode=${DSPARK_ISSUE191_TOOLCALL_MODE:-failclosed} retries=${DSPARK_ISSUE191_TOOLCALL_RETRIES:-2} thinkoff-fallback=${DSPARK_ISSUE191_TOOLCALL_THINKOFF_FALLBACK:-1})"
+  echo "  async scheduling: ${DSPARK_ASYNC_SCHEDULING:-1} (1=--async-scheduling / 0=removed on both ranks)"
   echo "  default thinking: $DEFAULT_THINKING (off/low/high/max)"
   echo "  issue31 GPU thinking_token_budget hotfix: ${DSPARK_ENABLE_ISSUE31_GPU_HOTFIX:-0} (0=stock V2 / 1=apply)"
   if [ "$DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT" = "1" ]; then
@@ -1377,6 +1394,11 @@ if [ -f "$DSPARK_ISSUE136_XGRAMMAR_HOTFIX" ] && [ ! -L "$DSPARK_ISSUE136_XGRAMMA
   ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
   scp "$DSPARK_ISSUE136_XGRAMMAR_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-issue136-xgrammar-termination.py"
 fi
+if [ -f "$DSPARK_ISSUE191_TOOLCALL_HOTFIX" ] && [ ! -L "$DSPARK_ISSUE191_TOOLCALL_HOTFIX" ]; then
+  echo "Syncing Issue #191 tool-call fail-closed hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_ISSUE191_TOOLCALL_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-issue191-toolcall-failclosed.py"
+fi
 # Compose always bind-mounts patches/tp3. Create it on the worker even for
 # TP=2 so Docker does not invent a root-owned empty dir (or fail the mount).
 ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches/tp3'"
@@ -1530,6 +1552,17 @@ if [ "${DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX:-0}" = "1" ]; then
   fi
   echo "Checking Issue #136 XGrammar compatibility on the head before either rank starts..."
   compose_base 0 "" run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-issue136-xgrammar-termination.py --check
+fi
+
+if [ "${DSPARK_ENABLE_ISSUE191_TOOLCALL_FAILCLOSED:-0}" = "1" ]; then
+  echo "Checking Issue #191 tool-call fail-closed compatibility on the worker before either rank starts..."
+  remote_compose "NODE_RANK=1 HEADLESS=1 $WORKER_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER_COMPOSE_FILES run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-issue191-toolcall-failclosed.py --check"
+  if [ "$DSPARK_TP3" = "1" ]; then
+    echo "Checking Issue #191 tool-call fail-closed compatibility on worker2 before ranks start..."
+    remote_compose2 "NODE_RANK=2 HEADLESS=1 $WORKER2_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER2_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER2_COMPOSE_FILES run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-issue191-toolcall-failclosed.py --check"
+  fi
+  echo "Checking Issue #191 tool-call fail-closed compatibility on the head before either rank starts..."
+  compose_base 0 "" run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-issue191-toolcall-failclosed.py --check
 fi
 
 echo "Starting DSpark worker on ${WORKER_HOST}..."
