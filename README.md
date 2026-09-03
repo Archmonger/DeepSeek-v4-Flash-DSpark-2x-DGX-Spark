@@ -100,6 +100,8 @@ Qwen3.8-Flash-vLLM).
    One-shot bind override: `./start-deepseek-v4-flash-dspark.sh --host 0.0.0.0 --port 9000`.
    After a reboot, dockerd may already have restored the ranks (`restart: unless-stopped`); start then exits **3** (already running), not 1. That is expected — do not `./stop` unless you want a cold start. systemd: `SuccessExitStatus=3`.
 
+   Optional **three Sparks (TP=3)** is a separate launcher so `.env` cannot flip the 2-node path: `./start-tp3.sh` (needs `WORKER2_HOST`; see [Optional: three Sparks (TP=3)](#optional-three-sparks-tp3) and [docs/TP3.md](docs/TP3.md)).
+
 6. **Check it is up**
 
    ```bash
@@ -271,10 +273,11 @@ generous `max_tokens` or that budget hotfix, or thinking won't end. See
 | `MAX_MODEL_LEN` | `1048576` | Per-request ceiling (1M). `200000` is the high-concurrency / Keys profile. |
 | `MAX_NUM_SEQS` | `6` | Concurrent slots. `16` only with the 200K + Stage-C path. |
 | `MAX_NUM_BATCHED_TOKENS` | `8192` | Prefill tokens per step. `16384` for big-prompt coding. |
-| `LONG_PREFILL_TOKEN_THRESHOLD` | `1024` | Issue **#27** chunk cap. `0` lets one prefill eat the whole batch (decode starves). |
+| `LONG_PREFILL_TOKEN_THRESHOLD` | `1024` | Issue **#27** chunk cap. `0` lets one prefill eat the whole batch (decode starves). `2048` costs ~1.5 GB of head-node host RAM on GB10 (measured 2026-09-02), keep 1024. |
+| `DSPARK_MAX_INFLIGHT_PREFILLS` | `2` | Issue **#27** in-flight partial prefills (1–3). `2` since the 2026-09-02 A/B ([docs/CLAUDE/ab-results-2026-09-03.md](docs/CLAUDE/ab-results-2026-09-03.md)): a 4 × 8K wave sees first-token spread 9.1 s vs 14.6 s and +12 % aggregate, single-stream and c=6 decode unchanged. `1` restores the strictly serialized default. |
 | `GPU_MEMORY_UTILIZATION_TEXT` | `0.835` | Main GPU util / KV pool size. Larger = bigger KV pool. |
 | `LIMIT_MM_PER_PROMPT` | `{"image":8}` | Max images per request (Vision-Exp native `image_url`). `image=8` is converted to JSON for Anemll argparse. No video. |
-| `MTP_NUM_TOKENS` | `6` | DSpark draft depth. Vision-Exp `n_predict=3` so k must be ≥ 5 and divisible by 3. Capture size = `seqs * (k+1)`. |
+| `MTP_NUM_TOKENS` | `6` | DSpark draft depth. Vision-Exp `n_predict=3` so k must be ≥ 5 and divisible by 3. Capture size = `seqs * (k+1)` padded up to a multiple of 8 (48 at 6×6). |
 | `VLLM_USE_BREAKABLE_CUDAGRAPH` | `0` | **Keep 0.** Unset enables Anemll’s slower breakable graphs. |
 | `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` | `4096` | Issue **#26** SWA prefix-cache spacing. Leave unless you are debugging warm-cache hits. |
 
@@ -289,6 +292,8 @@ generous `max_tokens` or that budget hotfix, or thinking won't end. See
 | `DSPARK_SKIP_SPIN_WAIT_HOTFIX` | `0` | `1` = leave vLLM shm `busy_loop_s=1s` (issue **#79** P-core spin on TP=2). |
 | `DSPARK_ISSUE43_SCHED_DIAG` | `0` | `1` = one scheduler line per step in the vLLM log (mixed prefill/decode). |
 | `DSPARK_ENABLE_ISSUE31_GPU_HOTFIX` | `0` | `1` = apply GPU `thinking_token_budget` at boot (fail-closed). Default stock V2; omit-field clients do not need this ([Issue #66](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/66)). |
+| `DSPARK_ENABLE_SP_INDEXER` | `0` | `1` = sequence-parallel Lightning indexer for prefill chunks ≥ `DSPARK_SP_INDEXER_MIN_KEYS` (8192) compressed keys: each TP rank scores half the keys, exact top-k merge. Long-context TTFT lever ([docs/PATCHES.md](docs/PATCHES.md)). |
+| `DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS` | `0` | `1` = alias DeepGEMM `sm121_*` indexer-logits headers to the shipped `sm120_*` so a cold JIT cache can compile on GB10. |
 | `ENABLE_VLLM_GB10_PATCH` | `0` | `1` = experimental hybrid NVFP4 plugin (`--quantization modelopt_gb10_hybrid`). |
 
 Issue **#21 / #26 / #27 / #43** Python hotfixes always run at container start
@@ -319,11 +324,19 @@ On the **default Anemll 1M/6** stack:
 | --- | --- |
 | One chat, any prompt length through 128K | ~62–83 decode tok/s after first token |
 | **Six short chats** (hundreds of tokens), 1M still *allowed* | **~160–190 tok/s aggregate** (~30–37 per stream) |
-| Six **cold 32K–128K** prompts at once | Prefills **queue** (issue #27). ~8 tok/s decode floor; 128K × 6 TTFT minutes |
+| Six **cold 32K–128K** prompts at once | Prefills are chunked (issue #27), **two in flight** (`DSPARK_MAX_INFLIGHT_PREFILLS=2`), the rest queue. A 4 × 8K wave gets its first tokens at 7.4 / 9.0 / 15.7 / 16.5 s (was 4.7 / 9.4 / 14.3 / 19.3 s at `1`). ~8 tok/s decode floor while prefills run; 128K × 6 TTFT minutes |
+
+| **Three Sparks (TP=3, `./start-tp3.sh`, 16 slots)** | Decode ≈ +4–13 % per stream and **≈ 200 tok/s aggregate at 16 streams**; prefill 4–13 % slower to 64K and ≈ 22 % slower at 128K–256K (5.0 / 18.6 / 91 / 202 s TTFT at 8K / 32K / 128K / 256K vs 4.4 / 18.0 / 75 / 165 s on two nodes). See [Optional: three Sparks (TP=3)](#optional-three-sparks-tp3). |
 
 That ~170–190 c=6 number is **six streams generating**, not six huge prefills.
 Live 2026-08-14 on this cluster: 256 × c=6 = **162** agg; 128K × c=1 still
 **75 tok/s** / **80 s** TTFT.
+
+Live 2026-09-02, same lane, sp-indexer on, capture 48, inflight 2
+([docs/CLAUDE/ab-results-2026-09-03.md](docs/CLAUDE/ab-results-2026-09-03.md)): 256 × c=1 = **56** tok/s
+(8-trial median, 51–67), 256 × c=6 = **139** agg, 128K × c=1 TTFT **78.5 s**.
+Decode is 15–25 % under the 14 Aug figures above and no `.env.dspark` knob
+accounts for it; treat the 14 Aug numbers as the best seen, not the norm.
 
 **315 / 205 tok/s** (200K context, 16 slots) needs the **Stage-C + Keys**
 path. The ~182 1M/6 microbench was also measured with that Keys mask; the
@@ -488,6 +501,53 @@ to fp8 or a smaller model to hide it.
 
 ---
 
+## Optional: three Sparks (TP=3)
+
+The default lane stays two nodes. A third DGX Spark is opt-in through its own
+launcher, so nothing in `.env.dspark` can flip the 2-node path by accident.
+Full details, fabric notes and the reasoning: [docs/TP3.md](docs/TP3.md).
+
+**Before the first boot** (the launcher checks these, but does not do them):
+
+- passwordless SSH from the head to spark3;
+- the pinned `DSPARK_VLLM_IMAGE` already pulled on spark3 (≈ 19 GB; the
+  launcher exits with the exact `docker pull` command otherwise);
+- a ConnectX link head ↔ spark3 on its own `/24` (e.g. `10.0.23.1` ↔ `10.0.23.3`)
+  plus a LAN interface all three nodes share for the bootstrap (default `enP7s7`).
+
+Spark3 needs no local checkpoint: it mounts the head's HF cache over NFS, and
+the launcher creates its directory and syncs compose, env and `patches/`.
+
+```bash
+# .env.dspark — in addition to the 2-node settings
+WORKER2_HOST=10.0.0.3
+WORKER2_VLLM_HOST_IP=10.0.0.3
+WORKER2_NFS_SERVER_IP=10.0.23.1        # head IP on the spark1<->spark3 link
+WORKER2_NCCL_IB_HCA=rocep1s0f1         # spark3's port facing the head
+WORKER2_NCCL_SOCKET_IFNAME=enp1s0f1np1
+WORKER2_TP_SOCKET_IFNAME=enp1s0f1np1
+WORKER2_GLOO_SOCKET_IFNAME=enp1s0f1np1
+TP3_MAX_NUM_SEQS=16                    # slots on the 3-node lane only
+
+./start-tp3.sh                         # or: ./start-tp3.sh --max-num-seqs 16
+scripts/validate_tp3.sh 127.0.0.1:8888 # proves the shard, not just HTTP
+./stop-deepseek-v4-flash-dspark.sh     # tears down all three ranks
+```
+
+The first boot compiles for several minutes (empty JIT cache on spark3, new
+shard shapes everywhere); wait for the health check rather than restarting.
+Boot log must show `DSv4 TP pad: heads 64 -> 72 for TP=3` on every rank.
+
+**What you get:** 16 slots, about three times the KV cache (≈ 35 GiB per
+rank, ≈ 5 M cached tokens), ≈ 200 tok/s aggregate at 16 streams and slightly
+faster decode per stream. **What it costs:** prefill latency, 4–13 % up to
+64K and ≈ 22 % at 128K–256K, because in DeepSeek's MLA every rank holds the
+full latent KV and the indexer, so attention does not shrink with a third GPU,
+while the head pad and the three-node all-reduce add work. Single-user
+long-context work is better served by the 2-node lane.
+
+---
+
 ## Optional: Stage-C / 200K-16
 
 Historical overlay image `vllm-dspark-runtime:dspark-nvfp4-stage-c`
@@ -517,7 +577,7 @@ Compose is Anemll-shaped (`/usr/local/bin/vllm`, hotfixes under
 - `--kv-cache-dtype nvfp4_ds_mla` · `--block-size 256`
 - `--max-model-len 1048576` · `--max-num-seqs 6` · `--max-num-batched-tokens 8192`
 - `--long-prefill-token-threshold 1024` · `--enable-chunked-prefill` · `--async-scheduling`
-- `--max-cudagraph-capture-size` = `MAX_NUM_SEQS * (MTP_NUM_TOKENS + 1)` → 42 at 6×6 (engine may truncate to 32)
+- `--max-cudagraph-capture-size` = `MAX_NUM_SEQS * (MTP_NUM_TOKENS + 1)` padded to a multiple of 8 → 48 at 6×6 (plain 42 truncates to 40 and costs 12 % at c=6, measured 2026-09-02)
 - `--moe-backend flashinfer_b12x` · `--generation-config vllm`
 - DSpark: `{"method":"dspark","num_speculative_tokens":6,"draft_sample_method":"probabilistic"}`
 

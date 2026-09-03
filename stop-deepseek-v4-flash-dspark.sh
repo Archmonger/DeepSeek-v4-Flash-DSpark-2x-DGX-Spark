@@ -37,6 +37,10 @@ fi
 cd "$SCRIPT_DIR"
 
 WORKER_DIR="${WORKER_SCRIPT_DIR:-${WORKER_DIR:-$SCRIPT_DIR}}"
+WORKER2_HOST="${WORKER2_HOST:-}"
+WORKER2_DIR="${WORKER2_SCRIPT_DIR:-${WORKER2_DIR:-$WORKER_DIR}}"
+WORKER2_HF_CACHE="${WORKER2_HF_CACHE:-${WORKER_HF_CACHE:-${HF_CACHE:-}}}"
+WORKER2_VLLM_HOST_IP="${WORKER2_VLLM_HOST_IP:-}"
 WORKER_HF_CACHE="${WORKER_HF_CACHE:-${HF_CACHE:-}}"
 WORKER_VLLM_HOST_IP="${WORKER_VLLM_HOST_IP:-}"
 DSPARK_WORKER_HF_NFS="${DSPARK_WORKER_HF_NFS:-0}"
@@ -44,9 +48,13 @@ NFS_VOLUME="${NFS_VOLUME:-dspark-hf}"
 NFS_CONTAINER="${NFS_CONTAINER:-dspark-nfs}"
 WORKER_COMPOSE_FILES="-f docker-compose.dspark.yml"
 WORKER_HF_COMPOSE_ENV="HF_CACHE='$WORKER_HF_CACHE'"
+WORKER2_COMPOSE_FILES="-f docker-compose.dspark.yml"
+WORKER2_HF_COMPOSE_ENV="HF_CACHE='$WORKER2_HF_CACHE'"
 if [ "$DSPARK_WORKER_HF_NFS" = "1" ]; then
   WORKER_COMPOSE_FILES="-f docker-compose.dspark.yml -f docker-compose.dspark-nfs.override.yml"
   WORKER_HF_COMPOSE_ENV="HF_CACHE='$NFS_VOLUME' DSPARK_JIT_CACHE='$WORKER_HF_CACHE'"
+  WORKER2_COMPOSE_FILES="-f docker-compose.dspark.yml -f docker-compose.dspark-nfs.override.yml"
+  WORKER2_HF_COMPOSE_ENV="HF_CACHE='$NFS_VOLUME' DSPARK_JIT_CACHE='$WORKER2_HF_CACHE'"
 fi
 
 # A stop that cannot reach the worker must not report success: a powered-down
@@ -70,6 +78,14 @@ else
   WORKER_REACHABLE=0
   echo "WARN: cannot reach worker ${WORKER_HOST}; its ranks will NOT be stopped." >&2
 fi
+WORKER2_REACHABLE=0
+if [ -n "$WORKER2_HOST" ]; then
+  if ssh -o BatchMode=yes -o ConnectTimeout=10 "$WORKER2_HOST" "true" >/dev/null 2>&1; then
+    WORKER2_REACHABLE=1
+  else
+    echo "WARN: cannot reach worker2 ${WORKER2_HOST}; its ranks will NOT be stopped." >&2
+  fi
+fi
 
 local_project_has_resources() {
   local project="$1"
@@ -83,7 +99,7 @@ local_project_has_resources() {
 # Force-remove leftover containers by compose project label + known names.
 force_rm_project_containers() {
   local project="$1"
-  local where="$2" # local | remote
+  local where="$2" # local | remote | remote2
   local cmd
   cmd=$(cat <<EOF
 ids=\$(docker ps -aq --filter "label=com.docker.compose.project=$project" 2>/dev/null || true)
@@ -98,6 +114,10 @@ EOF
 )
   if [ "$where" = "local" ]; then
     bash -c "$cmd" || true
+  elif [ "$where" = "remote2" ]; then
+    if [ -n "$WORKER2_HOST" ] && [ "${WORKER2_REACHABLE:-0}" = "1" ]; then
+      ssh "$WORKER2_HOST" "$cmd" || stop_warn "force-remove on ${WORKER2_HOST} failed"
+    fi
   elif [ "${WORKER_REACHABLE:-1}" = "1" ]; then
     ssh "$WORKER_HOST" "$cmd" || stop_warn "force-remove on ${WORKER_HOST} failed"
   fi
@@ -137,30 +157,42 @@ stop_main_head() {
 
 stop_main_worker() {
   local project="$1"
-  if [ "${WORKER_REACHABLE:-1}" != "1" ]; then
-    stop_warn "worker ${WORKER_HOST} unreachable: main DSpark worker rank not stopped"
+  local host="${2:-$WORKER_HOST}"
+  local wdir="${3:-$WORKER_DIR}"
+  local hf_env="${4:-$WORKER_HF_COMPOSE_ENV}"
+  local vllm_ip="${5:-$WORKER_VLLM_HOST_IP}"
+  local rank="${6:-1}"
+  local compose_files="${7:-$WORKER_COMPOSE_FILES}"
+  local reachable=1
+  if [ "$host" = "$WORKER_HOST" ]; then
+    reachable="${WORKER_REACHABLE:-1}"
+  elif [ "$host" = "$WORKER2_HOST" ]; then
+    reachable="${WORKER2_REACHABLE:-1}"
+  fi
+  if [ "$reachable" != "1" ]; then
+    stop_warn "worker ${host} unreachable: DSpark rank not stopped"
     return 0
   fi
-  ssh "$WORKER_HOST" "
-    cd '$WORKER_DIR' || exit 1
+  ssh "$host" "
+    cd '$wdir' || exit 1
     if {
       docker ps -aq --filter 'label=com.docker.compose.project=$project'
       docker network ls -q --filter 'label=com.docker.compose.project=$project'
       docker volume ls -q --filter 'label=com.docker.compose.project=$project'
       docker ps -aq --filter 'name=${project}-vllm-dspark'
     } | grep -q .; then
-      echo 'Stopping DSpark on worker $WORKER_HOST (project $project)...'
+      echo 'Stopping DSpark on worker $host (project $project)...'
       docker ps -aq --filter 'name=${project}-vllm-dspark' | xargs -r docker rm -f >/dev/null 2>&1 || true
       env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS \
-        COMPOSE_DISABLE_ENV_FILE=1 $WORKER_HF_COMPOSE_ENV \
-        VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' NODE_RANK=1 HEADLESS=1 \
+        COMPOSE_DISABLE_ENV_FILE=1 $hf_env \
+        VLLM_HOST_IP='$vllm_ip' NODE_RANK=$rank HEADLESS=1 \
         docker compose -p '$project' --env-file .env.dspark \
-          $WORKER_COMPOSE_FILES down --remove-orphans -t 1 2>&1 \
+          $compose_files down --remove-orphans -t 1 2>&1 \
           | grep -v 'No resource found to remove for project' || true
     else
-      echo 'No DSpark worker resources for project $project on $WORKER_HOST; skipping.'
+      echo 'No DSpark worker resources for project $project on $host; skipping.'
     fi
-  " || stop_warn "main DSpark worker stop failed on ${WORKER_HOST}"
+  " || stop_warn "main DSpark worker stop failed on ${host}"
 }
 
 stop_project() {
@@ -172,10 +204,14 @@ stop_project() {
 
   stop_main_head "$project"
   stop_main_worker "$project"
+  if [ -n "$WORKER2_HOST" ]; then
+    stop_main_worker "$project" "$WORKER2_HOST" "$WORKER2_DIR" "$WORKER2_HF_COMPOSE_ENV" "$WORKER2_VLLM_HOST_IP" 2 "$WORKER2_COMPOSE_FILES"
+  fi
 
   # Sweep anything left under this compose project on both nodes.
   force_rm_project_containers "$project" local
   force_rm_project_containers "$project" remote
+  force_rm_project_containers "$project" remote2
 }
 
 stop_project "$PROJECT_NAME"
@@ -193,6 +229,15 @@ if [ "$STOP_NFS" = "1" ]; then
       || stop_warn "worker volume rm failed on ${WORKER_HOST}"
   else
     stop_warn "worker ${WORKER_HOST} unreachable: NFS volume $NFS_VOLUME not removed"
+  fi
+  if [ -n "$WORKER2_HOST" ]; then
+    if [ "${WORKER2_REACHABLE:-0}" = "1" ]; then
+      echo "Removing worker2 NFS volume ($NFS_VOLUME)..."
+      ssh "$WORKER2_HOST" "docker volume rm $NFS_VOLUME 2>/dev/null && echo '  Worker2 volume: removed.' || echo '  Worker2 volume: not present.'" \
+        || stop_warn "worker2 volume rm failed on ${WORKER2_HOST}"
+    else
+      stop_warn "worker2 ${WORKER2_HOST} unreachable: NFS volume $NFS_VOLUME not removed"
+    fi
   fi
 fi
 
