@@ -1,16 +1,10 @@
-"""Issue #175 follow-up: the MoE gates must not host-sync once per layer.
-
-``token_routing_kind`` ends in ``.sum().item()``. It used to run in every MoE
-gate (43 per forward, and prefill is never CUDA-graphed, so text prompts paid
-it too). The batch is now classified once in ``embed_input_ids`` and carried on
-vLLM's per-step ``ForwardContext``, bound to the model that published it.
+"""Issue #175: classify routing once per model forward, not once per MoE gate.
 
 Run inside the container:
   python3 tests/test_issue175_routing_kind_once.py
 """
 from __future__ import annotations
 
-import logging
 import sys
 import types
 from pathlib import Path
@@ -26,51 +20,25 @@ from vllm.forward_context import override_forward_context  # noqa: E402
 
 ID = ip.IMAGE_TOKEN_ID
 N_MOE_LAYERS = 43
-
 _real_item = torch.Tensor.item
 _counter = {"n": 0}
+FAILURES = []
 
 
-def _counting_item(self, *a, **kw):
+def _counting_item(self, *args, **kwargs):
     _counter["n"] += 1
-    return _real_item(self, *a, **kw)
+    return _real_item(self, *args, **kwargs)
 
 
 torch.Tensor.item = _counting_item
 
 
-def syncs():
-    return _counter["n"]
-
-
-class _Records(logging.Handler):
-    """Captures what vision_exp actually logs, at what level."""
-
-    def __init__(self):
-        super().__init__(level=logging.DEBUG)
-        self.records = []
-
-    def emit(self, record):
-        self.records.append(record)
-
-    def levels(self):
-        return [r.levelno for r in self.records]
-
-
-_LOGS = _Records()
-ip._LOGGER.addHandler(_LOGS)
-ip._LOGGER.setLevel(logging.DEBUG)
-ip._LOGGER.propagate = False
-
-
 def reset():
     _counter["n"] = 0
-    ip.set_pending_routing_kind(None)
-    ip._LOGGED_ONCE.clear()
-    _LOGS.records.clear()
 
 
-FAILURES = []
+def syncs():
+    return _counter["n"]
 
 
 def check(name, got, want):
@@ -83,11 +51,11 @@ def check(name, got, want):
 def raises(name, exc_type, fn):
     try:
         fn()
-    except exc_type as e:
-        print(f"  [PASS] {name}: raised {type(e).__name__}")
+    except exc_type as exc:
+        print(f"  [PASS] {name}: raised {type(exc).__name__}")
         return
-    except Exception as e:  # noqa: BLE001
-        print(f"  [FAIL] {name}: raised {type(e).__name__}, want {exc_type.__name__}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [FAIL] {name}: raised {type(exc).__name__}, want {exc_type.__name__}")
         FAILURES.append(name)
         return
     print(f"  [FAIL] {name}: no exception, want {exc_type.__name__}")
@@ -99,7 +67,8 @@ def fake_ctx():
 
 
 class FakeLM:
-    """Stands in for DeepseekV4ForCausalLM as the embed_input_ids receiver."""
+    def __init__(self):
+        self._dspark_routing_kind_cell = [None]
 
 
 def embed_fn():
@@ -109,12 +78,10 @@ def embed_fn():
     return ap.make_embed_input_ids(orig)
 
 
-def gate_reads(ids, owner_id, n=N_MOE_LAYERS):
-    """Simulate the N MoE gates of one forward reading the routing kind."""
-    return {ip.current_routing_kind(ids, owner_id=owner_id) for _ in range(n)}
+def gate_reads(ids, kind_cell=None, n=N_MOE_LAYERS):
+    return {ip.current_routing_kind(ids, kind_cell=kind_cell) for _ in range(n)}
 
 
-# --------------------------------------------------------------------------
 print("1. text batch: embed + 43 gate reads")
 reset()
 embed, lm = embed_fn(), FakeLM()
@@ -122,13 +89,12 @@ ids = torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.long)
 with override_forward_context(None):
     out = embed(lm, ids, multimodal_embeddings=None, is_multimodal=None)
 with override_forward_context(fake_ctx()):
-    kinds = gate_reads(ids, id(lm))
+    kinds = gate_reads(ids, lm._dspark_routing_kind_cell)
 check("text kind", kinds, {"text"})
 check("text .item() count", syncs(), 0)
 check("text embed shape", tuple(out.shape), (6, 4))
 
-# --------------------------------------------------------------------------
-print("2. all-image batch: embed + 43 gate reads")
+print("2. all-image batch: one existing merge sync, no gate syncs")
 reset()
 embed, lm = embed_fn(), FakeLM()
 ids = torch.full((8,), ID, dtype=torch.long)
@@ -140,12 +106,11 @@ with override_forward_context(None):
         is_multimodal=torch.ones(8, dtype=torch.bool),
     )
 with override_forward_context(fake_ctx()):
-    kinds = gate_reads(ids, id(lm))
+    kinds = gate_reads(ids, lm._dspark_routing_kind_cell)
 check("image kind", kinds, {"image"})
 check("image .item() count", syncs(), 1)
 
-# --------------------------------------------------------------------------
-print("3. mixed batch: embed + 43 gate reads")
+print("3. mixed batch: one existing merge sync, no gate syncs")
 reset()
 embed, lm = embed_fn(), FakeLM()
 ids = torch.tensor([7, ID, ID, ID, 9], dtype=torch.long)
@@ -157,25 +122,23 @@ with override_forward_context(None):
         is_multimodal=torch.tensor([False, True, True, True, False]),
     )
 with override_forward_context(fake_ctx()):
-    kinds = gate_reads(ids, id(lm))
+    kinds = gate_reads(ids, lm._dspark_routing_kind_cell)
 check("mixed kind", kinds, {"mixed"})
 check("mixed .item() count", syncs(), 1)
 
-# --------------------------------------------------------------------------
-print("4. empty mm list is text (encoder ran but produced nothing)")
+print("4. empty multimodal output is text")
 reset()
 embed, lm = embed_fn(), FakeLM()
 ids = torch.tensor([1, 2, 3], dtype=torch.long)
 with override_forward_context(None):
     embed(lm, ids, multimodal_embeddings=[], is_multimodal=None)
 with override_forward_context(fake_ctx()):
-    kinds = gate_reads(ids, id(lm))
+    kinds = gate_reads(ids, lm._dspark_routing_kind_cell)
 check("empty-mm kind", kinds, {"text"})
 check("empty-mm .item() count", syncs(), 0)
 
-# --------------------------------------------------------------------------
-print("5. fallback: no forward context -> identical to token_routing_kind")
-for name, t in [
+print("5. no ForwardContext keeps token scan behavior")
+for name, token_ids in [
     ("text", torch.tensor([1, 2, 3])),
     ("image", torch.full((4,), ID)),
     ("mixed", torch.tensor([1, ID, 2])),
@@ -185,96 +148,71 @@ for name, t in [
 ]:
     reset()
     with override_forward_context(None):
-        got = ip.current_routing_kind(t)
-    check(f"fallback {name}", got, ip.token_routing_kind(t))
+        got = ip.current_routing_kind(token_ids)
+    check(f"fallback {name}", got, ip.token_routing_kind(token_ids))
 
-# --------------------------------------------------------------------------
-print("6. fallback inside a context with no pending kind (dummy/warmup run)")
+print("6. unpublished warmup/dummy forward scans once")
 reset()
 ids = torch.tensor([1, ID, 2], dtype=torch.long)
 with override_forward_context(fake_ctx()):
-    kinds = gate_reads(ids, None)
-check("no-pending kind", kinds, {"mixed"})
-check("no-pending syncs (memoized after 1st gate)", syncs(), 1)
+    kinds = gate_reads(ids)
+check("unpublished kind", kinds, {"mixed"})
+check("unpublished syncs", syncs(), 1)
 
-# --------------------------------------------------------------------------
-print("7. per-step isolation: a new ForwardContext never reuses the old kind")
+print("7. fresh contexts do not reuse the prior step")
 reset()
 embed, lm = embed_fn(), FakeLM()
-img_ids = torch.full((4,), ID, dtype=torch.long)
+image_ids = torch.full((4,), ID, dtype=torch.long)
 with override_forward_context(None):
     embed(
         lm,
-        img_ids,
+        image_ids,
         multimodal_embeddings=[torch.ones((4, 4))],
         is_multimodal=torch.ones(4, dtype=torch.bool),
     )
 ctx_a = fake_ctx()
 with override_forward_context(ctx_a):
-    a = ip.current_routing_kind(img_ids, owner_id=id(lm))
-txt_ids = torch.tensor([1, 2, 3], dtype=torch.long)
+    image_kind = ip.current_routing_kind(image_ids, kind_cell=lm._dspark_routing_kind_cell)
+text_ids = torch.tensor([1, 2, 3], dtype=torch.long)
 with override_forward_context(None):
-    embed(lm, txt_ids, multimodal_embeddings=None, is_multimodal=None)
+    embed(lm, text_ids, multimodal_embeddings=None, is_multimodal=None)
 ctx_b = fake_ctx()
 with override_forward_context(ctx_b):
-    b = ip.current_routing_kind(txt_ids, owner_id=id(lm))
-check("step A kind", a, "image")
-check("step B kind (fresh ctx)", b, "text")
-check("ctx A attr", getattr(ctx_a, ip._ROUTING_KIND_CTX_ATTR, None), "image")
-check("ctx B attr", getattr(ctx_b, ip._ROUTING_KIND_CTX_ATTR, None), "text")
+    text_kind = ip.current_routing_kind(text_ids, kind_cell=lm._dspark_routing_kind_cell)
+check("step A kind", image_kind, "image")
+check("step B kind", text_kind, "text")
+check("ctx A retained image", getattr(ctx_a, ip._ROUTING_KIND_CTX_ATTR), "image")
+check("ctx B retained text", getattr(ctx_b, ip._ROUTING_KIND_CTX_ATTR), "text")
 
-# --------------------------------------------------------------------------
-print("8. stale pending is one-shot: a second forward cannot reuse it")
+print("8. publication cell is consumed once")
 reset()
-ip.set_pending_routing_kind("image", 777)
+cell = ["image"]
 with override_forward_context(fake_ctx()):
-    first = ip.current_routing_kind(torch.tensor([1, 2, 3]), owner_id=777)
+    first = ip.current_routing_kind(torch.full((2,), ID), kind_cell=cell)
 with override_forward_context(fake_ctx()):
-    second = ip.current_routing_kind(torch.tensor([1, 2, 3]), owner_id=777)
-check("1st consumes pending", first, "image")
-check("2nd falls back (not stale)", second, "text")
+    second = ip.current_routing_kind(torch.tensor([1, 2]), kind_cell=cell)
+check("first consumes image", first, "image")
+check("cell empty after consume", cell[0], None)
+check("next forward scans its own text", second, "text")
+check("only fallback scanned", syncs(), 1)
 
-# --------------------------------------------------------------------------
-print("9. DSpark drafter cannot eat the target's pending kind (owner stamp)")
+print("9. model-local cells cannot cross target/drafter or target instances")
 reset()
-target, drafter = FakeLM(), FakeLM()
-embed = embed_fn()
-img_ids = torch.full((4,), ID, dtype=torch.long)
-
-
-def publish_image():
-    with override_forward_context(None):
-        embed(
-            target,
-            img_ids,
-            multimodal_embeddings=[torch.ones((4, 4))],
-            is_multimodal=torch.ones(4, dtype=torch.bool),
-        )
-
-
-# 9a. The routine case: the target replayed a full CUDA graph (no Python in its
-# gates, so nobody consumed the value), then the drafter's untagged gates run
-# under their own ForwardContext.
-publish_image()
+target_a, target_b = FakeLM(), FakeLM()
+target_a._dspark_routing_kind_cell[0] = "image"
+target_b._dspark_routing_kind_cell[0] = "text"
 with override_forward_context(fake_ctx()):
-    stolen = ip.current_routing_kind(torch.tensor([1, 2, 3]), owner_id=None)
-check("untagged drafter gate scans for itself", stolen, "text")
-check("pending survives for its owner", ip._PENDING_ROUTING_KIND[0], "image")
-check("expected drafter fallback is not a warning", _LOGS.levels(), [logging.DEBUG])
+    drafter = ip.current_routing_kind(torch.tensor([1, 2]))
+check("untagged drafter scans text", drafter, "text")
+check("drafter did not consume target A", target_a._dspark_routing_kind_cell[0], "image")
 with override_forward_context(fake_ctx()):
-    mine = ip.current_routing_kind(img_ids, owner_id=id(target))
-check("target still gets 'image'", mine, "image")
-
-# 9b. Two tagged models crossing is a real anomaly and must stay loud.
-reset()
-publish_image()
+    a = ip.current_routing_kind(torch.full((2,), ID), kind_cell=target_a._dspark_routing_kind_cell)
 with override_forward_context(fake_ctx()):
-    crossed = ip.current_routing_kind(torch.tensor([1, 2, 3]), owner_id=id(drafter))
-check("tagged cross-owner falls back", crossed, "text")
-check("tagged cross-owner warns", _LOGS.levels(), [logging.WARNING])
-check("pending still survives", ip._PENDING_ROUTING_KIND[0], "image")
+    b = ip.current_routing_kind(torch.tensor([1, 2]), kind_cell=target_b._dspark_routing_kind_cell)
+check("target A receives image", a, "image")
+check("target B receives text", b, "text")
 
-print("10. CUDA-graph capture short-circuits before any kind resolution")
+print("10. CUDA-graph capture exits before consuming the cell")
 reset()
 calls = {"orig": 0}
 
@@ -283,7 +221,7 @@ class _Gate:
     e_score_correction_bias_vl = torch.zeros(4)
 
 
-class _Router:
+class _Router(nn.Module):
     scoring_func = "sigmoid"
     top_k = 2
     renormalize = True
@@ -295,122 +233,100 @@ class _Router:
         return ("orig", input_ids)
 
 
-lm = FakeLM()
-router = _Router()
+lm, router = FakeLM(), _Router()
 ap._wrap_router_compute_routing(router, _Gate())
-router._dspark_routing_owner = id(lm)
+router._dspark_routing_kind_cell = lm._dspark_routing_kind_cell
+lm._dspark_routing_kind_cell[0] = "image"
 real_capturing = torch.cuda.is_current_stream_capturing
 torch.cuda.is_current_stream_capturing = lambda: True
 try:
-    ip.set_pending_routing_kind("image", id(lm))  # would route image if consulted
     with override_forward_context(fake_ctx()):
-        r = router._compute_routing(
-            torch.zeros((4, 4)), torch.zeros((4, 4)), None,
+        result = router._compute_routing(
+            torch.zeros((4, 4)),
+            torch.zeros((4, 4)),
+            None,
             input_ids=torch.full((4,), ID, dtype=torch.long),
         )
-    check("capturing -> orig path", r[0], "orig")
-    check("capturing .item() count", syncs(), 0)
-    check("capturing did not consume pending", ip._PENDING_ROUTING_KIND[0], "image")
+    check("capturing uses original path", result[0], "orig")
+    check("capturing does not sync", syncs(), 0)
+    check("capturing preserves publication", lm._dspark_routing_kind_cell[0], "image")
 finally:
     torch.cuda.is_current_stream_capturing = real_capturing
 
-# --------------------------------------------------------------------------
-print("11. non-capturing text step: gate wrapper takes orig path, zero syncs")
+print("11. non-capturing text wrapper uses original route with zero syncs")
 reset()
 calls["orig"] = 0
+lm._dspark_routing_kind_cell[0] = None
+with override_forward_context(None):
+    embed_fn()(lm, text_ids, multimodal_embeddings=None, is_multimodal=None)
 torch.cuda.is_current_stream_capturing = lambda: False
 try:
-    embed = embed_fn()
-    txt = torch.tensor([1, 2, 3, 4], dtype=torch.long)
-    with override_forward_context(None):
-        embed(lm, txt, multimodal_embeddings=None, is_multimodal=None)
     with override_forward_context(fake_ctx()):
         for _ in range(N_MOE_LAYERS):
-            router._compute_routing(torch.zeros((4, 4)), torch.zeros((4, 4)), None, input_ids=txt)
-    check("text step orig calls", calls["orig"], N_MOE_LAYERS)
-    check("text step .item() count", syncs(), 0)
+            router._compute_routing(
+                torch.zeros((4, 4)), torch.zeros((4, 4)), None, input_ids=text_ids
+            )
+    check("text original-route calls", calls["orig"], N_MOE_LAYERS)
+    check("text wrapper syncs", syncs(), 0)
 finally:
     torch.cuda.is_current_stream_capturing = real_capturing
 
-# --------------------------------------------------------------------------
-print("12. fused_topk_bias_split_vl honours a precomputed kind (no re-scan)")
+print("12. precomputed fused-topk kind does not re-resolve")
 reset()
 import vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router as ftb_mod
 
 seen = {}
 
 
-def _fake_ftb(**kw):
-    seen.update(kw)
+def fake_ftb(**kwargs):
+    seen.update(kwargs)
     return ("w", "ids")
 
 
-_real_ftb = ftb_mod.fused_topk_bias
-_real_curr = ap.current_routing_kind
-
-
-def _boom(*a, **k):
-    raise AssertionError("current_routing_kind must not run when kind is given")
-
-
-ftb_mod.fused_topk_bias = _fake_ftb
-ap.current_routing_kind = _boom
+real_ftb, real_current = ftb_mod.fused_topk_bias, ap.current_routing_kind
+ftb_mod.fused_topk_bias = fake_ftb
+ap.current_routing_kind = lambda *args, **kwargs: (_ for _ in ()).throw(
+    AssertionError("precomputed kind must not be resolved")
+)
+common = dict(
+    hidden_states=torch.zeros((2, 2)),
+    gating_output=torch.zeros((2, 2)),
+    scoring_func="sigmoid",
+    e_score_correction_bias=torch.ones(4),
+    e_score_correction_bias_vl=torch.zeros(4),
+    topk=1,
+    renormalize=False,
+    indices_type=None,
+    hash_indices_table="HASH",
+    routed_scaling_factor=1.0,
+)
 try:
-    vl_bias = torch.zeros(4)
-    common = dict(
-        hidden_states=torch.zeros((2, 2)),
-        gating_output=torch.zeros((2, 2)),
-        scoring_func="sigmoid",
-        e_score_correction_bias=torch.ones(4),
-        e_score_correction_bias_vl=vl_bias,
-        topk=1,
-        renormalize=False,
-        indices_type=None,
-        hash_indices_table="HASH",
-        routed_scaling_factor=1.0,
-    )
     ap.fused_topk_bias_split_vl(input_tokens=torch.tensor([ID, ID]), kind="image", **common)
-    check(
-        "kind=image -> bias_vl used",
-        seen["e_score_correction_bias"].data_ptr() == vl_bias.data_ptr(),
-        True,
-    )
-    check("kind=image -> hash table skipped", seen["hash_indices_table"], None)
-    check("kind=image -> no re-scan syncs", syncs(), 0)
+    check("image uses Vision-Exp bias", seen["e_score_correction_bias"].data_ptr(), common["e_score_correction_bias_vl"].data_ptr())
+    check("image skips hash table", seen["hash_indices_table"], None)
     seen.clear()
     ap.fused_topk_bias_split_vl(input_tokens=torch.tensor([1, 2]), kind="text", **common)
-    check("kind=text -> text bias + hash table", seen["hash_indices_table"], "HASH")
-    check("kind=text -> no re-scan syncs", syncs(), 0)
+    check("text keeps hash table", seen["hash_indices_table"], "HASH")
+    check("precomputed paths do not sync", syncs(), 0)
 finally:
-    ftb_mod.fused_topk_bias = _real_ftb
-    ap.current_routing_kind = _real_curr
+    ftb_mod.fused_topk_bias = real_ftb
+    ap.current_routing_kind = real_current
 
-print("13. kind=None still resolves (backwards compatible call)")
+print("13. kind=None resolves from a model cell")
 reset()
-ftb_mod.fused_topk_bias = _fake_ftb
+ftb_mod.fused_topk_bias = fake_ftb
 try:
     seen.clear()
-    with override_forward_context(None):
+    with override_forward_context(fake_ctx()):
         ap.fused_topk_bias_split_vl(
-            hidden_states=torch.zeros((2, 2)),
-            gating_output=torch.zeros((2, 2)),
-            scoring_func="sigmoid",
-            e_score_correction_bias=torch.ones(4),
-            e_score_correction_bias_vl=torch.zeros(4),
-            topk=1,
-            renormalize=False,
-            indices_type=None,
-            input_tokens=torch.tensor([1, 2, 3]),
-            hash_indices_table="HASH",
-            routed_scaling_factor=1.0,
+            input_tokens=torch.full((2,), ID), kind_cell=["image"], **common
         )
-    check("kind=None text -> hash table kept", seen["hash_indices_table"], "HASH")
-    check("kind=None text -> 1 fallback sync", syncs(), 1)
+    check("cell image skips hash table", seen["hash_indices_table"], None)
+    check("cell resolution does not sync", syncs(), 0)
 finally:
-    ftb_mod.fused_topk_bias = _real_ftb
+    ftb_mod.fused_topk_bias = real_ftb
 
-# --------------------------------------------------------------------------
-print("14. hardening: no silent degradation")
+print("14. hard failures prevent silent performance regressions")
 reset()
 
 
@@ -418,44 +334,27 @@ class _Slotted:
     __slots__ = ()
 
 
-ip.set_pending_routing_kind("text", 1)
 with override_forward_context(_Slotted()):
-    try:
-        ip.current_routing_kind(torch.tensor([1, 2]), owner_id=1)
-        print("  [FAIL] setattr on a locked ForwardContext must raise")
-        FAILURES.append("locked ctx raises")
-    except AttributeError as e:
-        print(f"  [PASS] setattr on a locked ForwardContext raises: {type(e).__name__}")
-
-raises(
-    "_num_tokens on an unsized object raises (no silent 0 -> 'image')",
-    TypeError,
-    lambda: ap._num_tokens(object()),
-)
-raises(
-    "routing_kind_from_mm(n_tokens=0) raises",
-    ValueError,
-    lambda: ip.routing_kind_from_mm(3, 0),
-)
-
-_saved = ip._FORWARD_CONTEXT_HOOKS
-ip._FORWARD_CONTEXT_HOOKS = None
-import vllm.forward_context as _fcmod
-
-_saved_fn = _fcmod.is_forward_context_available
-del _fcmod.is_forward_context_available
-try:
     raises(
-        "missing vllm forward_context symbol is a hard failure",
+        "locked ForwardContext",
         AttributeError,
-        lambda: ip._forward_context_or_none(),
+        lambda: ip.current_routing_kind(torch.tensor([1, 2]), kind_cell=["text"]),
     )
-finally:
-    _fcmod.is_forward_context_available = _saved_fn
-    ip._FORWARD_CONTEXT_HOOKS = _saved
+raises("unsized token input", TypeError, lambda: ap._num_tokens(object()))
+raises("zero-token multimodal classification", ValueError, lambda: ip.routing_kind_from_mm(3, 0))
+saved_hooks = ip._FORWARD_CONTEXT_HOOKS
+ip._FORWARD_CONTEXT_HOOKS = None
+import vllm.forward_context as fc_mod
 
-# --------------------------------------------------------------------------
-print("15. tag_routing_owner binds gates by object graph, not by name")
+saved_fn = fc_mod.is_forward_context_available
+del fc_mod.is_forward_context_available
+try:
+    raises("missing vLLM context symbol", AttributeError, ip._forward_context_or_none)
+finally:
+    fc_mod.is_forward_context_available = saved_fn
+    ip._FORWARD_CONTEXT_HOOKS = saved_hooks
+
+print("15. cell attachment follows the model graph, not names")
 
 
 class _Experts(nn.Module):
@@ -478,12 +377,12 @@ class _Stack(nn.Module):
         self.layers = nn.ModuleList([_MoE(True), _MoE(True), _MoE(False)])
 
 
-stack = _Stack()
-n = ap.tag_routing_owner(stack, 4242)
-check("tagged only bias_vl gates", n, 2)
-check("moe tagged", stack.layers[0]._dspark_routing_owner, 4242)
-check("router tagged", stack.layers[0].experts.router._dspark_routing_owner, 4242)
-check("non-vl gate untagged", getattr(stack.layers[2], "_dspark_routing_owner", None), None)
+stack, cell = _Stack(), [None]
+attached = ap.attach_routing_kind_cell(stack, cell)
+check("attached only Vision-Exp gates", attached, 2)
+check("MoE shares exact cell", stack.layers[0]._dspark_routing_kind_cell is cell, True)
+check("router shares exact cell", stack.layers[0].experts.router._dspark_routing_kind_cell is cell, True)
+check("non-Vision gate remains untagged", hasattr(stack.layers[2], "_dspark_routing_kind_cell"), False)
 
 print()
 if FAILURES:

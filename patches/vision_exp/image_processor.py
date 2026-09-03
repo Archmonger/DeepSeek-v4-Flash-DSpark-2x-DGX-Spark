@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import base64
 import io
-import logging
 import math
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -92,33 +91,12 @@ def token_routing_kind(input_tokens: Any, image_token_id: int = IMAGE_TOKEN_ID) 
     return "mixed"
 
 
-# --- per-forward routing kind (issue #175 host-sync removal) -----------------
-# ``token_routing_kind`` ends in ``.sum().item()``: a device->host sync. It used
-# to run once per MoE gate per forward (43 syncs, and prefill is never captured
-# into a CUDA graph, so plain text prompts paid them too). The runner now
-# classifies the batch once in ``embed_input_ids`` -- which runs before any MoE
-# layer -- and publishes the answer through ``_PENDING_ROUTING_KIND``. The first
-# MoE gate of the step moves it onto vLLM's per-step ``ForwardContext``; every
-# later gate then reads it for free.
-#
-# ``set_forward_context`` builds a fresh ``ForwardContext`` per step, so the
-# attribute cannot leak into the next step. An ``id(input_ids)`` memo would:
-# the runner hands out slices of one preallocated buffer, so each step gets a
-# new view object whose id is silently recycled.
+# ``token_routing_kind`` ends in ``.sum().item()``. The runner classifies the
+# batch in ``embed_input_ids`` before the step's ``ForwardContext`` exists, then
+# the first eager MoE gate moves that model's one-slot value onto the fresh
+# context. Later gates read it without another host sync.
 _ROUTING_KIND_CTX_ATTR = "_dspark_vision_exp_routing_kind"
-# (kind, owner_id, seq) published by embed_input_ids, or None once consumed.
-_PENDING_ROUTING_KIND = None
-_PENDING_SEQ = 0
 _FORWARD_CONTEXT_HOOKS = None
-_LOGGED_ONCE = set()
-_LOGGER = logging.getLogger(__name__)
-
-
-def _log_once(level: int, msg: str, *args: Any) -> None:
-    if msg in _LOGGED_ONCE:
-        return
-    _LOGGED_ONCE.add(msg)
-    _LOGGER.log(level, msg, *args)
 
 
 def routing_kind_from_mm(n_placeholders: int, n_tokens: int) -> str:
@@ -141,60 +119,6 @@ def routing_kind_from_mm(n_placeholders: int, n_tokens: int) -> str:
     return "mixed"
 
 
-def set_pending_routing_kind(kind: Any, owner_id: Any = None) -> None:
-    """Publish the routing kind for the forward that is about to start.
-
-    ``owner_id`` is ``id()`` of the ``embed_input_ids`` receiver. Only MoE
-    gates tagged with the same owner may consume it: the DSpark drafter builds
-    its own ``DeepseekV4DecoderLayer``/``DeepseekV4MoE`` stack and opens its own
-    ``ForwardContext``, so an unstamped value could be eaten by another model.
-    """
-    global _PENDING_ROUTING_KIND, _PENDING_SEQ
-    _PENDING_SEQ += 1
-    _PENDING_ROUTING_KIND = None if kind is None else (kind, owner_id, _PENDING_SEQ)
-
-
-def _take_pending_routing_kind(owner_id: Any):
-    """One-shot, owner-checked read. None when there is nothing of ours."""
-    global _PENDING_ROUTING_KIND
-    pending = _PENDING_ROUTING_KIND
-    if pending is None:
-        return None
-    kind, pending_owner, seq = pending
-    if pending_owner != owner_id:
-        # Not ours: leave it for its real owner and scan instead.
-        if owner_id is None:
-            # Expected, and it happens on ordinary steps: an untagged gate does
-            # not belong to a model that publishes kinds. The DSpark drafter
-            # builds its own DeepseekV4DecoderLayer stack and opens its own
-            # ForwardContext, and a target step that replayed a full CUDA graph
-            # ran no Python in its gates, so its value is still sitting here.
-            # The drafter scanning for itself is correct pre-#175 behaviour and
-            # the target model is unaffected -- this is not a fault.
-            _log_once(
-                logging.DEBUG,
-                "vision_exp: routing kind seq=%s (owner %s) was read by an "
-                "untagged gate; expected spec-decode drafter path, that gate "
-                "scans for itself and the target model is unaffected",
-                seq,
-                pending_owner,
-            )
-        else:
-            # A tagged gate belongs to a model that does publish kinds, so two
-            # of them crossed. Unexpected, and it costs 43 host syncs per
-            # forward -- say so.
-            _log_once(
-                logging.WARNING,
-                "vision_exp: routing kind seq=%s published by owner %s reached "
-                "tagged owner %s; unexpected, falling back to a per-layer token "
-                "scan (issue #175)",
-                seq,
-                pending_owner,
-                owner_id,
-            )
-        return None
-    _PENDING_ROUTING_KIND = None
-    return kind
 
 
 def _forward_context_or_none():
@@ -222,26 +146,26 @@ def _forward_context_or_none():
 def current_routing_kind(
     input_tokens: Any,
     image_token_id: int = IMAGE_TOKEN_ID,
-    owner_id: Any = None,
+    kind_cell: Any = None,
 ) -> str:
-    """Routing kind of the running forward, computed at most once per step.
+    """Return one routing kind per eager forward.
 
-    Falls back to a fresh ``token_routing_kind`` scan whenever the per-step
-    carrier is missing (no forward context, a forward that never went through
-    ``embed_input_ids``, another model's pending value), so the semantics are
-    unchanged -- only the sync count differs.
+    ``kind_cell`` belongs to one language-model instance and is shared only
+    with that model's gates. A missing publication falls back to one token scan
+    memoized on the current ``ForwardContext``.
     """
     ctx = _forward_context_or_none()
     if ctx is None:
         return token_routing_kind(input_tokens, image_token_id)
     kind = getattr(ctx, _ROUTING_KIND_CTX_ATTR, None)
     if kind is None:
-        kind = _take_pending_routing_kind(owner_id)
+        if kind_cell is not None:
+            kind = kind_cell[0]
+            kind_cell[0] = None
         if kind is None:
             kind = token_routing_kind(input_tokens, image_token_id)
-        # Deliberately unguarded: if ForwardContext ever stops accepting
-        # attributes this must fail at warmup, not silently restore 43 syncs
-        # per forward. _dummy_run reaches this before the server is healthy.
+        # Fail during warmup if ForwardContext stops accepting attributes;
+        # silently restoring 43 scans per forward is not a safe fallback.
         setattr(ctx, _ROUTING_KIND_CTX_ATTR, kind)
     return kind
 
