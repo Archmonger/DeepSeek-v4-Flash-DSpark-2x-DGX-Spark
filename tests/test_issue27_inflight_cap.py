@@ -160,8 +160,39 @@ class Issue27InflightCapTest(unittest.TestCase):
 
     def test_admission_stops_at_cached_cap(self):
         scheduler, _, _ = _load_scheduler("1")
-        scheduler._inflight_prefills.add(object())
+        scheduler.running.append(_mid_prefill())
         self.assertEqual(scheduler.schedule(), 0)
+
+    def test_t1_lost_track_blocks_admission_and_warns(self):
+        scheduler, logger, _ = _load_scheduler("1")
+        scheduler.running.append(_mid_prefill())
+        self.assertEqual(scheduler.schedule(), 0)
+        self.assertEqual(len(logger.warnings), 1)
+        self.assertIn("undercount: tracked=0 running=1", logger.warnings[0])
+
+    def test_t2_completed_prefill_does_not_block_or_warn(self):
+        scheduler, logger, _ = _load_scheduler("1")
+        scheduler.running.append(_RunningReq(1024, 1024))
+        self.assertEqual(scheduler.schedule(), 1)
+
+    def test_t3_cap_two_admits_one_blocks_two(self):
+        scheduler, logger, _ = _load_scheduler("2")
+        one = _mid_prefill()
+        scheduler.running.append(one)
+        scheduler._inflight_prefills.add(one)
+        self.assertEqual(scheduler.schedule(), 1)
+        self.assertEqual(logger.warnings, [])
+
+        scheduler, _, _ = _load_scheduler("2")
+        # bookkeeping lost: prefills in running only -> gate must still block
+        scheduler.running.extend([_mid_prefill(), _mid_prefill()])
+        self.assertEqual(scheduler.schedule(), 0)
+
+    def test_t4_async_kv_only_tracked_entry_is_tolerated(self):
+        scheduler, logger, _ = _load_scheduler("1")
+        scheduler._inflight_prefills.add(object())  # WAITING_FOR_REMOTE_KVS: not in running
+        self.assertEqual(scheduler.schedule(), 1)
+        self.assertEqual(logger.warnings, [])
 
     def test_init_logs_resolved_cap_and_env_once(self):
         scheduler, logger, _ = _load_scheduler("1")

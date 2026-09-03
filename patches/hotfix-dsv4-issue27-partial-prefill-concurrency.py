@@ -19,14 +19,20 @@ the cap. The cap is ``DSPARK_MAX_INFLIGHT_PREFILLS`` (1-3, default 1 via
 compose) because this image rejects ``--max-num-partial-prefills``. It is
 parsed once during ``Scheduler`` construction; unset, blank, nonpositive, or
 malformed values fall back to ``SchedulerConfig.max_num_partial_prefills``
-(stock 1), and malformed values emit one warning. ``self._inflight_prefills``
-is maintained by ``_update_after_schedule`` (populated for requests still
-needing more prefill chunks, discarded when they finish prefilling), so it
-correctly reflects the currently-prefilling set. This restores the documented
-concurrency cap of 1 by default, so at most one request prefill-chunks per
-step and decode lanes behind it in ``self.running`` always receive budget
-(chunk cap via ``--long-prefill-token-threshold`` keeps that one chunk below
-``max_num_batched_tokens`` leaving room for decode tokens).
+(stock 1), and malformed values emit one warning. The in-flight count is
+derived directly from ``self.running`` (requests with ``num_computed_tokens <
+num_prompt_tokens``); ``self._inflight_prefills`` bookkeeping is retained for
+``_inflight_prefill_reserved_blocks`` but is no longer load-bearing for
+admission. Every ``Scheduler`` construction logs the resolved cap once
+(``[issue27-hotfix] in-flight prefill cap=N env=<raw>``); if the tracked set
+ever undercounts the running prefills a bounded tripwire logs at most 16
+warnings per process, and verbose per-admission lines (``[issue27-adm]``)
+appear only under the existing ``DSPARK_ISSUE43_SCHED_DIAG`` knob. This
+restores the documented concurrency cap of 1 by default, so at most one
+request prefill-chunks per step and decode lanes behind it in ``self.running``
+always receive budget (chunk cap via ``--long-prefill-token-threshold`` keeps
+that one chunk below ``max_num_batched_tokens`` leaving room for decode
+tokens).
 
 Idempotent: re-applying is a no-op once the marker is present.
 
@@ -101,8 +107,12 @@ INJECT = ADMISSION_ANCHOR + (
     "                # requests at the front of self.running consume the whole\n"
     "                # max_num_batched_tokens each step; decode-active requests behind\n"
     "                # them get num_new_tokens==0 and are skipped (continue, not preempt)\n"
-    "                # -> zero-preemption decode starvation (issue #27). _inflight_prefills\n"
-    "                # is the set of running requests still needing prefill chunks.\n"
+    "                # -> zero-preemption decode starvation (issue #27). Admission\n"
+    "                # is counted directly from self.running (requests with\n"
+    "                # num_computed_tokens < num_prompt_tokens), not from the\n"
+    "                # _inflight_prefills set, whose add/discard bookkeeping is\n"
+    "                # shared with async-KV loads and is not load-bearing here\n"
+    "                # (kept for _inflight_prefill_reserved_blocks).\n"
     "                # DSPARK_MAX_INFLIGHT_PREFILLS is parsed and cached once\n"
     "                # during Scheduler construction, never in this hot loop.\n"
     "                if self._dspark_max_inflight_prefills > 0:\n"
@@ -133,7 +143,7 @@ INJECT = ADMISSION_ANCHOR + (
     "                            self._dspark_max_inflight_prefills,\n"
     "                            len(self.waiting),\n"
     "                        )\n"
-    "                    if _pp_tracked >= self._dspark_max_inflight_prefills:\n"
+    "                    if _pp_running >= self._dspark_max_inflight_prefills:\n"
     "                        break\n"
 )
 src = src.replace(INIT_ANCHOR, INIT_INJECT, 1)

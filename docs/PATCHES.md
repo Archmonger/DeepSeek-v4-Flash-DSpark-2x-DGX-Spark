@@ -204,6 +204,23 @@ docker exec <container> bash /path/to/hotfix-nvfp4-ds-mla-issue22.sh
 
 ---
 
+## Issue #27 — partial-prefill admission cap (running-derived count)
+
+`patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py` breaks the
+waiting-admission loop once in-flight partial prefills reach
+`DSPARK_MAX_INFLIGHT_PREFILLS` (1–3; fallback
+`SchedulerConfig.max_num_partial_prefills`). The count is derived directly
+from `self.running` (`num_computed_tokens < num_prompt_tokens`), not from the
+`_inflight_prefills` set, whose add/discard bookkeeping is shared with
+async-KV loads and is retained only for `_inflight_prefill_reserved_blocks`
+(issue #154 defense). Each `Scheduler` construction logs
+`[issue27-hotfix] in-flight prefill cap=N env=<raw>` once; a bounded tripwire
+(≤16 warnings per process) logs `in-flight prefill undercount` whenever the
+set undercounts the running prefills; verbose `[issue27-adm]` admission lines
+require the existing `DSPARK_ISSUE43_SCHED_DIAG=1` knob.
+
+---
+
 ## Issue #52 — trailing assistant turn closes with EOS (no-op loop)
 
 ### Symptom
