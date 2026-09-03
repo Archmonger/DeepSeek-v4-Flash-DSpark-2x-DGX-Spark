@@ -255,6 +255,28 @@ class Issue27InflightCapTest(unittest.TestCase):
         scheduler.running.extend([_mid_prefill(), _mid_prefill()])
         self.assertEqual(scheduler.schedule(), 0)
 
+    def test_cap_two_admits_two_of_four_in_one_schedule_call(self):
+        scheduler, logger, _ = _load_scheduler("2")
+        scheduler.waiting = [
+            _RunningReq(f"w{i}", 0, 5000)
+            for i in range(4)
+        ]
+
+        self.assertEqual(scheduler.schedule(), 2)
+        self.assertEqual(
+            [request.request_id for request in scheduler.running],
+            ["w0", "w1"],
+        )
+        self.assertEqual(
+            [request.request_id for request in scheduler.waiting],
+            ["w2", "w3"],
+        )
+        self.assertEqual(
+            {request.request_id for request in scheduler._inflight_prefills},
+            {"w0", "w1"},
+        )
+        self.assertEqual(logger.warnings, [])
+
     def test_t4_async_kv_only_tracked_entry_is_tolerated(self):
         scheduler, logger, _ = _load_scheduler("1")
         scheduler._inflight_prefills.add(object())  # WAITING_FOR_REMOTE_KVS: not in running
