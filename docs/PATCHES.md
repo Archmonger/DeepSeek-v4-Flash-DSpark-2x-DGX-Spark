@@ -675,3 +675,81 @@ The hermetic behavior/source/transaction/startup suite is:
 ```bash
 python3 scripts/test-issue117-shm-ring-buffer.py
 ```
+
+---
+
+## Item 6 — sequence-parallel Lightning indexer for long prefills (default OFF)
+
+### Why
+
+`DeepseekV4Indexer` is replicated across TP ranks (`wq_b` / `weights_proj` are
+`ReplicatedLinear`), so every rank scores all 64 index heads against the whole
+compressed key range of every prefill query. At long context that O(queries ×
+keys) score is the dominant prefill cost (900K prefill ≈ 875 tok/s vs ≈ 2,500
+tok/s at 2K) and it is computed once per rank. Report:
+`docs/CLAUDE/fable5-1-report.md` §3.6.
+
+### What the patch does
+
+`patches/hotfix-dsv4-sp-indexer-prefill.py` edits
+`vllm/model_executor/layers/sparse_attn_indexer.py`. In the prefill loop, for a
+chunk with at least `DSPARK_SP_INDEXER_MIN_KEYS` compressed keys (default 8192
+= 32K tokens at compress ratio 4), TP rank `r`:
+
+1. splits every request's compressed key range into `tp` contiguous,
+   page-aligned slices (`_sp_indexer_split`) and gathers only its own slice
+   from the paged indexer cache (shifted block table, rank-local
+   `cu_seq_lens`);
+2. maps each query's global `[ks, ke)` onto its local rows
+   (`_sp_indexer_local_bounds`, causal bound clamped into the slice);
+3. runs the stock `fp8_fp4_mqa_logits` + `top_k_per_row_prefill` on the local
+   slice (half the logits, half the K gather at TP=2);
+4. packs `(score, global_id)` for its local top-k, all-gathers the candidates
+   across the TP group (`tp × index_topk × 8 B` per query) and runs vLLM's
+   DCP `stable_topk_from_gathered_candidates_cutedsl` into the shared
+   `topk_indices_buffer`.
+
+Exactness follows the DCP argument: a token in the global top-k is in its
+owning rank's local top-k, so merging local top-k sets equals top-k over the
+full row. Decode, chunks below the threshold, DCP>1, TP=1 and XPU keep the
+stock replicated path byte-for-byte. Control flow is symmetric across ranks
+(the decision uses CPU-side chunk metadata that is identical on all ranks), so
+the collective cannot desynchronize.
+
+### Flag (default OFF = stock)
+
+| value | behavior |
+|---|---|
+| `0` / unset / anything ≠ `1` | patcher not invoked; stock bytes |
+| `1` | apply at boot on both ranks, `|| exit 1` (fail-closed); `DSPARK_SP_INDEXER_MIN_KEYS` tunes the threshold at runtime |
+
+Recreate both containers when flipping (a restart keeps the patched layer).
+
+### Validation
+
+* CPU: `python3 tests/test_sp_indexer_prefill.py` — applies to the real image
+  file, idempotent, compiles; split/bounds math vs brute force for many request
+  shapes at TP 2/3/4 (page alignment, disjoint cover, per-query local range).
+* GPU (inside the image, one GPU, no process group): `scripts/test-sp-indexer-gpu.py`
+  runs the real kernels for emulated TP=2 and TP=3 and compares the merged top-k
+  against the stock full-range path (valid-candidate counts and score multisets).
+  Needs the DeepGEMM SM121 header alias below when the JIT cache is cold.
+* Live A/B still required: `scripts/bench-ttft.py` at 32K–900K prompts with
+  `DSPARK_ENABLE_SP_INDEXER=0/1`, plus `scripts/ruler-lite.py` for quality.
+
+---
+
+## DeepGEMM SM121 indexer-logits header alias (default OFF)
+
+The image's vendored DeepGEMM emits `sm121_fp8_mqa_logits<...>` and includes
+`impls/sm121_fp8_mqa_logits.cuh` on GB10 (CC 12.1) but ships only `sm120_*`
+headers. Production works because `VLLM_CACHE_ROOT/deep_gemm/cache/` already
+holds cubins built from `sm120_fp8_mqa_logits.cuh` (Jul 16 / Jul 27). A cache
+miss — fresh volume, new cache root, new index head count, the fp4 indexer path
+— fails at first use with `Failed to open .../sm121_fp8_mqa_logits.cuh`.
+
+`patches/hotfix-deepgemm-sm121-mqa-header-alias.sh` (gate
+`DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS=1`) writes four alias headers
+(`#include <deep_gemm/impls/sm120_X.cuh>` + `#define sm121_X sm120_X`) for the
+fp8/fp4 × contiguous/paged mqa-logits kernels. Idempotent; `--status` reports.
+Details: `docs/CLAUDE/item8-fp4-kv-design.md` §5.

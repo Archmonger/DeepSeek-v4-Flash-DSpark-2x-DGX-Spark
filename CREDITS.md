@@ -60,6 +60,14 @@ repo builds from:
 
 - https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark
 
+## Three-Node TP=3 Padding
+
+Optional `./start-tp3.sh` vendors the attention-group pad (8→9) from:
+
+- https://github.com/localaiguyy/DeepSeek-V4-Flash-DSpark-3x-DGX-Spark
+
+That work is independent of this 2-node recipe. See [docs/TP3.md](docs/TP3.md).
+
 ## Upstream Foundations
 
 This work also relies on:
