@@ -50,6 +50,8 @@ services:
       # Issue #55 tool-call truncation safety: finish_reason=length + drop
       # non-JSON-parseable args when max_tokens cuts a tool call mid-flight.
       - ${DSPARK_ISSUE55_HOTFIX:-./patches/hotfix-dsv4-issue55-tool-truncation.py}:/opt/hotfix-dsv4-issue55-tool-truncation.py:ro
+      # Optional Responses state: bound response/message/event stores together.
+      - ${DSPARK_RESPONSES_STORE_HOTFIX:-./patches/hotfix-dsv4-responses-store.py}:/opt/hotfix-dsv4-responses-store.py:ro
       # Issue #109: encoder-only EC producer steps must not emit phantom token 0.
       - ${DSPARK_EMPTY_ENCODER_OUTPUT_HOTFIX:-./patches/hotfix-vllm-empty-encoder-output.py}:/opt/hotfix-vllm-empty-encoder-output.py:ro
       # Issue #27 partial-prefill concurrency hotfix (enforce max_num_partial_prefills).
@@ -106,6 +108,10 @@ services:
       # coordinator hotfix — SWA-min alone still 0/8 at 44K+ x8 because
       # dense SWA tails evict MLA prefix blocks.
       VLLM_PREFIX_CACHE_RETENTION_INTERVAL: "${VLLM_PREFIX_CACHE_RETENTION_INTERVAL:-4096}"
+      # Stateful previous_response_id is opt-in. The backport bounds terminal
+      # response/message/event state and protects active work when enabled.
+      VLLM_ENABLE_RESPONSES_API_STORE: "${VLLM_ENABLE_RESPONSES_API_STORE:-0}"
+      DSPARK_RESPONSES_STORE_MAX_ENTRIES: "${DSPARK_RESPONSES_STORE_MAX_ENTRIES:-256}"
       # Issue #43 scheduler diagnostics: emit one compact per-step line
       # (scheduled prefill/decode tokens per request + zero-token decode
       # skips) when set to 1. Off by default (zero overhead).
@@ -362,6 +368,7 @@ services:
         if [ "$${DSPARK_SKIP_ISSUE117_RECHECK_HOTFIX:-0}" != "1" ]; then if [ ! -f /opt/dspark-patches/hotfix-vllm-issue117-shm-ring-buffer.py ]; then echo "FATAL: /opt/dspark-patches/hotfix-vllm-issue117-shm-ring-buffer.py missing" >&2; exit 1; fi; python3 /opt/dspark-patches/hotfix-vllm-issue117-shm-ring-buffer.py || exit 1; python3 /opt/dspark-patches/hotfix-vllm-issue117-shm-ring-buffer.py --status || exit 1; fi;
         if [ "$${DSPARK_SKIP_HOTFIX:-0}" != "1" ]; then for _hf in hotfix-dsv4-mtp-buffer-50312.sh hotfix-dsv4-skip-topk-49486.sh hotfix-dsv4-dense-prefill-indexer-48407.sh hotfix-dsv4-skip-empty-c128-48957.sh hotfix-dsv4-flashmla-workspace-50298.sh hotfix-dsv4-grammar-advance.sh; do if [ ! -f /opt/dspark-patches/$${_hf} ]; then echo "FATAL: /opt/dspark-patches/$${_hf} missing" >&2; exit 1; fi; bash /opt/dspark-patches/$${_hf} || exit 1; done; fi;
         if [ "$${_dspark_keys_set}" = "1" ] || [ -n "$${VLLM_API_KEY:-}" ]; then bash /opt/dspark-patches/hotfix-vllm-redact-api-key-log.sh || exit 1; bash /opt/dspark-patches/hotfix-vllm-redact-api-key-log.sh --status || exit 1; fi;
+        if [ "$${VLLM_ENABLE_RESPONSES_API_STORE:-0}" != "1" ]; then export VLLM_ENABLE_RESPONSES_API_STORE=0; fi; if [ "$${VLLM_ENABLE_RESPONSES_API_STORE}" = "1" ]; then python3 /opt/hotfix-dsv4-responses-store.py || exit 1; fi;
         if [ "$${DSPARK_ENABLE_ISSUE138_RESPONSES_HISTORY_COMPAT:-0}" = "1" ]; then python3 /opt/hotfix-vllm-issue138-responses-history.py || exit 1; fi;
         if [ "$${DSPARK_ENABLE_CODEX_AGENT_MESSAGE_COMPAT:-0}" = "1" ]; then python3 /opt/hotfix-vllm-codex-agent-message.py || exit 1; fi;
         python3 /opt/hotfix-dsv4-vision-exp.py || exit 1; if [ "$${DSPARK_ENABLE_ISSUE141_SPARSE_MLA_CHUNK:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-issue141-sparse-mla-decode-chunk.py || exit 1; fi; if [ "$${DSPARK_ENABLE_SP_INDEXER:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-sp-indexer-prefill.py || exit 1; fi; if [ "$${DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS:-0}" = "1" ]; then bash /opt/dspark-patches/hotfix-deepgemm-sm121-mqa-header-alias.sh || exit 1; fi; python3 /opt/hotfix-vllm-empty-encoder-output.py || exit 1; python3 /opt/hotfix-dsv4-issue27-partial-prefill-concurrency.py || exit 1; if [ "$${DSPARK_ENABLE_ADAPTIVE_CHUNK:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-adaptive-prefill-chunk.py || exit 1; fi; if [ "$${DSPARK_ENABLE_REPLICATE_MARKOV:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-replicate-markov-head.py || exit 1; fi; python3 /opt/hotfix-dsv4-issue43-decode-fairness-and-diag.py || exit 1; python3 /opt/hotfix-dsv4-issue26-hybrid-swa-min.py || exit 1; python3 /opt/hotfix-dsv4-issue133-triton-specialization.py || exit 1; if [ "$${DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX:-0}" != "1" ]; then python3 /opt/hotfix-dsv4-suppress-stops-in-reasoning.py || exit 1; fi; VLLM_QUANTIZATION_ARGS="";
