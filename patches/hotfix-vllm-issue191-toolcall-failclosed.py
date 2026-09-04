@@ -54,8 +54,8 @@ PRISTINE_SIZE = 49_931
 # Post-issue55 bytes (issue #55 hotfix is unconditional in Compose).
 STOCK_SHA256 = "08ddb5f3b6cd8dd465208e787a7cdb45da308ffeb4e7bc5f8d40ccdec8e15f77"
 STOCK_SIZE = 51_928
-PATCHED_SHA256 = "873ac9c6c4a9d27d78e86dd100eb317518816a4fb53502fc13f6fcca78538cdd"
-PATCHED_SIZE = 63123
+PATCHED_SHA256 = "bfeccebf2f304e4e018198ea785c94a39e782dda4d6feada548b15eddf7a4916"
+PATCHED_SIZE = 63087
 MARK = "# [issue191-hotfix] fail-closed named/required tool_choice contract"
 ISSUE55_MARK = "# [issue55-hotfix] tool-call truncation safety"
 
@@ -197,8 +197,8 @@ def _issue191_schema_error(value, schema):
         validator_cls = _js.validators.validator_for(schema)
         validator_cls.check_schema(schema)
         error = next(iter(validator_cls(schema).iter_errors(value)), None)
-    except Exception as exc:  # malformed schema: never fail the request on it
-        return f"schema-validator-error:{type(exc).__name__}"
+    except Exception:  # malformed schema or validator error: not a client violation
+        return None
     if error is None:
         return None
     path = "/".join(str(part) for part in error.absolute_path)

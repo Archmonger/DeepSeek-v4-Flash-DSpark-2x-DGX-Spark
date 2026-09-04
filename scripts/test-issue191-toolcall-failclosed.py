@@ -253,6 +253,27 @@ class ContractSemantics(unittest.TestCase):
             else:
                 sys.modules["jsonschema"] = saved
         self.assertTrue(calls)
+    def test_schema_validator_error_is_not_a_violation(self):
+        # D1: a malformed schema or jsonschema validator/meta failure must
+        # never fail the request — the exception arm returns None, not a
+        # "schema-validator-error" contract violation.
+        class _ExplodingValidator:
+            def __init__(self, schema):
+                raise RuntimeError("meta-validation exploded")
+
+        fake = types.ModuleType("jsonschema")
+        fake.validators = NS(validator_for=lambda schema: _ExplodingValidator)
+        saved = sys.modules.get("jsonschema")
+        sys.modules["jsonschema"] = fake
+        try:
+            err = self.ns["_issue191_schema_error"]
+            self.assertIsNone(err({"event_id": "a"}, _tool().function.parameters))
+            self.assertIsNone(err({"event_id": "a"}, {"type": "definitely not a schema"}))
+        finally:
+            if saved is None:
+                del sys.modules["jsonschema"]
+            else:
+                sys.modules["jsonschema"] = saved
 
     def test_env_knobs(self):
         import os
