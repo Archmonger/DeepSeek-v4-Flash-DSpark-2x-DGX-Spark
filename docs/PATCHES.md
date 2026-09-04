@@ -756,6 +756,83 @@ incident closed until the two-rank canary and log/health gate above pass.
 
 ---
 
+## Issue #191 — fail-closed named/required `tool_choice` contract (default OFF)
+
+**Symptom.** With Vision-Exp (`n_predict=3`, `MTP_NUM_TOKENS=6`), async
+scheduling and TP=2, the shipped 145-case `scripts/verify-issue136-xgrammar-live.py`
+gate scored `142/145` twice at concurrency 4: HTTP 200 responses with zero
+`tool_calls` (named and `required` lanes) or arguments that violate the
+`strict` schema. Failing labels changed between runs and every failed case
+replayed `18/18` clean, so this is a concurrency-dependent engine race, not a
+prompt problem. See MIA issue #191.
+
+**Where the contract leaks.** `_create_chat_completion` returns
+`chat_completion_full_generator(...)` directly; that path serialises
+`tool_calls or []` for named/required choices with no terminal check.
+
+**What the engine actually does (measured 2026-09-03, async on and off).**
+The DeepSeek-V4 named/required structural tag is a strict *sequence*
+(`\n\n<｜DSML｜tool_calls>\n` … `</｜DSML｜tool_calls>`, `deepseek_xml` schema
+style) and XGrammar 0.2.3 enforces `required`, property order and
+`additionalProperties` on it (verified on CPU with the model tokenizer). The
+scheduler never logged `Unexpected: grammar rejected tokens`; every
+`Failed to advance FSM` line came from the *tolerated* branch of
+`StructuredOutputManager.grammar_bitmask` — drafts proposed after a mid-window
+`</think>` are checked against the fresh grammar and rejected (they predate the
+mask), which is expected and harmless but logged at ERROR. With
+`chat_template_kwargs.thinking=false` the same 145-case gate produces zero such
+lines. The real residual failure is reasoning length: see hunk 3 above. The
+`-1` placeholder / single-slot draft hand-off of async scheduling (vLLM #49694 /
+#54437) remains a code-level fail-open hazard, but it was not the observed cause
+(same violation rate with `DSPARK_ASYNC_SCHEDULING=0`).
+
+**What the patcher does.** `patches/hotfix-vllm-issue191-toolcall-failclosed.py`
+(source-exact, post-issue55 identity `08ddb5f3…`, patched identity `873ac9c6…`)
+adds two hunks to `entrypoints/openai/chat_completion/serving.py`:
+
+1. helper block after `_dsml_issue55_json_ok`: `_issue191_tool_contract_violation(request, response)`
+   returns `None` or a short reason (`tool-call-cardinality:N`, `tool-call-name`,
+   `tool-arguments-json`, `tool-arguments-type`, `tool-arguments-schema:<path>:<keyword>`,
+   `tool-call-truncated`, `no-choices`). Schema checks use the image's
+   `jsonschema` (4.26.0) and fall back to a required/type/additionalProperties
+   checker; a malformed schema never fails the request.
+2. tail of `_create_chat_completion`: on a violation log one WARNING
+   `[issue191-toolcall] contract violation request=… attempt=… mode=… reason=…`,
+   then (mode `failclosed`) regenerate the same engine input with a fresh engine
+   request id (`<id>-issue191r<n>`, client-visible id unchanged) up to
+   `DSPARK_ISSUE191_TOOLCALL_RETRIES` times and finally answer HTTP 500; mode
+   `log` returns the response unchanged. Beam search is never retried; a
+   `length` finish counts as a violation only when it left no tool call. Streaming is out of scope (chunks are already sent).
+3. **thinking-off fallback on the last retry** (`DSPARK_ISSUE191_TOOLCALL_THINKOFF_FALLBACK`,
+   default `1`). The 2026-09-03 measurement found the residual violations are
+   not grammar desync at all: with `thinking=true, reasoning_effort=low` a
+   fraction of strict requests reason for 300–500 tokens (non-deterministic
+   across batches even at temperature 0), so `max_tokens=512` cuts the reply
+   before or inside the DSML call (`finish_reason=length`, zero or a salvaged
+   partial call). Replaying the identical engine input mostly replays the
+   problem. The last `failclosed` attempt therefore swaps the prompt's trailing
+   `<think>` marker (id taken from the request's reasoning parser) for
+   `</think>` — byte-identical to rendering the chat with `thinking=false` —
+   passes `reasoning_ended=True` and thinking-off `chat_template_kwargs` to the
+   engine, and parses the reply with a thinking-off parser. The grammar then
+   constrains the reply from its first token and the call fits the client's
+   budget. The fallback only fires when the prompt ends with `<think>` (otherwise
+   the retry is identical); the log line `[issue191-toolcall] regenerating … fallback=thinkoff`
+   marks it. `0` keeps every retry identical.
+
+**Gates.** Default `0` changes no bytes. `1` requires the exact pinned identity
+on both ranks (`--check` preflight worker then head, apply at container start,
+post-apply digest verification, atomic same-directory replace). CPU suite:
+`python3 scripts/test-issue191-toolcall-failclosed.py`. Live acceptance: the
+145-case gate must reach `145/145` with the hotfix on, and the WARNING count
+in `docker logs` is the measured raw violation rate.
+
+**Companion knob.** `DSPARK_ASYNC_SCHEDULING=0` removes `--async-scheduling` on
+both ranks so the grammar bitmask rows are built from real draft tokens; it is
+the single-variable A/B for the engine-side trigger and costs decode throughput.
+
+---
+
 ## Issue #117 — bounded SHM dispatch-ring reader recovery
 
 ### Scope and upstream fix
