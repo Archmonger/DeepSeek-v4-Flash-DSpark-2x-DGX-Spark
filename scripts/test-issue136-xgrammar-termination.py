@@ -561,12 +561,6 @@ class PatcherTestBase(unittest.TestCase):
             "structured_output_init": manager,
         }
 
-    def backend_spec(self):
-        return BACKEND_SPEC
-
-    def manager_spec(self):
-        return MANAGER_SPEC
-
     def publish_one(self, spec, target, data):
         inspection = PATCHER.inspect_target(spec, target)
         candidate = PATCHER.build_candidate(spec, inspection.variant, inspection.data)

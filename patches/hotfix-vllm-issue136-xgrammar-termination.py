@@ -669,22 +669,21 @@ def apply(
 
     # Build and compile every candidate before the first write.
     candidates = [build_candidate(spec, insp.variant, insp.data) for spec, insp in to_publish]
-    candidates_by_name = {spec.name: cand for (spec, _), cand in zip(to_publish, candidates)}
 
-    published_so_far: list[tuple[TargetSpec, Path, Inspection]] = []
+    published_so_far: list[tuple[TargetSpec, Path, Inspection, bytes]] = []
     try:
         for (spec, insp), candidate in zip(to_publish, candidates):
             path = targets[spec.name]
             _publish_one(spec, path, insp, candidate)
-            published_so_far.append((spec, path, insp))
+            published_so_far.append((spec, path, insp, candidate))
     except BaseException as primary_error:
         # Roll earlier publications back in reverse order.  _publish_one
         # already restored its own target when its publication failed, so only
         # fully completed earlier writes need rollback here.
         rollback_failures: list[str] = []
-        for spec, path, insp in reversed(published_so_far):
+        for spec, path, insp, candidate in reversed(published_so_far):
             try:
-                _publish_one_restore(spec, path, insp, candidates_by_name[spec.name])
+                _publish_one_restore(spec, path, insp, candidate)
             except BaseException as rollback_error:
                 rollback_failures.append(
                     f"{spec.name}:{type(rollback_error).__name__}"
