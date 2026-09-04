@@ -594,7 +594,7 @@ python3 scripts/test-issue141-sparse-mla-decode-chunk.py
 
 ---
 
-## Issue #136 — XGrammar accepts speculative tokens after termination
+## Issues #136 + #210 — XGrammar termination and post-reasoning FSM chain
 
 ### Symptom and source fix
 
@@ -619,23 +619,59 @@ the grammar state machine.
   and returns no speculative drafts after cached termination;
 - `reset` clears the matcher, counter, and cached termination flag.
 
-This is disjoint from the existing #44993 grammar-advance backport:
-`hotfix-dsv4-grammar-advance.sh` changes only
-`v1/structured_output/__init__.py` and `v1/core/sched/scheduler.py`; issue #136
-changes only `v1/structured_output/backend_xgrammar.py`.
+The same flag then applies the single-hunk vLLM PR
+[#53046](https://github.com/vllm-project/vllm/pull/53046) (issue #210) to
+`v1/structured_output/__init__.py`: in `grammar_bitmask`'s speculative window,
+a draft after the reasoning-end marker is checked with `validate_tokens`
+before `accept_tokens`, so a grammar-invalid draft that predates the bitmask
+is skipped instead of tripping the spurious `Failed to advance FSM` error
+path. No output corruption was demonstrated for the prior code, but the FSM
+state path is correctness-sensitive; the upstream fix removes the desync risk
+class. The reporter measured their best tool-evaluation result on this recipe
+with both backports active.
+
+One flag, one transaction: both candidates are built and compiled before
+either file is written; publication is per-file atomic in chain order
+(backend first), and a second-file failure rolls the first file back to its
+exact original bytes (refusing to clobber a concurrent change). A pre-chain
+#136-only state (backend patched, manager stock) is completed by publishing
+the manager file only; the inverse mix is refused as invalid.
+
+Relationship to the #44993 grammar-advance train: both patchers now touch
+`v1/structured_output/__init__.py`, on non-overlapping regions (proven
+byte-exact in both application orders by the test suite). Compose order is
+fixed — the default train runs first — so the chain normally sees the
+post-#44993 file; with `DSPARK_SKIP_HOTFIX=1` it sees the pristine pinned
+image. The patcher pins BOTH stock identities (post-#44993 and pristine) with
+their respective post-images; neither is a prerequisite of the other.
 
 ### Compatibility and exact identities
 
 Enabled mode accepts only all of the following:
 
-- image `ghcr.io/anemll/dspark-vllm-gx10:0.1.1@sha256:a83948492cf13df455170fb42885f5ef4db54fefe0feff0f841ecbff464ac9d8`;
+- image `ghcr.io/anemll/dspark-vllm-gx10:0.1.1@sha256:a83948492cf13df455170fb42885f5ef4db54fefe0feff0f841ecbff464ac9d8`
+  — the registry manifest digest (the repo's pin). It resolves directly (no
+  index layer) to config/image ID `sha256:3430d6614a8e2925f34d059af6caf05aff42387326db4d05639a60f10f2654d8`
+  on a pulled host (`docker image inspect .Id`); both names refer to the same
+  image, and the pristine manager fixture was extracted from a fresh
+  `docker create` of it.
 - installed metadata `vllm==0.25.2.dev0+g752a3a504.d20260714` and
   `xgrammar==0.2.3`;
 - stock target SHA-256
   `231f6b9d7dab5e8d68aba486fa5912db99f8bdd3f9d8842ee3e0bb12bdb7cb67`
   (12,699 bytes), or exact post-image SHA-256
   `6c7e23c0ae5c6836d0d56862c6e825c49727fa2409b881b44ea2526f1fd03f04`
-  (12,983 bytes).
+  (12,983 bytes);
+- manager target `v1/structured_output/__init__.py`, two legitimate stock
+  identities with their post-images: post-#44993
+  `e782163b8a83d58e61a655df042d3126cde8c913a2eeaf9d4a061148cd8e5c77`
+  (21,979 bytes) →
+  `3dff0e1e35f04f35e8c50c17d9efa65cd5fc8db1f25d4eb5d536b6e61114a616`
+  (22,271 bytes), or pristine
+  `fd23813a4e0d8cdc93fa1e6687e5a4f4e514b0ae37dec707d50d840771390818`
+  (22,076 bytes) →
+  `53186ccf86e3d620a9aa91af8c541516f0b45a3f640d937607a252bc42f376e6`
+  (22,368 bytes).
 
 Anything else—including another vLLM/xgrammar version, a symlink, partial
 application, or drift before/inside/after the method region—is incompatible.
@@ -664,7 +700,7 @@ docker compose --env-file .env.dspark -f docker-compose.dspark.yml run \
   /opt/hotfix-vllm-issue136-xgrammar-termination.py --check
 ```
 
-Running-container status (`patched` exits 0, `stock-compatible` exits 1,
+Running-container status (`patched` exits 0, `stock` or `partial-invalid` exits 1,
 `incompatible` exits 2):
 
 ```bash

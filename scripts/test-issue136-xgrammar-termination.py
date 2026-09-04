@@ -26,6 +26,13 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "scripts" / "fixtures" / "issue136"
 STOCK_FIXTURE = FIXTURES / "backend_xgrammar-752a3a504.py"
 POST_FIXTURE = FIXTURES / "backend_xgrammar-752a3a504-pr52805.py"
+MANAGER_STOCK_FIXTURE = FIXTURES / "structured_output_init-752a3a504.py"
+MANAGER_POST_FIXTURE = FIXTURES / "structured_output_init-752a3a504-pr53046.py"
+MANAGER_PRISTINE_FIXTURE = FIXTURES / "structured_output_init-752a3a504-pristine.py"
+MANAGER_PRISTINE_POST_FIXTURE = FIXTURES / "structured_output_init-752a3a504-pristine-pr53046.py"
+# Fixture provenance: extracted from the pinned image (registry manifest
+# sha256:a8394849… = local config/image ID sha256:3430d661…). The non-pristine
+# pair additionally carries the default #44993 grammar-advance train.
 PATCHER_PATH = ROOT / "patches" / "hotfix-vllm-issue136-xgrammar-termination.py"
 COMPOSE = ROOT / "docker-compose.dspark.yml"
 START = ROOT / "start-deepseek-v4-flash-dspark.sh"
@@ -39,6 +46,43 @@ STOCK_BYTES = 12_699
 POST_BYTES = 12_983
 EXPECTED_VLLM = "0.25.2.dev0+g752a3a504.d20260714"
 EXPECTED_XGRAMMAR = "0.2.3"
+MANAGER_STOCK_SHA256 = "e782163b8a83d58e61a655df042d3126cde8c913a2eeaf9d4a061148cd8e5c77"
+MANAGER_POST_SHA256 = "3dff0e1e35f04f35e8c50c17d9efa65cd5fc8db1f25d4eb5d536b6e61114a616"
+MANAGER_STOCK_BYTES = 21_979
+MANAGER_POST_BYTES = 22_271
+MANAGER_PRISTINE_SHA256 = "fd23813a4e0d8cdc93fa1e6687e5a4f4e514b0ae37dec707d50d840771390818"
+MANAGER_PRISTINE_POST_SHA256 = "53186ccf86e3d620a9aa91af8c541516f0b45a3f640d937607a252bc42f376e6"
+MANAGER_PRISTINE_BYTES = 22_076
+MANAGER_PRISTINE_POST_BYTES = 22_368
+# Independent literal description of the single upstream #53046 hunk (issue
+# 210): inside grammar_bitmask's speculative window, a post-reasoning-end
+# draft is validated before it is accepted, so a grammar-invalid draft that
+# predates the bitmask no longer trips a spurious FSM error.
+MANAGER_OLD = (
+    b"                    if advance_grammar and not grammar.is_terminated():\n"
+    b"                        accepted = grammar.accept_tokens(req_id, [token])\n"
+    b"                        if accepted:\n"
+    b"                            state_advancements += 1\n"
+    b"                        elif not post_reasoning_end_in_window:\n"
+    b"                            raise AssertionError(\n"
+    b"                                (token, req_id, scheduled_spec_decode_tokens)\n"
+    b"                            )\n"
+)
+MANAGER_NEW = (
+    b"                    if advance_grammar and not grammar.is_terminated():\n"
+    b"                        if post_reasoning_end_in_window:\n"
+    b"                            accepted = bool(grammar.validate_tokens([token]))\n"
+    b"                            if accepted:\n"
+    b"                                accepted = grammar.accept_tokens(req_id, [token])\n"
+    b"                        else:\n"
+    b"                            accepted = grammar.accept_tokens(req_id, [token])\n"
+    b"                        if accepted:\n"
+    b"                            state_advancements += 1\n"
+    b"                        elif not post_reasoning_end_in_window:\n"
+    b"                            raise AssertionError(\n"
+    b"                                (token, req_id, scheduled_spec_decode_tokens)\n"
+    b"                            )\n"
+)
 REGION_START = b"    def accept_tokens("
 REGION_SENTINEL = (
     b"# cf https://github.com/mlc-ai/xgrammar/blob/"
@@ -170,6 +214,41 @@ def load_patcher():
 
 
 PATCHER = load_patcher()
+BACKEND_SPEC = next(t for t in PATCHER.TARGETS if t.name == "backend_xgrammar")
+MANAGER_SPEC = next(t for t in PATCHER.TARGETS if t.name == "structured_output_init")
+
+def load_transaction_parser():
+    spec = importlib.util.spec_from_file_location(
+        "hotfix_atomic_transaction",
+        ROOT / "scripts" / "test-hotfix-atomic-transaction.py",
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load the atomic-transaction harness")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def grammar_advance_hunks():
+    """The production #44993 __init__.py hunks, parsed from the shell script."""
+    module = load_transaction_parser()
+    found = [
+        h
+        for h in module.hunks("hotfix-dsv4-grammar-advance.sh")
+        if h.path.endswith("v1/structured_output/__init__.py")
+    ]
+    if len(found) != 2:
+        raise RuntimeError("expected exactly two #44993 __init__.py hunks")
+    return found
+
+
+def apply_hunks(text: str, found) -> str:
+    for hunk in found:
+        if text.count(hunk.old) != hunk.expect:
+            raise AssertionError(f"hunk anchor count != expect={hunk.expect} ({hunk.label})")
+        text = text.replace(hunk.old, hunk.new, hunk.expect)
+    return text
 
 
 def provider(
@@ -278,7 +357,7 @@ def grammar_instance(source: bytes):
 
 
 def temp_artifacts(directory: Path) -> list[Path]:
-    return sorted(directory.glob(".backend_xgrammar.py.issue136-*.tmp"))
+    return sorted(directory.glob("*.issue136-*.tmp"))
 
 
 class FixtureProvenanceTests(unittest.TestCase):
@@ -286,6 +365,8 @@ class FixtureProvenanceTests(unittest.TestCase):
     def setUpClass(cls):
         cls.stock = STOCK_FIXTURE.read_bytes()
         cls.post = POST_FIXTURE.read_bytes()
+        cls.manager_stock = MANAGER_STOCK_FIXTURE.read_bytes()
+        cls.manager_post = MANAGER_POST_FIXTURE.read_bytes()
 
     def test_full_fixture_identities(self):
         self.assertEqual((len(self.stock), len(self.post)), (STOCK_BYTES, POST_BYTES))
@@ -304,6 +385,59 @@ class FixtureProvenanceTests(unittest.TestCase):
             self.assertEqual(generated.count(new), 0)
             generated = generated.replace(old, new, 1)
         self.assertEqual(generated, self.post)
+    def test_manager_fixture_identities(self):
+        self.assertEqual(
+            (len(self.manager_stock), len(self.manager_post)),
+            (MANAGER_STOCK_BYTES, MANAGER_POST_BYTES),
+        )
+        self.assertEqual(
+            (sha256(self.manager_stock), sha256(self.manager_post)),
+            (MANAGER_STOCK_SHA256, MANAGER_POST_SHA256),
+        )
+        compile(self.manager_stock.decode("utf-8"), MANAGER_STOCK_FIXTURE.name, "exec")
+        compile(self.manager_post.decode("utf-8"), MANAGER_POST_FIXTURE.name, "exec")
+
+    def test_only_the_53046_hunk_changes_in_the_manager(self):
+        self.assertEqual(self.manager_stock.count(MANAGER_OLD), 1)
+        self.assertEqual(self.manager_stock.count(MANAGER_NEW), 0)
+        generated = self.manager_stock.replace(MANAGER_OLD, MANAGER_NEW, 1)
+        self.assertEqual(generated, self.manager_post)
+        self.assertEqual(self.manager_post.count(MANAGER_NEW), 1)
+        self.assertEqual(self.manager_post.count(MANAGER_OLD), 0)
+    def test_pristine_variant_hunk_and_identity(self):
+        pristine = MANAGER_PRISTINE_FIXTURE.read_bytes()
+        pristine_post = MANAGER_PRISTINE_POST_FIXTURE.read_bytes()
+        self.assertEqual((len(pristine), len(pristine_post)), (MANAGER_PRISTINE_BYTES, MANAGER_PRISTINE_POST_BYTES))
+        self.assertEqual((sha256(pristine), sha256(pristine_post)), (MANAGER_PRISTINE_SHA256, MANAGER_PRISTINE_POST_SHA256))
+        # the #53046 anchor is present exactly once in both stock variants
+        self.assertEqual(pristine.count(MANAGER_OLD), 1)
+        self.assertEqual(pristine.replace(MANAGER_OLD, MANAGER_NEW, 1), pristine_post)
+        compile(pristine.decode("utf-8"), MANAGER_PRISTINE_FIXTURE.name, "exec")
+        compile(pristine_post.decode("utf-8"), MANAGER_PRISTINE_POST_FIXTURE.name, "exec")
+
+    def test_both_application_orders_converge(self):
+        # Apply the PRODUCTION #44993 hunks (parsed from the shell script, not
+        # fixture-derived) around the #53046 hunk in both orders; both must
+        # yield the checked-in post-#44993 + #53046 post-image byte-for-byte.
+        pristine = MANAGER_PRISTINE_FIXTURE.read_text()
+        pristine_post = MANAGER_PRISTINE_POST_FIXTURE.read_text()
+        hunks44993 = grammar_advance_hunks()
+        # the production #44993 literals transform pristine into the post-#44993
+        # stock fixture exactly (also proves the parsed hunks are complete)
+        trained = apply_hunks(pristine, hunks44993)
+        self.assertEqual(trained, self.manager_stock.decode("utf-8"))
+        manager_old = MANAGER_OLD.decode("utf-8")
+        manager_new = MANAGER_NEW.decode("utf-8")
+        # production boot order: #44993 train first, then this chain
+        self.assertEqual(
+            trained.replace(manager_old, manager_new, 1),
+            self.manager_post.decode("utf-8"),
+        )
+        # reverse order: #53046 on pristine, then the same production hunks
+        self.assertEqual(
+            apply_hunks(pristine.replace(manager_old, manager_new, 1), hunks44993),
+            self.manager_post.decode("utf-8"),
+        )
 
     def test_region_hashes_and_outside_bytes(self):
         stock_prefix, stock_region, stock_suffix = method_region(self.stock)
@@ -314,16 +448,23 @@ class FixtureProvenanceTests(unittest.TestCase):
         self.assertEqual(stock_suffix, post_suffix)
 
     def test_production_patcher_generates_checked_in_post_fixture(self):
-        self.assertEqual(PATCHER.build_candidate(self.stock), self.post)
+        self.assertEqual(PATCHER.build_candidate(BACKEND_SPEC, BACKEND_SPEC.variants[0], self.stock), self.post)
 
     def test_issue44993_patch_targets_are_disjoint(self):
+        # File-level disjointness no longer holds: the #136+#210 chain and #44993
+        # both touch v1/structured_output/__init__.py.  Region-level disjointness
+        # does: the production #44993 hunks and the #53046 hunk anchor on
+        # non-overlapping text (proven constructively in
+        # test_both_application_orders_converge), and #44993's shell script does
+        # not touch the chain's backend file.
         grammar_advance = GRAMMAR_ADVANCE.read_text(encoding="utf-8")
         self.assertNotIn("backend_xgrammar.py", grammar_advance)
         self.assertIn("v1/structured_output/__init__.py", grammar_advance)
         self.assertIn("v1/core/sched/scheduler.py", grammar_advance)
-        stock_prefix, _, stock_suffix = method_region(self.stock)
-        post_prefix, _, post_suffix = method_region(self.post)
-        self.assertEqual((stock_prefix, stock_suffix), (post_prefix, post_suffix))
+        stock = MANAGER_PRISTINE_FIXTURE.read_text()
+        for hunk in grammar_advance_hunks():
+            self.assertNotIn(hunk.old, MANAGER_NEW.decode("utf-8"))
+            self.assertNotIn(hunk.new, MANAGER_NEW.decode("utf-8"))
 
 
 class ExtractedBehaviorTests(unittest.TestCase):
@@ -405,6 +546,26 @@ class PatcherTestBase(unittest.TestCase):
     def setUpClass(cls):
         cls.stock = STOCK_FIXTURE.read_bytes()
         cls.post = POST_FIXTURE.read_bytes()
+        cls.manager_stock = MANAGER_STOCK_FIXTURE.read_bytes()
+        cls.manager_post = MANAGER_POST_FIXTURE.read_bytes()
+
+    def write_manager(self, directory: Path, data: bytes, mode: int = 0o640) -> Path:
+        target = directory / "structured_output_init.py"
+        target.write_bytes(data)
+        target.chmod(mode)
+        return target
+
+    def targets(self, backend: Path, manager: Path) -> dict:
+        return {
+            "backend_xgrammar": backend,
+            "structured_output_init": manager,
+        }
+
+    def publish_one(self, spec, target, data):
+        inspection = PATCHER.inspect_target(spec, target)
+        candidate = PATCHER.build_candidate(spec, inspection.variant, inspection.data)
+        PATCHER._publish_one(spec, target, inspection, candidate)
+        return inspection, candidate
 
     def write_target(self, directory: Path, data: bytes, mode: int = 0o640) -> Path:
         target = directory / "backend_xgrammar.py"
@@ -429,56 +590,76 @@ class PatcherCompatibilityTests(PatcherTestBase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             target = self.write_target(directory, self.stock, 0o604)
-            result = PATCHER.apply(target, provider())
+            manager = self.write_manager(directory, self.manager_stock, 0o604)
+            result = PATCHER.apply(self.targets(target, manager), provider())
             self.assertEqual(result.outcome, "applied")
             self.assertEqual(target.read_bytes(), self.post)
+            self.assertEqual(manager.read_bytes(), self.manager_post)
             self.assertEqual(sha256(target.read_bytes()), POST_SHA256)
+            self.assertEqual(sha256(manager.read_bytes()), MANAGER_POST_SHA256)
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o604)
+            self.assertEqual(stat.S_IMODE(manager.stat().st_mode), 0o604)
             self.assertEqual(temp_artifacts(directory), [])
 
     def test_second_apply_and_exact_post_are_successful_nowrites(self):
-        for initial, first_apply in ((self.stock, True), (self.post, False)):
+        for (backend_data, manager_data), first_apply in (
+            ((self.stock, self.manager_stock), True),
+            ((self.post, self.manager_post), False),
+        ):
             with self.subTest(first_apply=first_apply), tempfile.TemporaryDirectory() as tmp:
                 directory = Path(tmp)
-                target = self.write_target(directory, initial)
+                target = self.write_target(directory, backend_data)
+                manager = self.write_manager(directory, manager_data)
                 if first_apply:
-                    PATCHER.apply(target, provider())
+                    PATCHER.apply(self.targets(target, manager), provider())
                 before = self.snapshot(target)
-                result = PATCHER.apply(target, provider())
+                before_manager = self.snapshot(manager)
+                result = PATCHER.apply(self.targets(target, manager), provider())
                 self.assertEqual(result.outcome, "already-patched")
                 self.assert_snapshot(target, before)
+                self.assert_snapshot(manager, before_manager)
                 self.assertEqual(temp_artifacts(directory), [])
 
     def test_check_and_status_classify_without_writes(self):
-        for data, expected_state in ((self.stock, "stock-compatible"), (self.post, "patched")):
+        for data, expected_state in ((self.stock, "stock"), (self.post, "patched")):
             with self.subTest(state=expected_state), tempfile.TemporaryDirectory() as tmp:
                 target = self.write_target(Path(tmp), data)
                 before = self.snapshot(target)
-                inspection = PATCHER.inspect_target(target, provider())
+                inspection = PATCHER.inspect_target(BACKEND_SPEC, target)
                 self.assertEqual(inspection.state, expected_state)
                 self.assert_snapshot(target, before)
 
     def test_cli_check_and_status_exit_codes(self):
         cases = (
-            (self.stock, ["--check"], 0, "compatible: stock-compatible"),
-            (self.post, ["--check"], 0, "compatible: patched"),
-            (self.stock, ["--status"], 1, "stock-compatible"),
-            (self.post, ["--status"], 0, "patched"),
-            (self.stock + b"# drift\n", ["--status"], 2, "incompatible"),
+            ((self.stock, self.manager_stock), ["--check"], 0, "compatible: stock"),
+            ((self.post, self.manager_post), ["--check"], 0, "compatible: patched"),
+            ((self.post, self.manager_stock), ["--check"], 0, "compatible: partial-legacy"),
+            ((self.stock, self.manager_post), ["--check"], 2, "incompatible: partial-invalid"),
+            ((self.stock, self.manager_stock), ["--status"], 1, "stock"),
+            ((self.post, self.manager_post), ["--status"], 0, "patched"),
+            ((self.post, self.manager_stock), ["--status"], 1, "partial-invalid"),
+            ((self.stock, self.manager_post), ["--status"], 1, "partial-invalid"),
+            ((self.stock + b"# drift\n", self.manager_stock), ["--status"], 2, "incompatible"),
         )
-        for data, argv, expected_rc, output in cases:
+        for (backend_data, manager_data), argv, expected_rc, output in cases:
             with self.subTest(argv=argv, rc=expected_rc), tempfile.TemporaryDirectory() as tmp:
-                target = self.write_target(Path(tmp), data)
+                directory = Path(tmp)
+                target = self.write_target(directory, backend_data)
+                manager = self.write_manager(directory, manager_data)
                 before = self.snapshot(target)
+                before_manager = self.snapshot(manager)
                 stdout = io.StringIO()
                 stderr = io.StringIO()
-                with mock.patch.object(PATCHER, "PRODUCTION_TARGET", target), mock.patch.object(
+                with mock.patch.object(
+                    PATCHER, "_production_targets", lambda: self.targets(target, manager)
+                ), mock.patch.object(
                     PATCHER.importlib.metadata, "version", provider()
                 ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                     rc = PATCHER.main(argv)
                 self.assertEqual(rc, expected_rc)
                 self.assertIn(output, stdout.getvalue())
                 self.assert_snapshot(target, before)
+                self.assert_snapshot(manager, before_manager)
 
     def test_wrong_or_missing_metadata_fails_unchanged(self):
         cases = (
@@ -489,29 +670,36 @@ class PatcherCompatibilityTests(PatcherTestBase):
         )
         for metadata_provider in cases:
             with self.subTest(provider=metadata_provider), tempfile.TemporaryDirectory() as tmp:
-                target = self.write_target(Path(tmp), self.stock)
+                directory = Path(tmp)
+                target = self.write_target(directory, self.stock)
+                manager = self.write_manager(directory, self.manager_stock)
                 before = self.snapshot(target)
+                before_manager = self.snapshot(manager)
                 with self.assertRaises(PATCHER.CompatibilityError):
-                    PATCHER.apply(target, metadata_provider)
+                    PATCHER.apply(self.targets(target, manager), metadata_provider)
                 self.assert_snapshot(target, before)
+                self.assert_snapshot(manager, before_manager)
 
     def test_missing_directory_and_symlink_targets_fail(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
+            manager = self.write_manager(directory, self.manager_stock)
             missing = directory / "missing.py"
             with self.assertRaises(PATCHER.CompatibilityError):
-                PATCHER.apply(missing, provider())
+                PATCHER.apply(self.targets(missing, manager), provider())
 
             with self.assertRaises(PATCHER.CompatibilityError):
-                PATCHER.apply(directory, provider())
+                PATCHER.apply(self.targets(directory, manager), provider())
 
             real = self.write_target(directory, self.stock)
             link = directory / "link.py"
             link.symlink_to(real)
             before = self.snapshot(real)
+            before_manager = self.snapshot(manager)
             with self.assertRaises(PATCHER.CompatibilityError):
-                PATCHER.apply(link, provider())
+                PATCHER.apply(self.targets(link, manager), provider())
             self.assert_snapshot(real, before)
+            self.assert_snapshot(manager, before_manager)
 
     def test_every_drift_class_fails_without_write(self):
         prefix, old_region, suffix = method_region(self.stock)
@@ -536,17 +724,34 @@ class PatcherCompatibilityTests(PatcherTestBase):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
                 directory = Path(tmp)
                 target = self.write_target(directory, data)
+                manager = self.write_manager(directory, self.manager_stock)
                 before = self.snapshot(target)
+                before_manager = self.snapshot(manager)
                 with self.assertRaises(PATCHER.CompatibilityError):
-                    PATCHER.apply(target, provider())
+                    PATCHER.apply(self.targets(target, manager), provider())
                 self.assert_snapshot(target, before)
+                self.assert_snapshot(manager, before_manager)
                 self.assertEqual(temp_artifacts(directory), [])
+
+        with self.subTest(name="manager-drift"), tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            target = self.write_target(directory, self.stock)
+            manager = self.write_manager(directory, self.manager_stock + b"# drift\n")
+            before = self.snapshot(target)
+            before_manager = self.snapshot(manager)
+            with self.assertRaises(PATCHER.CompatibilityError):
+                PATCHER.apply(self.targets(target, manager), provider())
+            self.assert_snapshot(target, before)
+            self.assert_snapshot(manager, before_manager)
+            self.assertEqual(temp_artifacts(directory), [])
 
     def test_candidate_syntax_failure_does_not_write(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             target = self.write_target(directory, self.stock)
+            manager = self.write_manager(directory, self.manager_stock)
             before = self.snapshot(target)
+            before_manager = self.snapshot(manager)
             real_compile = PATCHER._compile_source
 
             def fail_post(data: bytes, label: str) -> None:
@@ -556,12 +761,16 @@ class PatcherCompatibilityTests(PatcherTestBase):
 
             with mock.patch.object(PATCHER, "_compile_source", side_effect=fail_post):
                 with self.assertRaises(PATCHER.CompatibilityError):
-                    PATCHER.apply(target, provider())
+                    PATCHER.apply(self.targets(target, manager), provider())
             self.assert_snapshot(target, before)
+            self.assert_snapshot(manager, before_manager)
             self.assertEqual(temp_artifacts(directory), [])
 
-
 class PatcherFailureRecoveryTests(PatcherTestBase):
+    # Single-file publication/failure semantics are exercised through the
+    # per-target transaction helper directly; apply() itself is reserved for
+    # valid chain states (see ChainTransactionTests).
+
     def test_staging_creation_and_write_failures_leave_original(self):
         failures = (
             ("mkstemp", mock.patch.object(PATCHER.tempfile, "mkstemp", side_effect=OSError("injected"))),
@@ -574,7 +783,7 @@ class PatcherFailureRecoveryTests(PatcherTestBase):
                 before = self.snapshot(target)
                 with patch_context:
                     with self.assertRaises(OSError):
-                        PATCHER.apply(target, provider())
+                        self.publish_one(BACKEND_SPEC, target, self.stock)
                 self.assert_snapshot(target, before)
                 self.assertEqual(temp_artifacts(directory), [])
 
@@ -585,7 +794,7 @@ class PatcherFailureRecoveryTests(PatcherTestBase):
             before = self.snapshot(target)
             with mock.patch.object(PATCHER.os, "replace", side_effect=OSError("injected")):
                 with self.assertRaises(OSError):
-                    PATCHER.apply(target, provider())
+                    self.publish_one(BACKEND_SPEC, target, self.stock)
             self.assert_snapshot(target, before)
             self.assertEqual(temp_artifacts(directory), [])
 
@@ -606,7 +815,7 @@ class PatcherFailureRecoveryTests(PatcherTestBase):
 
             with mock.patch.object(PATCHER.os, "replace", side_effect=replace_then_raise):
                 with self.assertRaises(OSError):
-                    PATCHER.apply(target, provider())
+                    self.publish_one(BACKEND_SPEC, target, self.stock)
             self.assertEqual(calls, 2)
             self.assertEqual(target.read_bytes(), original)
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o605)
@@ -625,7 +834,7 @@ class PatcherFailureRecoveryTests(PatcherTestBase):
                 side_effect=KeyboardInterrupt("injected verification interrupt"),
             ):
                 with self.assertRaises(KeyboardInterrupt):
-                    PATCHER.apply(target, provider())
+                    self.publish_one(BACKEND_SPEC, target, self.stock)
             self.assertEqual(target.read_bytes(), original)
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o604)
             self.assertEqual(temp_artifacts(directory), [])
@@ -648,10 +857,260 @@ class PatcherFailureRecoveryTests(PatcherTestBase):
                 PATCHER, "_verify_published", side_effect=OSError("injected verification failure")
             ):
                 with self.assertRaises(PATCHER.RollbackError):
-                    PATCHER.apply(target, provider())
+                    self.publish_one(BACKEND_SPEC, target, self.stock)
             self.assertEqual(target.read_bytes(), self.post)
             self.assertEqual(temp_artifacts(directory), [])
 
+
+class ChainTransactionTests(PatcherTestBase):
+    def test_chain_publishes_both_files_in_chain_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            target = self.write_target(directory, self.stock)
+            manager = self.write_manager(directory, self.manager_stock)
+            order = []
+            real_publish = PATCHER._publish_one
+
+            def recording(spec, *args, **kwargs):
+                order.append(spec.name)
+                return real_publish(spec, *args, **kwargs)
+
+            with mock.patch.object(PATCHER, "_publish_one", side_effect=recording):
+                result = PATCHER.apply(self.targets(target, manager), provider())
+            self.assertEqual(result.outcome, "applied")
+            self.assertEqual(order, ["backend_xgrammar", "structured_output_init"])
+            self.assertEqual(target.read_bytes(), self.post)
+            self.assertEqual(manager.read_bytes(), self.manager_post)
+            self.assertEqual(temp_artifacts(directory), [])
+
+    def test_chain_second_file_failure_rolls_back_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            target = self.write_target(directory, self.stock, 0o604)
+            manager = self.write_manager(directory, self.manager_stock)
+            real_replace = PATCHER.os.replace
+
+            def fail_manager_candidate(src, dst):
+                if Path(dst) == manager and "issue136-" in Path(src).name:
+                    raise OSError("injected manager publish failure")
+                return real_replace(src, dst)
+
+            with mock.patch.object(PATCHER.os, "replace", side_effect=fail_manager_candidate):
+                with self.assertRaises(OSError):
+                    PATCHER.apply(self.targets(target, manager), provider())
+            self.assertEqual(target.read_bytes(), self.stock)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o604)
+            self.assertEqual(manager.read_bytes(), self.manager_stock)
+            self.assertEqual(temp_artifacts(directory), [])
+
+    def test_chain_rollback_refuses_to_clobber_concurrent_change(self):
+        # The manager publish fails after a concurrent writer changes the
+        # already-published backend bytes: rollback must refuse to clobber.
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            target = self.write_target(directory, self.stock)
+            manager = self.write_manager(directory, self.manager_stock)
+            concurrent = b"# concurrent change\n" + self.stock
+            real_verify = PATCHER._verify_published
+
+            def corrupt_backend_then_fail(spec, *args, **kwargs):
+                if spec.name == "structured_output_init":
+                    target.write_bytes(concurrent)
+                    raise OSError("injected manager verification failure")
+                return real_verify(spec, *args, **kwargs)
+
+            with mock.patch.object(PATCHER, "_verify_published", side_effect=corrupt_backend_then_fail):
+                with self.assertRaises(PATCHER.RollbackError):
+                    PATCHER.apply(self.targets(target, manager), provider())
+            self.assertEqual(target.read_bytes(), concurrent)
+            self.assertEqual(manager.read_bytes(), self.manager_stock)
+            self.assertEqual(temp_artifacts(directory), [])
+    def test_rollback_refuses_after_metadata_only_change(self):
+        # chmod lands on the already-published backend before the manager
+        # publish fails: the rollback must refuse (metadata mismatch), leaving
+        # the patched bytes with their new mode unclobbered.
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            target = self.write_target(directory, self.stock, 0o640)
+            manager = self.write_manager(directory, self.manager_stock)
+            real_verify = PATCHER._verify_published
+
+            def chmod_backend_then_fail(spec, *args, **kwargs):
+                if spec.name == "structured_output_init":
+                    target.chmod(0o600)
+                    raise OSError("injected manager verification failure")
+                return real_verify(spec, *args, **kwargs)
+
+            with mock.patch.object(PATCHER, "_verify_published", side_effect=chmod_backend_then_fail):
+                with self.assertRaises(PATCHER.RollbackError):
+                    PATCHER.apply(self.targets(target, manager), provider())
+            self.assertEqual(target.read_bytes(), self.post)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+            self.assertEqual(manager.read_bytes(), self.manager_stock)
+
+    def test_rollback_refuses_after_symlink_swap_with_same_bytes(self):
+        # The backend path is swapped for a symlink whose target holds the
+        # exact published bytes: content compare alone would be fooled; the
+        # regular-file guard must refuse the rollback.
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            target = self.write_target(directory, self.stock)
+            manager = self.write_manager(directory, self.manager_stock)
+            real_verify = PATCHER._verify_published
+
+            def swap_backend_then_fail(spec, *args, **kwargs):
+                if spec.name == "structured_output_init":
+                    twin = directory / "twin.py"
+                    twin.write_bytes(self.post)
+                    target.unlink()
+                    target.symlink_to(twin)
+                    raise OSError("injected manager verification failure")
+                return real_verify(spec, *args, **kwargs)
+
+            with mock.patch.object(PATCHER, "_verify_published", side_effect=swap_backend_then_fail):
+                with self.assertRaises(PATCHER.RollbackError):
+                    PATCHER.apply(self.targets(target, manager), provider())
+            self.assertTrue(target.is_symlink())
+            self.assertEqual(target.read_bytes(), self.post)
+            self.assertEqual(manager.read_bytes(), self.manager_stock)
+
+    def test_legacy_partial_completes_manager_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            target = self.write_target(directory, self.post, 0o604)
+            manager = self.write_manager(directory, self.manager_stock)
+            before = self.snapshot(target)
+            result = PATCHER.apply(self.targets(target, manager), provider())
+            self.assertEqual(result.outcome, "applied")
+            self.assert_snapshot(target, before)
+            self.assertEqual(manager.read_bytes(), self.manager_post)
+            self.assertEqual(temp_artifacts(directory), [])
+
+    def test_inverse_partial_is_refused_without_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            target = self.write_target(directory, self.stock)
+            manager = self.write_manager(directory, self.manager_post)
+            before = self.snapshot(target)
+            before_manager = self.snapshot(manager)
+            with self.assertRaises(PATCHER.CompatibilityError):
+                PATCHER.apply(self.targets(target, manager), provider())
+            self.assert_snapshot(target, before)
+            self.assert_snapshot(manager, before_manager)
+            self.assertEqual(temp_artifacts(directory), [])
+    def test_pristine_manager_variant_applies_to_its_own_postimage(self):
+        # DSPARK_SKIP_HOTFIX=1 boots present the pristine pinned image bytes;
+        # the chain must select the pristine variant and publish its postimage.
+        pristine = MANAGER_PRISTINE_FIXTURE.read_bytes()
+        pristine_post = MANAGER_PRISTINE_POST_FIXTURE.read_bytes()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            target = self.write_target(directory, self.stock)
+            manager = self.write_manager(directory, pristine)
+            result = PATCHER.apply(self.targets(target, manager), provider())
+            self.assertEqual(result.outcome, "applied")
+            self.assertEqual(target.read_bytes(), self.post)
+            self.assertEqual(manager.read_bytes(), pristine_post)
+            self.assertEqual(temp_artifacts(directory), [])
+
+    def test_inspect_classifies_both_manager_variants(self):
+        for fixture, variant_name, state in (
+            (self.manager_stock, "post-44993", "stock"),
+            (self.manager_post, "post-44993", "patched"),
+            (MANAGER_PRISTINE_FIXTURE.read_bytes(), "pristine", "stock"),
+            (MANAGER_PRISTINE_POST_FIXTURE.read_bytes(), "pristine", "patched"),
+        ):
+            with self.subTest(variant=variant_name, state=state), tempfile.TemporaryDirectory() as tmp:
+                manager = self.write_manager(Path(tmp), fixture)
+                inspection = PATCHER.inspect_target(MANAGER_SPEC, manager)
+                self.assertEqual(inspection.state, state)
+                self.assertEqual(inspection.variant.name, variant_name)
+
+
+def manager_window_step(region: bytes):
+    """Build a callable from the exact grammar_bitmask window region bytes.
+
+    The region lives at a 20-space base indent inside the manager's spec-decode
+    loop; it is re-homed into a function whose parameters provide the region's
+    free names.  The text under test is byte-exact from the fixtures.
+    """
+    text = region.decode("utf-8")
+    body = "".join(line[16:] for line in text.splitlines(keepends=True))
+    source = (
+        "def _step(grammar, token, req_id, scheduled_spec_decode_tokens,"
+        " post_reasoning_end_in_window, state_advancements, advance_grammar):\n"
+        + body
+        + "    return state_advancements\n"
+    )
+    namespace: dict = {}
+    exec(compile(source, "manager-region", "exec"), namespace)
+    return namespace["_step"]
+
+
+class FakeWindowGrammar:
+    def __init__(self, validate_result=None, accept_result=True, terminated=False):
+        self._validate_result = [] if validate_result is None else validate_result
+        self._accept_result = accept_result
+        self._terminated = terminated
+        self.calls = []
+
+    def is_terminated(self):
+        return self._terminated
+
+    def validate_tokens(self, tokens):
+        self.calls.append(("validate", list(tokens)))
+        return self._validate_result
+
+    def accept_tokens(self, req_id, tokens):
+        self.calls.append(("accept", req_id, list(tokens)))
+        return self._accept_result
+
+
+class ManagerWindowBehaviorTests(unittest.TestCase):
+    def test_patched_post_reasoning_invalid_draft_is_validated_not_accepted(self):
+        step = manager_window_step(MANAGER_NEW)
+        grammar = FakeWindowGrammar(validate_result=[], accept_result=True)
+        state = step(grammar, 9, "r1", (), True, 0, True)
+        self.assertEqual(state, 0)
+        self.assertEqual(grammar.calls, [("validate", [9])])
+
+    def test_patched_post_reasoning_valid_draft_validates_then_accepts(self):
+        step = manager_window_step(MANAGER_NEW)
+        grammar = FakeWindowGrammar(validate_result=[9], accept_result=True)
+        state = step(grammar, 9, "r1", (), True, 0, True)
+        self.assertEqual(state, 1)
+        self.assertEqual(grammar.calls, [("validate", [9]), ("accept", "r1", [9])])
+
+    def test_patched_post_reasoning_accept_failure_after_validate_is_tolerated(self):
+        step = manager_window_step(MANAGER_NEW)
+        grammar = FakeWindowGrammar(validate_result=[9], accept_result=False)
+        state = step(grammar, 9, "r1", (), True, 0, True)
+        self.assertEqual(state, 0)
+        self.assertEqual(grammar.calls, [("validate", [9]), ("accept", "r1", [9])])
+
+    def test_patched_outside_window_accepts_directly_and_raises_on_reject(self):
+        step = manager_window_step(MANAGER_NEW)
+        grammar = FakeWindowGrammar(accept_result=False)
+        with self.assertRaises(AssertionError):
+            step(grammar, 9, "r1", (), False, 0, True)
+        self.assertEqual(grammar.calls, [("accept", "r1", [9])])
+
+    def test_patched_terminated_grammar_is_untouched(self):
+        step = manager_window_step(MANAGER_NEW)
+        grammar = FakeWindowGrammar(terminated=True)
+        state = step(grammar, 9, "r1", (), True, 0, True)
+        self.assertEqual(state, 0)
+        self.assertEqual(grammar.calls, [])
+
+    def test_stock_region_accepts_blindly_in_window(self):
+        # Negative control: the stock region calls accept_tokens without
+        # validating first — the upstream source of the spurious "Failed to
+        # advance FSM" errors.  The patched region must not do this.
+        step = manager_window_step(MANAGER_OLD)
+        grammar = FakeWindowGrammar(accept_result=False)
+        state = step(grammar, 9, "r1", (), True, 0, True)
+        self.assertEqual(state, 0)
+        self.assertEqual(grammar.calls, [("accept", "r1", [9])])
 
 class StartupWiringTests(unittest.TestCase):
     # Gate execution behavior (disabled/non-"1" values skip, enabled invokes,
