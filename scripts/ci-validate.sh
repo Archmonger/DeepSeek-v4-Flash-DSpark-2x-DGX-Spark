@@ -73,6 +73,7 @@ py_files+=(
   scripts/test-dsv4-vision-exp-hotfix.py
   scripts/test-issue141-sparse-mla-decode-chunk.py
   scripts/test-issue136-xgrammar-termination.py
+  scripts/test-issue191-toolcall-failclosed.py
   scripts/test-issue117-shm-ring-buffer.py
   scripts/verify-issue136-xgrammar-live.py
   scripts/test-empty-encoder-output-hotfix.py
@@ -133,6 +134,8 @@ python3 scripts/test-issue141-sparse-mla-decode-chunk.py -q
 ok "test-issue141-sparse-mla-decode-chunk"
 python3 scripts/test-issue136-xgrammar-termination.py -q
 ok "test-issue136-xgrammar-termination"
+python3 scripts/test-issue191-toolcall-failclosed.py -q
+ok "test-issue191-toolcall-failclosed"
 python3 scripts/test-issue117-shm-ring-buffer.py -q
 ok "test-issue117-shm-ring-buffer"
 python3 scripts/test-empty-encoder-output-hotfix.py -q
@@ -522,4 +525,25 @@ else
   bad "TP=3 optional path missing (compose TP_SIZE/NNODES, apply_tp3_patch, start-tp3.sh, or bootstrap ifaces)"
 fi
 
+# Issue #191 tool-call fail-closed contract: default OFF, exact-1/fail-closed,
+# async-scheduling knob defaults to 1 and is passed to the worker verbatim.
+if grep -Fq 'DSPARK_ENABLE_ISSUE191_TOOLCALL_FAILCLOSED: "${DSPARK_ENABLE_ISSUE191_TOOLCALL_FAILCLOSED:-0}"' docker-compose.dspark.yml \
+  && grep -Fq 'if [ "$${DSPARK_ENABLE_ISSUE191_TOOLCALL_FAILCLOSED:-0}" = "1" ]; then python3 /opt/hotfix-vllm-issue191-toolcall-failclosed.py || exit 1; fi;' docker-compose.dspark.yml \
+  && grep -Fq 'DSPARK_ASYNC_SCHEDULING: "${DSPARK_ASYNC_SCHEDULING:-1}"' docker-compose.dspark.yml \
+  && grep -Fq 'ASYNC_SCHEDULING_ARGS="--async-scheduling"' docker-compose.dspark.yml \
+  && ! grep -Fxq '        --async-scheduling' docker-compose.dspark.yml \
+  && grep -Fq "DSPARK_ISSUE191_TOOLCALL_HOTFIX='./patches/hotfix-vllm-issue191-toolcall-failclosed.py'" start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'DSPARK_ASYNC_SCHEDULING=$REMOTE_ASYNC_SCHEDULING' start-deepseek-v4-flash-dspark.sh; then
+  ok "compose/launcher gate issue191 tool-call fail-closed hotfix and the async-scheduling knob"
+else
+  bad "issue191 hotfix must be default-off, fail-closed, worker-synced, and DSPARK_ASYNC_SCHEDULING must replace the bare --async-scheduling line"
+fi
+# Issue #191 thinking-off fallback knob (default 1, passed verbatim).
+if grep -Fq 'DSPARK_ISSUE191_TOOLCALL_THINKOFF_FALLBACK: "${DSPARK_ISSUE191_TOOLCALL_THINKOFF_FALLBACK:-1}"' docker-compose.dspark.yml \
+  && grep -Fq 'DSPARK_ISSUE191_TOOLCALL_THINKOFF_FALLBACK=$REMOTE_ISSUE191_THINKOFF' start-deepseek-v4-flash-dspark.sh \
+  && grep -Fq 'DSPARK_ISSUE191_TOOLCALL_THINKOFF_FALLBACK=1' .env.dspark.example; then
+  ok "compose/launcher gate the issue191 thinking-off fallback"
+else
+  bad "issue191 thinking-off fallback must default to 1 and be passed to the worker"
+fi
 echo "CI validate passed (CPU recipe gates only)."
