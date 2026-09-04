@@ -204,6 +204,34 @@ docker exec <container> bash /path/to/hotfix-nvfp4-ds-mla-issue22.sh
 
 ---
 
+## Issue #27 — partial-prefill admission cap (running-derived count)
+
+`patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py` breaks the
+waiting-admission loop once in-flight partial prefills reach
+`DSPARK_MAX_INFLIGHT_PREFILLS` (1–3; fallback
+`SchedulerConfig.max_num_partial_prefills`). The count is derived from
+`self.running` in exact parity with the stock `_inflight_prefills` set:
+requests admitted in earlier steps (list prefix) count while
+`num_computed_tokens < num_prompt_tokens` (the set's own membership, discard at
+the end of the last-chunk step), so release timing and admission decisions
+match the set whenever it is intact; decoders never qualify
+(`num_computed_tokens >= num_prompt_tokens`; an unscheduled decoder sits at
+`num_tokens + num_output_placeholders - 1`). Requests admitted this step (list
+suffix, sized by `scheduled_new_reqs` + `scheduled_resumed_reqs`) count by the
+set's add predicate (`num_computed_tokens + num_scheduled_tokens[request_id]
+< num_tokens`), so single-chunk same-step bursts are not throttled. The set is
+retained only for `_inflight_prefill_reserved_blocks` (issue #154 defense).
+Each `Scheduler` construction logs `[issue27-hotfix] in-flight prefill cap=N
+env=<raw>` once; a bounded tripwire (≤16 warnings per process) logs
+`in-flight prefill undercount` only when the set truly loses a running partial
+prefill; verbose `[issue27-adm]` admission lines require the existing
+`DSPARK_ISSUE43_SCHED_DIAG=1` knob. Any older `[issue27-hotfix]` application
+without the `[issue27-r3]` marker is refused (exit 1); `--status` reports
+`APPLIED (r3)` / `APPLIED (r2, stale)` / `APPLIED (pre-r2, stale)` /
+`NOT APPLIED`.
+
+---
+
 ## Issue #52 — trailing assistant turn closes with EOS (no-op loop)
 
 ### Symptom
