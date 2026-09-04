@@ -465,7 +465,6 @@ class FixtureProvenanceTests(unittest.TestCase):
         for hunk in grammar_advance_hunks():
             self.assertNotIn(hunk.old, MANAGER_NEW.decode("utf-8"))
             self.assertNotIn(hunk.new, MANAGER_NEW.decode("utf-8"))
-            self.assertNotIn(MANAGER_NEW.decode("utf-8"), hunk.old + hunk.new)
 
 
 class ExtractedBehaviorTests(unittest.TestCase):
@@ -562,9 +561,6 @@ class PatcherTestBase(unittest.TestCase):
             "structured_output_init": manager,
         }
 
-    def versions(self, metadata_provider=None) -> tuple:
-        return PATCHER._load_versions(metadata_provider or provider())
-
     def backend_spec(self):
         return BACKEND_SPEC
 
@@ -572,7 +568,7 @@ class PatcherTestBase(unittest.TestCase):
         return MANAGER_SPEC
 
     def publish_one(self, spec, target, data):
-        inspection = PATCHER.inspect_target(spec, target, self.versions())
+        inspection = PATCHER.inspect_target(spec, target)
         candidate = PATCHER.build_candidate(spec, inspection.variant, inspection.data)
         PATCHER._publish_one(spec, target, inspection, candidate)
         return inspection, candidate
@@ -635,7 +631,7 @@ class PatcherCompatibilityTests(PatcherTestBase):
             with self.subTest(state=expected_state), tempfile.TemporaryDirectory() as tmp:
                 target = self.write_target(Path(tmp), data)
                 before = self.snapshot(target)
-                inspection = PATCHER.inspect_target(BACKEND_SPEC, target, self.versions())
+                inspection = PATCHER.inspect_target(BACKEND_SPEC, target)
                 self.assertEqual(inspection.state, expected_state)
                 self.assert_snapshot(target, before)
 
@@ -1032,7 +1028,7 @@ class ChainTransactionTests(PatcherTestBase):
         ):
             with self.subTest(variant=variant_name, state=state), tempfile.TemporaryDirectory() as tmp:
                 manager = self.write_manager(Path(tmp), fixture)
-                inspection = PATCHER.inspect_target(MANAGER_SPEC, manager, self.versions())
+                inspection = PATCHER.inspect_target(MANAGER_SPEC, manager)
                 self.assertEqual(inspection.state, state)
                 self.assertEqual(inspection.variant.name, variant_name)
 

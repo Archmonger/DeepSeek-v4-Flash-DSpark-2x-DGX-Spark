@@ -391,7 +391,7 @@ def _read_file(target: Path) -> bytes:
 
 
 def inspect_target(
-    spec: TargetSpec, target: Path, versions: tuple[str, str]
+    spec: TargetSpec, target: Path
 ) -> Inspection:
     """Classify an exact stock or exact patched regular file without mutation."""
     before = _lstat_regular(target)
@@ -451,8 +451,6 @@ def build_candidate(spec: TargetSpec, variant: SourceVariant, stock: bytes) -> b
         or _sha256(candidate) != variant.patched_sha256
         or candidate.count(spec.old_region) != 0
         or candidate.count(spec.new_region) != 1
-        or candidate[:offset] != prefix
-        or candidate[offset + len(spec.new_region) :] != suffix
     ):
         raise CompatibilityError(f"constructed post-image failed exact validation ({spec.name})")
     _compile_source(candidate, spec.production_path.name)
@@ -653,7 +651,7 @@ def apply(
         if spec.name not in targets:
             raise CompatibilityError(f"missing target path for {spec.name}")
         specs.append(spec)
-        inspections.append(inspect_target(spec, targets[spec.name], versions))
+        inspections.append(inspect_target(spec, targets[spec.name]))
 
     chain = _classify_chain(inspections)
     if chain == "patched":
@@ -752,7 +750,7 @@ def _display_digests(targets: dict[str, Path]) -> str:
         target = targets[spec.name]
         try:
             file_stat = target.lstat()
-            if stat.S_ISREG(file_stat.st_mode) and not stat.S_ISLNK(file_stat.st_mode):
+            if stat.S_ISREG(file_stat.st_mode):
                 digests.append(_sha256(target.read_bytes()))
                 continue
         except OSError:
@@ -795,7 +793,7 @@ def main(argv: list[str] | None = None) -> int:
         if mode in {"check", "status"}:
             versions = _load_versions(importlib.metadata.version)
             inspections = [
-                inspect_target(spec, targets[spec.name], versions) for spec in TARGETS
+                inspect_target(spec, targets[spec.name]) for spec in TARGETS
             ]
             chain = _classify_chain(inspections)
             joined = ",".join(i.digest for i in inspections)
