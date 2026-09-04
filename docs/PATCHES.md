@@ -830,6 +830,40 @@ in `docker logs` is the measured raw violation rate.
 **Companion knob.** `DSPARK_ASYNC_SCHEDULING=0` removes `--async-scheduling` on
 both ranks so the grammar bitmask rows are built from real draft tokens; it is
 the single-variable A/B for the engine-side trigger and costs decode throughput.
+## DSpark block-k unlock — `num_speculative_tokens` follows `dspark_block_size` (default OFF)
+
+**Symptom.** Vision-Exp ships `num_nextn_predict_layers=3` and
+`dspark_block_size=5`. The pinned `SpeculativeConfig.__post_init__` maps
+`num_nextn_predict_layers` to `n_predict` and rejects any
+`num_speculative_tokens > n_predict` that is not a multiple of it ("Ensure
+divisibility for MTP module reuse"), so the recipe runs k=6 (0731 has one stage
+and boots k=5). The launcher mirrors that rule. Measured against 0731 on the
+same `bench_quick` (2×GB10, TP=2): prefill identical, single-stream decode
+−15–20 % (greedy) and −20–30 % (temp 0.6); per-position draft acceptance
+0.89/0.73/0.49/0.34/0.23/0.15 at k=6 versus 0731's 0.93/0.75/0.66/0.58/0.47 at k=5.
+
+**Why the rule does not apply.** The DSpark drafter (`models/deepseek_v4/nvidia/dspark.py`,
+`v1/worker/gpu/spec_decode/dspark/speculator.py`) *stacks* the `mtp.{0,1,2}`
+stages into one non-causal backbone and predicts every position of the block in
+one parallel pass (anchor + k−1 noise queries), then samples left-to-right with
+the Markov head; no stage is re-run per step. The checkpoint's own
+`inference/model.py::DSparkBlock` drafts exactly `dspark_block_size` tokens, so
+k=5 is the trained shape.
+
+**What the patcher does.** `patches/hotfix-vllm-dspark-block-k.py`
+(source-exact, stock identity `3f1abd1c…`, patched identity `7fffe035…`) adds
+`self.method != "dspark"` to that single condition in `config/speculative.py`
+and nothing else. `DSPARK_ENABLE_DSPARK_BLOCK_K=1` gates it (mount, `--check`
+preflight worker then head, apply at container start, atomic replace) and
+relaxes the launcher's `MTP_NUM_TOKENS` rule to `>= 1`; the CPU suite is
+`python3 scripts/test-dspark-block-k.py`. Pair it with `MTP_NUM_TOKENS=5`.
+Capture size follows (`MAX_NUM_SEQS * (k + 1)` rounded up to 8 → 40 at 6×5).
+
+**Measured (2026-09-03, Vision-Exp, k=5 vs k=6, same machine):** greedy 8K
+decode 56.6 vs 55.3 tok/s, greedy 32K 56.6 vs 53.6, temp 0.6 49.9–56.9 vs
+48.6–53.1, single-stream mini-bench 56–64 vs 51–55, concurrency-4 aggregate
+unchanged (110 vs 106–111), TTFT unchanged. Per-position acceptance is the same
+at either k (0.88/0.74/0.53/0.36/0.24), so the gain is the cheaper step.
 
 ---
 
