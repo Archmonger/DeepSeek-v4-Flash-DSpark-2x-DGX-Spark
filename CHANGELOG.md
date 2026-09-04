@@ -1,3 +1,9 @@
+## 2026-09-04
+
+### Changed
+
+- **`DSPARK_MAX_INFLIGHT_PREFILLS` default returns to `1`** (compose fallback and `.env.dspark.example`, locked together in `scripts/ci-validate.sh`): the r3 admission-count repair ([#211](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/pull/211)) made the #27 gate count in-flight partial prefills exactly from `self.running`, and all post-r3 live qualification ran at cap 1 — repeated fresh-boot gate26 runs on the 2x GB10 TP=2 lane held decode-fairness spreads of 1.60–1.76x with zero preemptions. Cap 2 retains unit coverage (including a same-`schedule()` four-lane admission regression) but no post-r3 live qualification; the 2026-09-02 A/B that favored 2 ran on the pre-r3 undercounting scheduler and does not establish post-r3 behavior. Set `2` or `3` explicitly to opt into overlap.
+
 ## 2026-09-02
 
 ### Added
