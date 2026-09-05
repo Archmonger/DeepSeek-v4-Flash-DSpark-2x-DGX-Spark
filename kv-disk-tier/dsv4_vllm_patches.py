@@ -211,6 +211,8 @@ def _swap_blocks_batch_patched(
             # _handler_init_patched; don't hard-depend on it (the patches are
             # independently gated).
             tt = getattr(handler, "transfer_type", ("?", "?"))
+            refs = getattr(handler, "kv_cache_groups_data_refs", None)
+            refs_per_group = [len(r) for r in refs] if refs is not None else None
             logger.info(
                 "[dsv4-patch] %s->%s job=%d copy_ops=%d refs_per_group=%s "
                 "pinned=%d chunk=%d",
@@ -218,7 +220,7 @@ def _swap_blocks_batch_patched(
                 tt[1],
                 ctx["job_id"],
                 n,
-                [len(r) for r in handler.kv_cache_groups_data_refs],
+                refs_per_group,
                 int(_PIN_DESCRIPTORS),
                 _MAX_COPIES_PER_BATCH,
             )

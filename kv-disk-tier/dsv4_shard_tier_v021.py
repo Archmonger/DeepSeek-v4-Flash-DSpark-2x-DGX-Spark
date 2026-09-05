@@ -424,7 +424,13 @@ class ShardAgent:
                             raw = sock.recv(zmq.NOBLOCK)
                         except zmq.Again:
                             break
-                        self._handle(raw, sock)
+                        try:
+                            self._handle(raw, sock)
+                        except Exception as e:
+                            logger.error(
+                                "[dsv4-shard] agent failed to handle a frame: %s",
+                                e,
+                            )
                 for job_id, ok in self._pool.get_finished():
                     if not ok:
                         self._n_fail += 1

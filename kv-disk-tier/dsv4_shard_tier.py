@@ -470,7 +470,13 @@ class ShardAgent:
                             raw = sock.recv(zmq.NOBLOCK)
                         except zmq.Again:
                             break
-                        self._handle(raw, sock)
+                        try:
+                            self._handle(raw, sock)
+                        except Exception as e:
+                            logger.error(
+                                "[dsv4-shard] agent failed to handle a frame: %s",
+                                e,
+                            )
                 for job_id, ok, *_ in self._pool.get_finished():  # GLM53-POOL-UNPACK: now (job_id, ok, transfer_time)
                     if not ok:
                         self._n_fail += 1
@@ -968,8 +974,14 @@ class DistributedShardTier(SecondaryTierManager):
         engine to keep stepping"), which would leave outstanding jobs uncollected
         whenever no request is scheduled -- stores would hang instead of
         finishing. While True, on_schedule_end() and get_finished_jobs() keep
-        being called."""
-        return bool(self._jobs)
+        being called.
+
+        _done must keep the engine stepping too: submit_store/submit_load
+        push early results there without ever creating a _jobs entry (e.g.
+        when not ready), so "no jobs in flight" must not mean "nothing to
+        hand back".
+        """
+        return bool(self._jobs) or bool(self._done)
 
     def on_new_request(self, req_context: ReqContext):
         """New abstract method. fs/manager.py returns the default context

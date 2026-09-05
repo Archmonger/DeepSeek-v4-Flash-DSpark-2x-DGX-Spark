@@ -224,6 +224,7 @@ class CappedFileSystemTierManager(FileSystemTierManager):
         # under a reader, and the job_id -> paths map so completion can unpin.
         self._pinned: dict[str, int] = {}
         self._load_job_keys: dict[int, list[str]] = {}
+        self._store_job_keys: dict[int, list[str]] = {}
 
         if self._max_bytes <= 0:
             logger.warning(
@@ -337,7 +338,10 @@ class CappedFileSystemTierManager(FileSystemTierManager):
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext | None = None):
         hit = super().lookup(key, req_context)
-        if hit:
+        # GLM53-LOOKUPRESULT: the parent returns a LookupResult enum, and every
+        # member (MISS/HIT_PENDING/RETRY included) is truthy. Only a real HIT
+        # should refresh LRU position.
+        if hit is LookupResult.HIT:
             self._mark_recent([self.file_mapper.get_file_name(key)])
         return hit
 
@@ -353,6 +357,7 @@ class CappedFileSystemTierManager(FileSystemTierManager):
         with self._lock:
             new_paths = [p for p in paths if p not in self._lru]
             self._evict_for(len(new_paths) * self._block_size)
+            self._store_job_keys[job_metadata.job_id] = new_paths
         super().submit_store(job_metadata)
         self._account(paths)
 
@@ -416,6 +421,15 @@ class CappedFileSystemTierManager(FileSystemTierManager):
                             self._pinned.pop(p, None)
                         else:
                             self._pinned[p] = n
+            # A failed store never landed its file, but submit_store already
+            # accounted its bytes optimistically; drop the phantom entry so
+            # _total_bytes and the LRU do not drift after a write error.
+            store_paths = self._store_job_keys.pop(result.job_id, None)
+            if store_paths is not None and not result.success:
+                with self._lock:
+                    for p in store_paths:
+                        if p in self._lru:
+                            self._total_bytes -= self._lru.pop(p)
             yield result
 
     def stats(self) -> dict:
