@@ -75,6 +75,7 @@ PY
 | `DSV4_MAX_COPIES_PER_BATCH` | Bound on copies per driver/SG launch; slices with a per-slice stream sync so a huge restore can't submit one unbounded batch. Default **8192**. |
 | `DSV4_MAX_OFFLOAD_BLOCKS_PER_REQUEST` | Cap on offload keys a single request may store; `0` = unlimited. Stops an in-GPU prompt from spilling its whole prefix to disk. Default **0**. |
 | `DSV4_HOST_KV` | **Experimental.** Allocate the KV cache from `cudaHostAlloc` so the disk tier can DMA straight into it. Default **0**; requires `libdsv4_host_kv.so` built on each node (`kv-disk-tier/build.sh`). |
+| `DSV4_ALLOW_EXPANDABLE_SEGMENTS` | **Experimental.** Keep `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` with the disk tier (default **0** unsets it). vLLM rejects the combination for every KV connector, but the `OffloadingConnector` here does not pin KV memory (no RDMA), so a `sitecustomize` hook exempts it. Keeping expandable segments on collapses per-allocation memdesc pressure during large prefills (see the NVRM OOM limitation). |
 | `VLLM_CACHE_ROOT` | vLLM cache root (compose sets path) |
 | `CUTE_DSL_ARCH` | **Not** `VLLM_*` — CuTeDSL/b12x compile target (`sm_121a` on GB10) |
 | `TILELANG_CACHE_DIR` | **Not** `VLLM_*`. Compose default `/cache/huggingface/tilelang-cache` (HF volume). Issue #65: in-image `~/.tilelang/cache` dies on container recreate. |
