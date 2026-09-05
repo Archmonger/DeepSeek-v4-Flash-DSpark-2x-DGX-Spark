@@ -41,9 +41,9 @@ KV_DISK_BYTES=150000000000     # per-node NVMe quota
 
 `--kv-transfer-config` and the tier JSON are assembled from those knobs, and
 `PYTORCH_CUDA_ALLOC_CONF` is unset automatically (the tier rejects
-`expandable_segments`). `PYTHONHASHSEED=0` is required (block hashes are salted
-from it). `gpu_clear.sh` clears a stale container and leftover `/dev/shm` staging
-before a relaunch.
+`expandable_segments` unless `DSV4_ALLOW_EXPANDABLE_SEGMENTS=1` — see below).
+`PYTHONHASHSEED=0` is required (block hashes are salted from it). `gpu_clear.sh`
+clears a stale container and leftover `/dev/shm` staging before a relaunch.
 
 ## Disable
 
@@ -70,6 +70,11 @@ holds **~549 blocks ≈ 562K tokens** of the main group — not a full 1M. A ful
   may store (`0` = unlimited). A prompt that fits in GPU KV doesn't need to
   spill to disk; set this to stop one huge request from flushing its whole
   prefix.
+- `DSV4_ALLOW_EXPANDABLE_SEGMENTS=1` — keep `expandable_segments:True` by
+  exempting the `OffloadingConnector` from vLLM's generic KV-connector check
+  (the connector does not pin KV memory, so expandable segments are safe). This
+  collapses GPU memdesc pressure during prefill and lifts the large-context
+  ceiling — see the NVRM OOM note below.
 
 ## Recent fixes (vLLM 0.25.x `port` variant)
 
@@ -97,14 +102,19 @@ holds **~549 blocks ≈ 562K tokens** of the main group — not a full 1M. A ful
 
 Large single-request contexts trigger a GPU-driver memory-descriptor exhaustion
 (`NVRM: nvCheckOkFailedNoLog … _memdescAllocInternal … NV_ERR_NO_MEMORY`), which
-is *not* host RAM and *not* fixed by the chunking above. Observed on this fleet:
+is *not* host RAM and *not* fixed by the chunking above. Root cause: the disk
+tier (via vLLM's generic KV-connector check) forced `PYTORCH_CUDA_ALLOC_CONF`
+empty, so the whole engine ran with `expandable_segments` off — each prefill
+allocation then created a burst of memdescs that exhausted the driver pool.
 
-- ~750K-token fill → container crash.
-- ~293K-token fill → engine hang, and a subsequent `docker restart` can hard-hang
-  the node (kernel alive, sshd dead) until the driver resets.
+`DSV4_ALLOW_EXPANDABLE_SEGMENTS=1` addresses this: a `sitecustomize` hook exempts
+the `OffloadingConnector` from that rejection (it does not pin KV memory, so
+expandable segments are safe), keeping `expandable_segments:True` across the
+engine. Verified on this fleet:
 
-The disk tier's *restore* path is the same copy path the chunking bounds, but
-the prefill/workspace allocations that exhaust the driver pool are not under
-this module's control. **Keep single-request contexts ≤ ~60K tokens with the
-disk tier enabled**; the tier is verified stable there. Larger contexts need the
-driver-level memdesc issue addressed (or `DSPARK_ENABLE_DISK_TIER=0`).
+- ~149K-token single-request fill → OK (TTFT ~42 s), restore ~7 s.
+- ~88K-token single-request fill → OK (TTFT ~20 s).
+- With the knob off: ~293K hung the engine and ~750K crashed the container.
+
+Larger-than-150K contexts remain untested and may still hit the driver ceiling;
+keep `gpu_clear.sh` as a recovery path when probing them.
