@@ -52,7 +52,12 @@ from collections.abc import Collection, Iterable
 from typing_extensions import override
 
 from vllm.logger import init_logger
-from vllm.v1.kv_offload.base import OffloadKey, OffloadingManager, ReqContext
+from vllm.v1.kv_offload.base import (
+    LookupResult,
+    OffloadKey,
+    OffloadingManager,
+    ReqContext,
+)
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 try:  # GLM53-TIER-IMPORT-FIX: JobMetadata moved base -> manager
     from vllm.v1.kv_offload.tiering.base import JobMetadata
@@ -408,7 +413,7 @@ class InstrumentedTieringManager(TieringOffloadingManager):
     def lookup(self, key, req_context):
         self._n_lookup += 1
         r = super().lookup(key, req_context)
-        if r is True:
+        if r is LookupResult.HIT:
             self._n_primary_hit += 1
         self._maybe_report()
         return r
