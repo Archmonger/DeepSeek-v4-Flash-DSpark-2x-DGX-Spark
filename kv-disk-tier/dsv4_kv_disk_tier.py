@@ -220,6 +220,10 @@ class CappedFileSystemTierManager(FileSystemTierManager):
         self._total_bytes = 0
         self._evicted_blocks = 0
         self._evicted_bytes = 0
+        # Paths with a load in flight (pin count) -- never evict these out from
+        # under a reader, and the job_id -> paths map so completion can unpin.
+        self._pinned: dict[str, int] = {}
+        self._load_job_keys: dict[int, list[str]] = {}
 
         if self._max_bytes <= 0:
             logger.warning(
@@ -295,16 +299,29 @@ class CappedFileSystemTierManager(FileSystemTierManager):
             return
         with self._lock:
             while self._lru and self._total_bytes + incoming_bytes > self._max_bytes:
-                path, size = self._lru.popitem(last=False)  # LRU end
+                # Skip blocks with a load in flight: unlinking between the
+                # lookup() hit and the read thread's os.open turns a hit into a
+                # load failure (the same race DistributedShardTier guards with
+                # its _pinned set).
+                victim = None
+                for path in self._lru:
+                    if path not in self._pinned:
+                        victim = path
+                        break
+                if victim is None:
+                    # Everything resident is pinned; stop rather than evict a
+                    # block a reader is about to open.
+                    break
+                size = self._lru.pop(victim)
                 self._total_bytes -= size
                 self._evicted_blocks += 1
                 self._evicted_bytes += size
                 try:
-                    os.unlink(path)
+                    os.unlink(victim)
                 except FileNotFoundError:
                     pass
                 except OSError as e:
-                    logger.warning("CappedFileSystemTier: unlink %s: %s", path, e)
+                    logger.warning("CappedFileSystemTier: unlink %s: %s", victim, e)
 
     def _account(self, paths: Iterable[str]) -> None:
         with self._lock:
@@ -365,7 +382,12 @@ class CappedFileSystemTierManager(FileSystemTierManager):
         This override drops O_DIRECT and never deletes on failure.
         """
         # A load is a use: keep these blocks hot.
-        self._mark_recent(self.file_mapper.get_file_name(k) for k in job_metadata.keys)
+        paths = [self.file_mapper.get_file_name(k) for k in job_metadata.keys]
+        with self._lock:
+            for p in paths:
+                self._pinned[p] = self._pinned.get(p, 0) + 1
+            self._load_job_keys[job_metadata.job_id] = paths
+        self._mark_recent(paths)
         tasks = (
             functools.partial(
                 _load_block_buffered,
@@ -377,6 +399,24 @@ class CappedFileSystemTierManager(FileSystemTierManager):
             for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
         )
         self._pool.enqueue_load(job_metadata.job_id, len(job_metadata.keys), tasks)
+
+    def get_finished_jobs(self):
+        """Poll completions and release load pins before they can block eviction.
+
+        A block stays pinned from submit_load() until its job reports finished,
+        so _evict_for() can never unlink a file a read thread is about to open.
+        """
+        for result in super().get_finished_jobs():
+            paths = self._load_job_keys.pop(result.job_id, None)
+            if paths:
+                with self._lock:
+                    for p in paths:
+                        n = self._pinned.get(p, 0) - 1
+                        if n <= 0:
+                            self._pinned.pop(p, None)
+                        else:
+                            self._pinned[p] = n
+            yield result
 
     def stats(self) -> dict:
         with self._lock:
@@ -439,11 +479,11 @@ class InstrumentedTieringManager(TieringOffloadingManager):
         return super().take_events()
 
     def _maybe_report(self):
-        # NOT a large threshold: offloading/scheduler.py _maximal_prefix_lookup()
-        # breaks on the first miss, so a cold request yields exactly ONE lookup
-        # and even a fully-hitting request yields one per offload block. A 2000
-        # threshold (the original value) could never fire on realistic traffic.
-        if self._n_lookup - self._last_report < 1:
+        # Periodic snapshot, not per-lookup: a fully-hitting request yields one
+        # lookup per offload block, so logging every lookup floods the log in
+        # steady state while adding no signal (all counters are cumulative).
+        # Every 1000 lookups keeps the counters visible without the spam.
+        if self._n_lookup - self._last_report < 1000:
             return
         self._last_report = self._n_lookup
         logger.info(
@@ -693,9 +733,12 @@ class MultiGroupTieringOffloadingSpec(
                 import types as _types
 
                 # check_multinode_safe only reads parallel_config.world_size.
+                # Newer vLLM carries this on self.config (parallel.world_size),
+                # not self.vllm_config.parallel_config -- see shard_tier_config
+                # and DistributedShardTier.__init__ for the same split.
                 _shim = _types.SimpleNamespace(
                     parallel_config=_types.SimpleNamespace(
-                        world_size=int(self.vllm_config.parallel_config.world_size)
+                        world_size=int(self.config.parallel.world_size)
                     )
                 )
                 dsv4_vllm_patches.check_multinode_safe(_shim)

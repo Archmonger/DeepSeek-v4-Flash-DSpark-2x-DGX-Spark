@@ -207,11 +207,15 @@ def _swap_blocks_batch_patched(
         _log_counter[0] += 1
         c = _log_counter[0]
         if c <= 50 or c % 200 == 0 or n > 60000:
+            # transfer_type is only set by the tensor-alias patch's
+            # _handler_init_patched; don't hard-depend on it (the patches are
+            # independently gated).
+            tt = getattr(handler, "transfer_type", ("?", "?"))
             logger.info(
                 "[dsv4-patch] %s->%s job=%d copy_ops=%d refs_per_group=%s "
                 "pinned=%d chunk=%d",
-                handler.transfer_type[0],
-                handler.transfer_type[1],
+                tt[0],
+                tt[1],
                 ctx["job_id"],
                 n,
                 [len(r) for r in handler.kv_cache_groups_data_refs],
@@ -374,7 +378,14 @@ def _get_finished_patched(self):
             # already proved the copy is complete, so the driver can no longer
             # touch these arrays.
             for buf in bufs:
-                if len(pool) < _MAX_POOLED_BUFFER_SETS:
+                # Only HOST descriptor buffers may be pooled. The SG path also
+                # appends its CUDA staging buffer to `captured` (to keep it
+                # alive until the job completes); pooling a device buffer here
+                # would poison the pool -- the next small transfer would
+                # copy_() host pointers into it (silent cross-device) and pass
+                # a device pointer to cuMemcpyBatchAsync, which expects host
+                # addresses.
+                if len(pool) < _MAX_POOLED_BUFFER_SETS and not buf[0].is_cuda:
                     pool.append(buf)
     return results
 
@@ -1173,11 +1184,13 @@ def _offload_budget_prune(manager, force: bool = False) -> None:
     if not force and len(_REQ_OFFLOADED) < 10000:
         return
     live = getattr(manager, "_req_state", None)
-    if live is None:
-        return
     for rid in list(_REQ_OFFLOADED):
-        if rid not in live:
-            del _REQ_OFFLOADED[rid]
+        # If the manager exposes no _req_state (should not happen for the
+        # tiering manager), it cannot tell us which requests are live; dropping
+        # everything still bounds the dict instead of leaking unbounded.
+        if live is not None and rid in live:
+            continue
+        del _REQ_OFFLOADED[rid]
 
 
 def _prepare_store_patched(self, keys, req_context):
@@ -1315,7 +1328,7 @@ def apply_all() -> None:
 _HOST_KV_POOL = None  # module-level: the pool must outlive every tensor from it
 _HOST_KV_ALLOC = None
 
-_HOST_KV_SO = os.environ.get("DSV4_HOST_KV_SO", "/opt/env/lib/libdsv4_host_kv.so")
+_HOST_KV_SO = os.environ.get("DSV4_HOST_KV_SO", "/usr/local/lib/libdsv4_host_kv.so")
 
 
 def _build_host_kv_pool():
@@ -1396,7 +1409,11 @@ _SG_FN = None
 
 
 def _sg_copy_threshold() -> int:
-    return _intenv("DSV4_SG_THRESHOLD", 0)
+    # Default matches the compose/docs default (20000): below the ~23k driver
+    # wall, the driver's cuMemcpyBatchAsync is faster and is used directly. A
+    # bare `vllm serve` (no compose env) still gets the SG fallback above the
+    # wall rather than segfaulting the driver.
+    return _intenv("DSV4_SG_THRESHOLD", 20000)
 
 
 def _sg_load():

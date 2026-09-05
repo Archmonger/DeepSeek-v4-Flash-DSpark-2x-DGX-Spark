@@ -43,7 +43,9 @@ services:
       - ${KV_SRC:-/opt/dsv4-kv}/dsv4_kv_disk_tier.py:/usr/local/lib/python3.12/dist-packages/dsv4_kv_disk_tier.py:ro
       - ${KV_SRC:-/opt/dsv4-kv}/dsv4_shard_tier.py:/usr/local/lib/python3.12/dist-packages/dsv4_shard_tier.py:ro
       - ${KV_SRC:-/opt/dsv4-kv}/dsv4_vllm_patches.py:/usr/local/lib/python3.12/dist-packages/dsv4_vllm_patches.py:ro
+      - ${KV_SRC:-/opt/dsv4-kv}/dsv4_sitecustomize.py:/usr/local/lib/python3.12/dist-packages/dsv4_sitecustomize.py:ro
       - ${KV_SRC:-/opt/dsv4-kv}/libdsv4_batch_copy.so:/usr/local/lib/libdsv4_batch_copy.so:ro
+      - ${KV_SRC:-/opt/dsv4-kv}/libdsv4_host_kv.so:/usr/local/lib/libdsv4_host_kv.so:ro
       - ${KVDISK_DIR:-${HOME}/kvdisk}:/kvdisk
       # Optional Stage-C overlay: host proposer only when path exists on the
       # Anemll layout (vLLM ships DSpark under v1/worker/gpu/spec_decode).
@@ -178,6 +180,7 @@ services:
       DSV4_MAX_COPIES_PER_BATCH: "${DSV4_MAX_COPIES_PER_BATCH:-8192}"
       DSV4_MAX_OFFLOAD_BLOCKS_PER_REQUEST: "${DSV4_MAX_OFFLOAD_BLOCKS_PER_REQUEST:-0}"
       DSV4_HOST_KV: "${DSV4_HOST_KV:-0}"
+      DSV4_HOST_KV_SO: "${DSV4_HOST_KV_SO:-/usr/local/lib/libdsv4_host_kv.so}"
 
       VLLM_USE_B12X_MOE: "${VLLM_USE_B12X_MOE:-1}"
       VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM: "${VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM:-0}"

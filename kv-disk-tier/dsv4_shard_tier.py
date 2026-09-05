@@ -542,6 +542,15 @@ class ShardAgent:
                     }
                 )
             )
+        elif kind == "rehello":
+            # The head asks us to re-report our on-disk inventory (e.g. after a
+            # peer reconnected with a changed inventory). Rescan and re-send the
+            # same hello frame we send at startup.
+            sock.send(
+                _ENC.encode(
+                    {"t": "hello", "rank": self._rank, "keys": self._inventory()}
+                )
+            )
         elif kind == "bye":
             self._stop = True
 
@@ -688,6 +697,25 @@ class DistributedShardTier(SecondaryTierManager):
     def _on_hello(self, ident: bytes, msg: dict) -> None:
         rank = int(msg["rank"])
         self._identities[ident] = rank
+
+        # A re-registration after READY means an agent reconnected with a
+        # possibly-changed inventory (e.g. its process restarted). The
+        # reconciled index is now stale, so discard it and ask EVERY agent to
+        # re-report before serving again -- otherwise the reconnect leaves
+        # _hellos at 1/N forever and the head keeps serving a stale index.
+        if self._ready:
+            logger.warning(
+                "[dsv4-shard] agent rank=%d reconnected after READY; discarding "
+                "the stale reconciled index and re-requesting inventory from "
+                "all %d agents",
+                rank, self._num_agents,
+            )
+            self._ready = False
+            self._present.clear()
+            self._bytes = 0
+            self._hellos.clear()
+            self._broadcast({"t": "rehello"})
+
         self._hellos[rank] = [bytes(k) for k in msg.get("keys", ())]
         logger.info(
             "[dsv4-shard] agent rank=%d registered (%d blocks on its disk); "
