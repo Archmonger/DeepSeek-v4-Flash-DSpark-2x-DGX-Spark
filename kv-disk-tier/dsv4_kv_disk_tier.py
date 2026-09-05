@@ -112,6 +112,11 @@ def _load_block_buffered(
     Loops on short reads rather than assuming one readv() drains the file.
     """
     try:
+        if offset < 0 or offset + block_size > view.nbytes:
+            raise ValueError(
+                f"load offset/size out of range: offset={offset} "
+                f"block_size={block_size} region={view.nbytes}"
+            )
         view_slice = view.cast("B")[offset : offset + block_size]
         fd = os.open(source_path, os.O_RDONLY)
         try:
