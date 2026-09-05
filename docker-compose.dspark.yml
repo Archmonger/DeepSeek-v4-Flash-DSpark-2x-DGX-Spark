@@ -181,7 +181,7 @@ services:
       DSV4_MAX_OFFLOAD_BLOCKS_PER_REQUEST: "${DSV4_MAX_OFFLOAD_BLOCKS_PER_REQUEST:-0}"
       DSV4_HOST_KV: "${DSV4_HOST_KV:-0}"
       DSV4_HOST_KV_SO: "${DSV4_HOST_KV_SO:-/usr/local/lib/libdsv4_host_kv.so}"
-      DSV4_ALLOW_EXPANDABLE_SEGMENTS: "${DSV4_ALLOW_EXPANDABLE_SEGMENTS:-0}"
+      DSV4_ALLOW_EXPANDABLE_SEGMENTS: "${DSV4_ALLOW_EXPANDABLE_SEGMENTS:-1}"
 
       VLLM_USE_B12X_MOE: "${VLLM_USE_B12X_MOE:-1}"
       VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM: "${VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM:-0}"
@@ -453,7 +453,7 @@ services:
           KVXFER_JSON="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_name\":\"MultiGroupTieringOffloadingSpec\",\"spec_module_path\":\"dsv4_kv_disk_tier\",\"cpu_bytes_to_use\":$${KV_CPU_BYTES:-4294967296},\"dsv4_block_size_factor\":4,\"eviction_policy\":\"lru\",\"secondary_tiers\":[{\"type\":\"shard_dist\",\"root_dir\":\"/kvdisk\",\"max_bytes\":$${KV_DISK_BYTES:-150000000000},\"port\":$${DSV4_SHARD_PORT:-25055}}]}}";
           KVXFER_ARGS=(--kv-transfer-config "$${KVXFER_JSON}");
           export PYTHONHASHSEED=0;
-          if [ "$${DSV4_ALLOW_EXPANDABLE_SEGMENTS:-0}" != "1" ]; then
+          if [ "$${DSV4_ALLOW_EXPANDABLE_SEGMENTS:-1}" != "1" ]; then
             unset PYTORCH_CUDA_ALLOC_CONF;
           fi;
         fi;

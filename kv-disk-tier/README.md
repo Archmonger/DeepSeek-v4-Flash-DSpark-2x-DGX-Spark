@@ -40,8 +40,9 @@ KV_DISK_BYTES=150000000000     # per-node NVMe quota
 ```
 
 `--kv-transfer-config` and the tier JSON are assembled from those knobs, and
-`PYTORCH_CUDA_ALLOC_CONF` is unset automatically (the tier rejects
-`expandable_segments` unless `DSV4_ALLOW_EXPANDABLE_SEGMENTS=1` — see below).
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is kept by default (the tier
+exempts its own `OffloadingConnector` from vLLM's generic rejection; set
+`DSV4_ALLOW_EXPANDABLE_SEGMENTS=0` to unset it — see below).
 `PYTHONHASHSEED=0` is required (block hashes are salted from it). `gpu_clear.sh`
 clears a stale container and leftover `/dev/shm` staging before a relaunch.
 
@@ -69,11 +70,12 @@ holds **~549 blocks ≈ 562K tokens** of the main group — not a full 1M. A ful
 - `DSV4_MAX_OFFLOAD_BLOCKS_PER_REQUEST=0` — cap on offload keys a single request
   may store (`0` = unlimited). A prompt that fits in GPU KV doesn't need to
   spill to disk; set this to stop one huge request from flushing its whole
-  prefix.
-- `DSV4_ALLOW_EXPANDABLE_SEGMENTS=1` — keep `expandable_segments:True` by
-  exempting the `OffloadingConnector` from vLLM's generic KV-connector check
+  prefix.(default) — keep `expandable_segments:True`
+  by exempting the `OffloadingConnector` from vLLM's generic KV-connector check
   (the connector does not pin KV memory, so expandable segments are safe). This
   collapses GPU memdesc pressure during prefill and lifts the large-context
+  ceiling — see the NVRM OOM note below. Set `0` to unset
+  `PYTORCH_CUDA_ALLOC_CONF` (the old behaviour) prefill and lifts the large-context
   ceiling — see the NVRM OOM note below.
 
 ## Recent fixes (vLLM 0.25.x `port` variant)
@@ -97,8 +99,7 @@ holds **~549 blocks ≈ 562K tokens** of the main group — not a full 1M. A ful
 - **Eager-offload budget.** `DSV4_MAX_OFFLOAD_BLOCKS_PER_REQUEST` (default `0` =
   unlimited) caps how many offload keys one request may store, so an in-GPU
   prompt doesn't spill its whole prefix to disk.
-
-## NVRM driver OOM on very large contexts — fixed via `DSV4_ALLOW_EXPANDABLE_SEGMENTS=1`
+by default
 
 Large single-request contexts trigger a GPU-driver memory-descriptor exhaustion
 (`NVRM: nvCheckOkFailedNoLog … _memdescAllocInternal … NV_ERR_NO_MEMORY`), which
@@ -107,10 +108,10 @@ tier (via vLLM's generic KV-connector check) forced `PYTORCH_CUDA_ALLOC_CONF`
 empty, so the whole engine ran with `expandable_segments` off — each prefill
 allocation then created a burst of memdescs that exhausted the driver pool.
 
-`DSV4_ALLOW_EXPANDABLE_SEGMENTS=1` fixes this: a `sitecustomize` hook exempts
-the `OffloadingConnector` from that rejection (it does not pin KV memory, so
-expandable segments are safe), keeping `expandable_segments:True` across the
-engine. Verified on this fleet with the knob on — all single-request fills, no
+The tier now exempts the `OffloadingConnector` from that rejection by default
+(it does not pin KV memory, so expandable segments are safe), keeping
+`expandable_segments:True` across the engine. Verified on this fleet — all
+single-request fills, no engine. Verified on this fleet with the knob on — all single-request fills, no
 driver OOM, engine hang, or crash:
 
 - ~750K-token fill → OK (TTFT ~604 s), restore ~2.3 s.
