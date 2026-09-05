@@ -699,14 +699,20 @@ class DistributedShardTier(SecondaryTierManager):
                 self._admit(acc.keys)
         else:
             # Do not keep serving a block we could not fully read or write.
-            self._forget(acc.keys)
+            # A failed job must not yank a block out from under a concurrent
+            # in-flight job (e.g. two requests restoring the same prefix). The
+            # pin count for this job's keys was already decremented above, so a
+            # key still in _pinned belongs to another live job: leave it alone.
+            doomed = [k for k in acc.keys if k not in self._pinned]
+            self._forget(doomed)
             # And tell the agents to delete it. Dropping it from the index alone
             # is not enough: a timed-out or failed store can leave a
             # correctly-named, correctly-sized but TORN file on disk, which the
             # next boot's inventory scan (which can only check the size) would
             # adopt and serve. Forgetting locally while leaving the bytes behind
             # is precisely how a half-written block becomes a silent bad hit.
-            self._broadcast({"t": "evict", "keys": acc.keys})
+            if doomed:
+                self._broadcast({"t": "evict", "keys": doomed})
         self._done.append(JobResult(job_id=job_id, success=ok))
 
     # ------------------------------------------------------------ index/LRU
@@ -720,8 +726,12 @@ class DistributedShardTier(SecondaryTierManager):
                 self._bytes += self._slice_bytes
 
     def _forget(self, keys: Iterable[bytes]) -> None:
+        # _present maps key -> None (membership only), so pop(k, None) cannot
+        # tell present from absent by its return value -- the byte counter
+        # would never be decremented and the capacity accounting would drift.
         for k in keys:
-            if self._present.pop(k, None) is not None:
+            if k in self._present:
+                del self._present[k]
                 self._bytes -= self._slice_bytes
 
     def _touch(self, keys: Iterable[bytes]) -> None:
@@ -814,6 +824,15 @@ class DistributedShardTier(SecondaryTierManager):
         job_id = int(job_metadata.job_id)
         keys = [bytes(k) for k in job_metadata.keys]
         bids = [int(b) for b in job_metadata.block_ids]
+
+        if not self._ready:
+            # Agents are not all up (or just reconnected after READY): we
+            # cannot restore reliably. Fail immediately so the primary tier
+            # recomputes instead of letting the job sit until its timeout
+            # against agents that will never ack it.
+            self._done.append(JobResult(job_id=job_id, success=False))
+            return
+
         self._touch(keys)
         for k in keys:
             self._pinned[k] = self._pinned.get(k, 0) + 1

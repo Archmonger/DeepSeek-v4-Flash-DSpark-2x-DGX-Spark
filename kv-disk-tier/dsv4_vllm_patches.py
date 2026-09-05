@@ -1342,7 +1342,7 @@ def _build_host_kv_pool():
         raise RuntimeError(
             f"dsv4-patch: DSV4_HOST_KV=1 but {_HOST_KV_SO} is missing. Build it with:\n"
             "  nvcc -O3 -arch=sm_121a -shared -Xcompiler -fPIC "
-            "-o /opt/env/lib/libdsv4_host_kv.so dsv4_host_kv_alloc.cu"
+            "-o /usr/local/lib/libdsv4_host_kv.so dsv4_host_kv_alloc.cu"
         )
     _HOST_KV_ALLOC = CUDAPluggableAllocator(
         _HOST_KV_SO, "dsv4_host_malloc", "dsv4_host_free"
@@ -1380,9 +1380,22 @@ def apply_host_kv_alloc() -> None:
             sample = next(iter(out.values()))
             ptr = sample.data_ptr()
             libc = _ct.CDLL("libc.so.6", use_errno=True)
-            buf = (_ct.c_char * 16)()
-            # A CPU read of the pointer succeeds ONLY if it is host-mapped.
-            _ct.memmove(buf, _ct.c_void_p(ptr), 16)
+            # Probe the VMA without reading it: mincore(2) returns -1/ENOMEM for
+            # an unmapped (PROT_NONE cudaMalloc) address instead of faulting, so
+            # a silent fallback to device-only memory raises a clean error here
+            # rather than SIGSEGVing the process.
+            mincore = libc.mincore
+            mincore.argtypes = [
+                _ct.c_void_p, _ct.c_size_t, _ct.POINTER(_ct.c_ubyte),
+            ]
+            mincore.restype = _ct.c_int
+            vec = (_ct.c_ubyte * 1)()
+            if mincore(_ct.c_void_p(ptr), _ct.c_size_t(1), vec) != 0:
+                err = _ct.get_errno()
+                raise RuntimeError(
+                    f"mincore probe failed (errno={err}) -- KV at 0x{ptr:x} "
+                    "is not host-addressable"
+                )
             logger.info(
                 "[dsv4-patch] host-KV verified: CPU can address KV at 0x%x", ptr
             )
@@ -1421,7 +1434,7 @@ def _sg_load():
     global _SG_LIB, _SG_FN
     if _SG_FN is not None:
         return _SG_FN
-    path = os.environ.get("DSV4_SG_SO", "/opt/env/lib/libdsv4_batch_copy.so")
+    path = os.environ.get("DSV4_SG_SO", "/usr/local/lib/libdsv4_batch_copy.so")
     if not os.path.exists(path):
         raise RuntimeError(f"DSV4_SG_THRESHOLD set but {path} is missing")
     _SG_LIB = ctypes.CDLL(path)
