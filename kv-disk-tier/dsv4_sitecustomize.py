@@ -28,6 +28,12 @@ def _apply_host_kv():
     dsv4_vllm_patches.apply_host_kv_alloc()
 
 
+def _apply_host_kv_v2():
+    import dsv4_vllm_patches
+
+    dsv4_vllm_patches.apply_host_kv_alloc_v2()
+
+
 def _apply_expandable_segments_exempt():
     """Let the disk tier run with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
 
@@ -60,6 +66,7 @@ def _apply_expandable_segments_exempt():
 
 if os.environ.get("DSV4_HOST_KV") == "1":
     _HOOKS.append(("vllm.v1.worker.gpu_model_runner", _apply_host_kv))
+    _HOOKS.append(("vllm.v1.worker.gpu.model_runner", _apply_host_kv_v2))
 
 if os.environ.get("DSV4_ALLOW_EXPANDABLE_SEGMENTS") == "1":
     _HOOKS.append(("vllm.config.vllm", _apply_expandable_segments_exempt))

@@ -1291,6 +1291,11 @@ def apply_all() -> None:
     # Opt-in: off by default until proven under the real MLA/DSpark kernels.
     if _flag("DSV4_HOST_KV", "0"):
         apply_host_kv_alloc()
+        try:
+            apply_host_kv_alloc_v2()
+        except ImportError:
+            # V1-only vLLM image: no vllm.v1.worker.gpu.model_runner module.
+            pass
 
     logger.info("[dsv4-patch] active patches: %s", sorted(_APPLIED))
 
@@ -1354,8 +1359,53 @@ def _build_host_kv_pool():
     return _HOST_KV_POOL
 
 
+def _verify_host_kv_tensors(tensors: dict) -> None:
+    """Prove the KV tensors are host-addressable and dump their layout.
+
+    A silent fallback to cudaMalloc would look identical until the first disk
+    read returned EFAULT in production, so this fails loud. mincore(2) returns
+    -1/ENOMEM for an unmapped (PROT_NONE cudaMalloc) address instead of
+    faulting; a raw memmove would SIGSEGV the process on that same address.
+    """
+    import ctypes as _ct
+
+    sample = next(iter(tensors.values()))
+    ptr = sample.data_ptr()
+    libc = _ct.CDLL("libc.so.6", use_errno=True)
+    mincore = libc.mincore
+    mincore.argtypes = [_ct.c_void_p, _ct.c_size_t, _ct.POINTER(_ct.c_ubyte)]
+    mincore.restype = _ct.c_int
+    vec = (_ct.c_ubyte * 1)()
+    if mincore(_ct.c_void_p(ptr), _ct.c_size_t(1), vec) != 0:
+        err = _ct.get_errno()
+        raise RuntimeError(
+            f"mincore probe failed (errno={err}) -- KV at 0x{ptr:x} "
+            "is not host-addressable"
+        )
+    logger.info("[dsv4-patch] host-KV verified: CPU can address KV at 0x%x", ptr)
+    # Dump the distinct backing tensors (deduped by data_ptr) so the
+    # direct-I/O path can map a disk cell -> per-group host pointers.
+    _seen: set[int] = set()
+    for _name, _t in tensors.items():
+        _p = _t.data_ptr()
+        if _p in _seen:
+            continue
+        _seen.add(_p)
+        logger.info(
+            "[dsv4-patch] host-KV tensor %s shape=%s stride=%s ptr=0x%x "
+            "nbytes=%d",
+            _name, tuple(_t.shape), tuple(_t.stride()), _p,
+            _t.numel() * _t.element_size(),
+        )
+
+
 def apply_host_kv_alloc() -> None:
-    """Route KV cache allocation through cudaHostAlloc memory."""
+    """Route KV cache allocation through cudaHostAlloc on the V1 model runner.
+
+    The V2 model runner (forced on for DSpark) allocates KV through
+    ``vllm.v1.worker.gpu.model_runner.init_kv_cache`` instead of this method;
+    see apply_host_kv_alloc_v2.
+    """
     if "hostkv" in _APPLIED:
         return
     from torch.cuda.memory import use_mem_pool
@@ -1373,34 +1423,8 @@ def apply_host_kv_alloc() -> None:
         )
         with use_mem_pool(pool):
             out = orig(self, kv_cache_config, kernel_block_sizes)
-        # Prove it actually came from our allocator rather than silently
-        # falling back -- a silent fallback would look identical until the
-        # first disk read returned EFAULT in production.
         try:
-            import ctypes as _ct
-
-            sample = next(iter(out.values()))
-            ptr = sample.data_ptr()
-            libc = _ct.CDLL("libc.so.6", use_errno=True)
-            # Probe the VMA without reading it: mincore(2) returns -1/ENOMEM for
-            # an unmapped (PROT_NONE cudaMalloc) address instead of faulting, so
-            # a silent fallback to device-only memory raises a clean error here
-            # rather than SIGSEGVing the process.
-            mincore = libc.mincore
-            mincore.argtypes = [
-                _ct.c_void_p, _ct.c_size_t, _ct.POINTER(_ct.c_ubyte),
-            ]
-            mincore.restype = _ct.c_int
-            vec = (_ct.c_ubyte * 1)()
-            if mincore(_ct.c_void_p(ptr), _ct.c_size_t(1), vec) != 0:
-                err = _ct.get_errno()
-                raise RuntimeError(
-                    f"mincore probe failed (errno={err}) -- KV at 0x{ptr:x} "
-                    "is not host-addressable"
-                )
-            logger.info(
-                "[dsv4-patch] host-KV verified: CPU can address KV at 0x%x", ptr
-            )
+            _verify_host_kv_tensors(out)
         except Exception as e:
             logger.error(
                 "[dsv4-patch] host-KV VERIFICATION FAILED (%r) -- KV is NOT "
@@ -1411,7 +1435,51 @@ def apply_host_kv_alloc() -> None:
 
     GPUModelRunner.initialize_kv_cache_tensors = patched
     _APPLIED.add("hostkv")
-    logger.info("[dsv4-patch] hostkv: KV cache will be cudaHostAlloc-backed")
+    logger.info("[dsv4-patch] hostkv (V1): KV cache will be cudaHostAlloc-backed")
+
+
+def apply_host_kv_alloc_v2() -> None:
+    """Route KV cache allocation through cudaHostAlloc on the V2 model runner.
+
+    V2 allocates KV via the module-level ``init_kv_cache`` imported into
+    ``vllm.v1.worker.gpu.model_runner`` (``from ...attn_utils import
+    init_kv_cache``), so that bound name -- not the one in attn_utils -- is
+    what ``GPUModelRunner.initialize_kv_cache`` calls at runtime. Wrapping the
+    V1 method is a silent no-op under V2: the sitecustomize hook still arms,
+    the wrapped method is simply never called.
+    """
+    if "hostkv_v2" in _APPLIED:
+        return
+    from torch.cuda.memory import use_mem_pool
+    import vllm.v1.worker.gpu.model_runner as _mr
+
+    orig = _mr.init_kv_cache
+    if getattr(orig, "_dsv4_host_kv", False):
+        _APPLIED.add("hostkv_v2")
+        return
+
+    def patched(*args, **kwargs):
+        pool = _build_host_kv_pool()
+        logger.info(
+            "[dsv4-patch] allocating KV cache from cudaHostAlloc "
+            "(V2 init_kv_cache)"
+        )
+        with use_mem_pool(pool):
+            out = orig(*args, **kwargs)
+        try:
+            _verify_host_kv_tensors(out)
+        except Exception as e:
+            logger.error(
+                "[dsv4-patch] host-KV VERIFICATION FAILED (%r) -- KV is NOT "
+                "host-addressable, so disk->KV DMA will EFAULT", e
+            )
+            raise
+        return out
+
+    patched._dsv4_host_kv = True
+    _mr.init_kv_cache = patched
+    _APPLIED.add("hostkv_v2")
+    logger.info("[dsv4-patch] hostkv (V2): init_kv_cache will be cudaHostAlloc-backed")
 
 
 # ---------------------------------------------------------------------------
