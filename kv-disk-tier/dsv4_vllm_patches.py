@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """
 Runtime monkeypatches for the vLLM KV-offload disk tier on DeepSeek-V4-Flash-0731
-(2x DGX Spark, TP=2 across nodes, vLLM 0.21.1rc1.dev339+g1967a5627bc3).
+(2x DGX Spark, TP=2 across nodes, vLLM 0.25.2.dev0+g752a3a504.d20260714).
 
 Import this from dsv4_kv_disk_tier.py BEFORE the connector is constructed:
 

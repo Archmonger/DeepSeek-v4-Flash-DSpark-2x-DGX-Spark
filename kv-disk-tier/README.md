@@ -4,16 +4,6 @@ Backs the prefix cache with NVMe so a large context survives GPU KV eviction and
 restores from disk instead of paying a cold prefill. Multi-node TP safe (per-node
 sharded tier) and needs no vLLM source change — modules are bind-mounted.
 
-## Two variants (pick for your vLLM tree)
-
-| Variant | files | vLLM |
-|---|---|---|
-| `port` (0.25.x) | `dsv4_kv_disk_tier.py` / `dsv4_shard_tier.py` | Anemll `0.1.1` (vLLM 0.25.2) |
-| `v021` | `dsv4_*_v021.py` | vLLM 0.21.1 images |
-
-The Anemll image this repo ships is 0.25.x, so it uses the `port` files. The
-`v021` pair is kept for older images and is not interchangeable.
-
 ## Build (once per node)
 
 ```bash
@@ -78,7 +68,7 @@ holds **~549 blocks ≈ 562K tokens** of the main group — not a full 1M. A ful
   `PYTORCH_CUDA_ALLOC_CONF` (the old behaviour) prefill and lifts the large-context
   ceiling — see the NVRM OOM note below.
 
-## Recent fixes (vLLM 0.25.x `port` variant)
+## Recent fixes
 
 - **Store/load race (crash).** `_sliding_window_lookup_patched` now uses the
   vLLM 0.25.x `LookupResult` enum (`HIT` / `HIT_PENDING` / `RETRY` / `MISS`)
