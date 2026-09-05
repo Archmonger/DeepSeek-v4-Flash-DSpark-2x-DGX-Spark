@@ -1,13 +1,3 @@
-## 2026-09-05
-
-### Fixed
-
-- **NVRM driver OOM on large contexts is now addressable (`DSV4_ALLOW_EXPANDABLE_SEGMENTS=1`)**: the disk tier previously forced `PYTORCH_CUDA_ALLOC_CONF` empty because vLLM's generic KV-connector check rejects `expandable_segments` for any connector, so the whole engine ran with expandable segments off and each prefill allocation burst memdescs until the driver pool exhausted (`_memdescAllocInternal … NV_ERR_NO_MEMORY`). The `sitecustomize` hook now exempts the `OffloadingConnector` (it does not pin KV memory) from that rejection, keeping `expandable_segments:True` across the engine. Verified with the knob on — single-request fills at ~750K (TTFT ~604 s, restore ~2.3 s), ~293K (TTFT ~134 s, restore ~1.0 s), ~149K and ~88K all OK with no driver OOM/hang/crash; with the knob off ~293K hung the engine and ~750K crashed the container. Default `1`; set `0` to restore the old unset behaviour. See `kv-disk-tier/README.md`.
-
-- **`stop-deepseek-v4-flash-dspark.sh` now cleans leaked `/dev/shm/vllm_offload_*.mmap`**: root-owned ~3.8 GB staging files left by an unclean restart could accumulate until the host OOM-killed `VLLM::Worker_TP`. The stop script (head + workers) removes them, wiring in the `gpu_clear.sh` cleanup that was previously not part of the teardown path.
-
-- **`sitecustomize` auto-import fixed**: the disk-tier hooks must mount under the exact `sitecustomize` name at `/usr/lib/python3.12/sitecustomize.py` (an empty system file there shadows `dist-packages`). Prior mounts under the wrong filename or directory silently never armed.
-
 ## 2026-09-04
 
 ### Added
