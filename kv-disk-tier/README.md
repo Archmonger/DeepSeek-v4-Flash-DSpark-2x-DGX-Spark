@@ -44,3 +44,34 @@ before a relaunch.
 ## Disable
 
 Remove `DSPARK_ENABLE_DISK_TIER` (or set it to `0`). Everything else is inert.
+
+## Recent fixes (vLLM 0.25.x `port` variant)
+
+- **Store/load race (crash).** `_sliding_window_lookup_patched` now uses the
+  vLLM 0.25.x `LookupResult` enum (`HIT` / `HIT_PENDING` / `RETRY` / `MISS`).
+  The previous code used the old bool/`None` contract, so *every* lookup was
+  counted as a hit — including mid-store `HIT_PENDING` blocks — and
+  `update_state_after_alloc` handed them to `prepare_load()`, whose stock
+  `assert block.is_ready` killed the EngineCore on any two requests sharing a
+  prefix. `HIT_PENDING`/`RETRY` now defer the lookup instead.
+
+- **Large-copy chunking.** The scatter-gather path now slices batches larger
+  than `DSV4_MAX_COPIES_PER_BATCH` (default `8192`) with a per-slice stream
+  sync, so a large restore (≈244k descriptors for 1M tokens) can't submit one
+  unbounded batch to the driver.
+
+## Known limitation — NVRM driver OOM on very large contexts
+
+Large single-request contexts trigger a GPU-driver memory-descriptor exhaustion
+(`NVRM: nvCheckOkFailedNoLog … _memdescAllocInternal … NV_ERR_NO_MEMORY`), which
+is *not* host RAM and *not* fixed by the chunking above. Observed on this fleet:
+
+- ~750K-token fill → container crash.
+- ~293K-token fill → engine hang, and a subsequent `docker restart` can hard-hang
+  the node (kernel alive, sshd dead) until the driver resets.
+
+The disk tier's *restore* path is the same copy path the chunking bounds, but
+the prefill/workspace allocations that exhaust the driver pool are not under
+this module's control. **Keep single-request contexts ≤ ~60K tokens with the
+disk tier enabled**; the tier is verified stable there. Larger contexts need the
+driver-level memdesc issue addressed (or `DSPARK_ENABLE_DISK_TIER=0`).

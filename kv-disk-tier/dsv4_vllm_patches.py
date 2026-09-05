@@ -242,7 +242,33 @@ def _swap_blocks_batch_patched(
     # restore needs ~244k descriptors, so the driver path cannot reach it at all.
     sg = _sg_copy_threshold()
     if sg > 0 and n >= sg:
-        rc = _sg_batch_copy(vsrc, vdst, vsz, n, handler, captured)
+        chunk = _MAX_COPIES_PER_BATCH
+        if chunk <= 0 or n <= chunk:
+            rc = _sg_batch_copy(vsrc, vdst, vsz, n, handler, captured)
+        else:
+            # Bound the per-launch descriptor count (and therefore the UVA
+            # traffic the driver must track at once). The kernel is
+            # grid-strided, so the slices are semantically identical to one big
+            # launch; synchronising between slices caps the driver's outstanding
+            # memdesc/UVA state, which is what exhausts _memdescAllocInternal on
+            # very large offloads (NVRM NV_ERR_NO_MEMORY, seen on a 750K-token
+            # offload). The descriptor device buffer is reused across slices,
+            # and the sync guarantees a slice's upload+launch has drained before
+            # the next slice's upload overwrites it.
+            rc = 0
+            for lo in range(0, n, chunk):
+                hi = min(lo + chunk, n)
+                rc = _sg_batch_copy(
+                    vsrc.narrow(0, lo, hi - lo),
+                    vdst.narrow(0, lo, hi - lo),
+                    vsz.narrow(0, lo, hi - lo),
+                    hi - lo,
+                    handler,
+                    captured,
+                )
+                if rc != 0:
+                    break
+                torch.cuda.current_stream().synchronize()
         if rc == 0:
             return None
         # Do NOT fall through to the driver above the wall: that path is known to
@@ -894,29 +920,40 @@ def _sliding_window_lookup_patched(self, keys, sliding_window_size, req_context)
     """Return the end index (in `keys`) of the last run of
     `sliding_window_size` consecutive hits, scanning from the end.
     Returns 0 on miss, None if the backend deferred a lookup."""
+    from vllm.v1.kv_offload.base import LookupResult
+
     defer_lookup = False
     consecutive_hits = 0
     for idx in range(len(keys) - 1, -1, -1):
         result = self.manager.lookup(keys[idx], req_context)
-        if result is None:
-            defer_lookup = True
-            # A deferred block is one the backend is already promoting, so it
-            # WILL be a hit. Count it as a provisional hit, exactly as
-            # _maximal_prefix_lookup already does.
-            result = True
-        if not result:
-            consecutive_hits = 0
-        else:
+        if result is LookupResult.HIT:
             consecutive_hits += 1
-            if consecutive_hits == sliding_window_size:
-                if not defer_lookup:
-                    return idx + sliding_window_size
-                # Deferred => this call returns None regardless of the count,
-                # so stop scanning. Look up one extra block first to cover the
-                # cdiv/floor slack in update_state_after_alloc's slice.
-                if idx > 0:
-                    self.manager.lookup(keys[idx - 1], req_context)
-                return None
+        elif result is LookupResult.HIT_PENDING:
+            # Block is in cache but not yet readable (a store is in-flight).
+            # It counts as a hit for the consecutive streak, but the load must
+            # be deferred: update_state_after_alloc would otherwise hand this
+            # key to prepare_load(), whose stock `assert block.is_ready` kills
+            # the EngineCore. This is the vLLM 0.25.x enum API; the old
+            # bool/None contract no longer exists, so `if not result` would
+            # misclassify every enum member (all truthy) as a hit.
+            defer_lookup = True
+            consecutive_hits += 1
+        elif result is LookupResult.RETRY:
+            # Block location uncertain -- does not count as a hit. Keep
+            # scanning so the manager can kick off async lookups.
+            defer_lookup = True
+            consecutive_hits = 0
+        else:  # LookupResult.MISS
+            consecutive_hits = 0
+        if consecutive_hits == sliding_window_size:
+            if not defer_lookup:
+                return idx + sliding_window_size
+            # Deferred => this call returns None regardless of the count,
+            # so stop scanning. Look up one extra block first to cover the
+            # cdiv/floor slack in update_state_after_alloc's slice.
+            if idx > 0:
+                self.manager.lookup(keys[idx - 1], req_context)
+            return None
     return consecutive_hits if not defer_lookup else None
 
 
