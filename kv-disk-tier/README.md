@@ -17,11 +17,15 @@ The Anemll image this repo ships is 0.25.x, so it uses the `port` files. The
 ## Build (once per node)
 
 ```bash
-KV_SRC=/opt/dsv4-kv ./build.sh   # builds libdsv4_batch_copy.so (sm_121a)
+KV_SRC=/opt/dsv4-kv ./build.sh   # builds libdsv4_batch_copy.so + libdsv4_host_kv.so (sm_121a)
 ```
 
-The `.so` is the scatter-gather copy kernel that replaces `cuMemcpyBatchAsync`,
-which segfaults in the driver above ~23k descriptors.
+`libdsv4_batch_copy.so` is the scatter-gather copy kernel that replaces
+`cuMemcpyBatchAsync` for large copies, which segfaults in the driver above ~23k
+descriptors. `libdsv4_host_kv.so` backs the experimental `DSV4_HOST_KV=1` path.
+`build.sh` needs an image with `nvcc` — the serving image
+(`ghcr.io/anemll/dspark-vllm-gx10:0.1.1`) has none, so a separate build image is
+used (`IMG`).
 
 ## Enable
 
@@ -45,20 +49,49 @@ before a relaunch.
 
 Remove `DSPARK_ENABLE_DISK_TIER` (or set it to `0`). Everything else is inert.
 
+## Capacity
+
+The offloaded block is one concatenated KV cell. With the shipped
+`dsv4_block_size_factor=4` geometry the cell is 272,842,752 B (~260 MB) and the
+main MLA group covers **1024 tokens per offloaded block**. The CPU staging tier
+is 7 blocks (4 GiB), and the per-node disk quota (`KV_DISK_BYTES=150000000000`)
+holds **~549 blocks ≈ 562K tokens** of the main group — not a full 1M. A full
+1M-token prompt cannot be disk-cached at the default geometry; raise
+`KV_DISK_BYTES` (with matching NVMe free space) to retain more.
+
+## Optional tuning
+
+- `DSV4_SG_THRESHOLD=20000` — copies with ≥ this many descriptors use the
+  scatter-gather kernel; smaller copies use the faster driver batch path (the
+  driver segfaults above ~23k descriptors, so 20000 stays clear of the wall).
+- `DSV4_MAX_COPIES_PER_BATCH=8192` — bounds copies per launch with a per-slice
+  stream sync.
+- `DSV4_MAX_OFFLOAD_BLOCKS_PER_REQUEST=0` — cap on offload keys a single request
+  may store (`0` = unlimited). A prompt that fits in GPU KV doesn't need to
+  spill to disk; set this to stop one huge request from flushing its whole
+  prefix.
+
 ## Recent fixes (vLLM 0.25.x `port` variant)
 
 - **Store/load race (crash).** `_sliding_window_lookup_patched` now uses the
-  vLLM 0.25.x `LookupResult` enum (`HIT` / `HIT_PENDING` / `RETRY` / `MISS`).
-  The previous code used the old bool/`None` contract, so *every* lookup was
-  counted as a hit — including mid-store `HIT_PENDING` blocks — and
-  `update_state_after_alloc` handed them to `prepare_load()`, whose stock
-  `assert block.is_ready` killed the EngineCore on any two requests sharing a
-  prefix. `HIT_PENDING`/`RETRY` now defer the lookup instead.
+  vLLM 0.25.x `LookupResult` enum (`HIT` / `HIT_PENDING` / `RETRY` / `MISS`)
+  and mirrors the stock function exactly. The previous code used the old
+  bool/`None` contract, so *every* lookup was counted as a hit — including
+  mid-store `HIT_PENDING` blocks — and `update_state_after_alloc` handed them
+  to `prepare_load()`, whose stock `assert block.is_ready` killed the
+  EngineCore on any two requests sharing a prefix. `HIT_PENDING`/`RETRY` now
+  defer the lookup instead; a deferred streak returns `None` (no load issued),
+  so no preemptive extra lookup is needed.
 
-- **Large-copy chunking.** The scatter-gather path now slices batches larger
-  than `DSV4_MAX_COPIES_PER_BATCH` (default `8192`) with a per-slice stream
-  sync, so a large restore (≈244k descriptors for 1M tokens) can't submit one
-  unbounded batch to the driver.
+- **Large-copy chunking + SG threshold.** Batches ≥ `DSV4_SG_THRESHOLD`
+  (default `20000`) descriptors go through the scatter-gather kernel instead of
+  `cuMemcpyBatchAsync` (which segfaults above ~23k); batches larger than
+  `DSV4_MAX_COPIES_PER_BATCH` (default `8192`) are sliced with a per-slice
+  stream sync. Smaller copies use the faster driver path directly.
+
+- **Eager-offload budget.** `DSV4_MAX_OFFLOAD_BLOCKS_PER_REQUEST` (default `0` =
+  unlimited) caps how many offload keys one request may store, so an in-GPU
+  prompt doesn't spill its whole prefix to disk.
 
 ## Known limitation — NVRM driver OOM on very large contexts
 

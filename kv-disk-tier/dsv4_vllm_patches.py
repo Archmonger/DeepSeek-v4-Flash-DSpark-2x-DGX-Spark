@@ -25,10 +25,19 @@ first-restart configuration.
     DSV4_PATCH_NUMBLOCKS_GUARD=1  actionable error instead of "cannot mmap an
                                   empty file" when the CPU tier rounds to 0
     DSV4_BATCH_LOG=1              log num_copy_ops / refs-per-group per transfer
-    DSV4_MAX_COPIES_PER_BATCH=0   EXPERIMENTAL, 0 = disabled. Splits the driver
-                                  batch. Only enable when instructed by the
-                                  test plan; the "65535 ceiling" root cause for
-                                  BUG 3 was REFUTED and this is unproven.
+    DSV4_MAX_COPIES_PER_BATCH=8192  bound copies per driver/SG launch (default
+                                  8192). Slices the batch with a per-slice
+                                  stream sync so a huge restore can't submit one
+                                  unbounded batch to the driver.
+    DSV4_SG_THRESHOLD=20000       batches with >= this many descriptors go
+                                  through the scatter-gather kernel; below it
+                                  the driver's cuMemcpyBatchAsync path is faster
+                                  and is used directly (the driver segfaults
+                                  above ~23k descriptors, so 20000 stays clear).
+    DSV4_MAX_OFFLOAD_BLOCKS_PER_REQUEST=0  cap on the number of offload keys a
+                                  single request may store (0 = unlimited).
+                                  Stops a prompt that fits in GPU KV from
+                                  spilling its whole prefix to disk.
 
 Everything here is pure Python. No vLLM file needs to be bind-mounted and no
 container rebuild is required. The file must be importable in BOTH the
@@ -120,7 +129,7 @@ _ORIG_HANDLER_INIT = None
 _PIN_DESCRIPTORS = True
 _WAITSTREAM_ON_LOAD = False
 _BATCH_LOG = True
-_MAX_COPIES_PER_BATCH = 0
+_MAX_COPIES_PER_BATCH = 8192
 
 _log_counter = [0]
 
@@ -907,11 +916,13 @@ def apply_bug1_io() -> None:
 # the W == 1 groups here the store-side alignment filter stores runs of
 # exactly one block, so a run never reaches length 2 and a threshold of W + 1
 # never fires - the scan degenerates back to a full scan. The correct shape is
-# "terminate at W, but issue one extra lookup first".
+# "terminate at W".
 #
 # (G % f == 0 holds for every group at bsf=4 and bsf=16 on this model, so the
-# extra lookup is belt-and-braces here - but it is a hard assert in the
-# scheduler process, i.e. a full outage, so it stays.)
+# W vs W+1 boundary is moot here. The deferred path returns None -- mirroring
+# stock vLLM 0.25.x -- so no load is issued on a deferred streak and the
+# prepare_load assert above is never reached; no preemptive extra lookup is
+# needed.)
 
 _ORIG_SW_LOOKUP = None
 
@@ -946,14 +957,11 @@ def _sliding_window_lookup_patched(self, keys, sliding_window_size, req_context)
         else:  # LookupResult.MISS
             consecutive_hits = 0
         if consecutive_hits == sliding_window_size:
-            if not defer_lookup:
-                return idx + sliding_window_size
-            # Deferred => this call returns None regardless of the count,
-            # so stop scanning. Look up one extra block first to cover the
-            # cdiv/floor slack in update_state_after_alloc's slice.
-            if idx > 0:
-                self.manager.lookup(keys[idx - 1], req_context)
-            return None
+            # Identical to stock vLLM 0.25.x. A deferred streak returns None,
+            # which makes _lookup() defer the whole request (no load is issued
+            # this step, so update_state_after_alloc/prepare_load are never
+            # reached). A non-deferred streak returns the end index.
+            return idx + sliding_window_size if not defer_lookup else None
     return consecutive_hits if not defer_lookup else None
 
 
@@ -1139,17 +1147,105 @@ def apply_multinode_guard() -> None:
 
 
 # ===========================================================================
+# Bound eager offload (DSV4_MAX_OFFLOAD_BLOCKS_PER_REQUEST)
+# ===========================================================================
+#
+# vLLM's offloading scheduler (kv_role=kv_both) stores EVERY request's prompt
+# blocks eagerly, even when the request fits entirely in GPU KV. On this
+# deployment the GPU pool holds ~1.4M tokens, so a single huge prompt (e.g.
+# 750K tokens) spills its whole prefix to the CPU staging tier and then to
+# disk, driving a large GPU->CPU->disk copy that the NVRM driver's memdesc pool
+# cannot always absorb -- and writing bytes to SSD that will never be a useful
+# prefix-cache hit (no reuse at that size on a 6-seq deployment).
+#
+# This caps the number of offload keys a single request may store. Keys past
+# the cap are never stored, so the oversized request serves from GPU memory
+# alone. 0 = unlimited (stock behaviour). Enforced on the manager's
+# prepare_store(), the single chokepoint every eager store goes through.
+
+_MAX_OFFLOAD_BLOCKS = 0
+_REQ_OFFLOADED: dict = {}
+_ORIG_PREPARE_STORE = None
+
+
+def _offload_budget_prune(manager, force: bool = False) -> None:
+    """Drop counters for requests the manager no longer tracks."""
+    if not force and len(_REQ_OFFLOADED) < 10000:
+        return
+    live = getattr(manager, "_req_state", None)
+    if live is None:
+        return
+    for rid in list(_REQ_OFFLOADED):
+        if rid not in live:
+            del _REQ_OFFLOADED[rid]
+
+
+def _prepare_store_patched(self, keys, req_context):
+    """Clamp the eager store to a per-request offload-key budget.
+
+    Passing an empty key list through the original manager yields a falsy
+    ``keys_to_store`` (verified: CPUPrimaryTierOffloadingManager.prepare_store
+    short-circuits on empty input), which _build_store_jobs handles by
+    advancing ``next_stored_block_idx`` and skipping -- so the request stops
+    being re-offered instead of retrying forever.
+    """
+    budget = _MAX_OFFLOAD_BLOCKS
+    if budget <= 0:
+        return _ORIG_PREPARE_STORE(self, keys, req_context)
+
+    rid = req_context.req_id
+    used = _REQ_OFFLOADED.get(rid, 0)
+    if used >= budget:
+        keys = []
+    else:
+        keys = list(keys)
+        room = budget - used
+        if len(keys) > room:
+            logger.info(
+                "[dsv4-patch] offload budget: req=%s capping store at %d "
+                "blocks (budget %d, already %d, offered %d)",
+                rid, room, budget, used, len(keys),
+            )
+            keys = keys[:room]
+    # Count conservatively (may over-count keys the primary tier already holds,
+    # which only makes the cap stricter, never looser).
+    _REQ_OFFLOADED[rid] = used + len(keys)
+    _offload_budget_prune(self)
+    return _ORIG_PREPARE_STORE(self, keys, req_context)
+
+
+def apply_offload_budget() -> None:
+    """Install the per-request offload cap (no-op at budget 0)."""
+    global _ORIG_PREPARE_STORE
+
+    if "offload_budget" in _APPLIED:
+        return
+
+    from vllm.v1.kv_offload.tiering.manager import TieringOffloadingManager
+
+    _ORIG_PREPARE_STORE = TieringOffloadingManager.prepare_store
+    TieringOffloadingManager.prepare_store = _prepare_store_patched
+    _APPLIED.add("offload_budget")
+    logger.info(
+        "[dsv4-patch] offload budget ACTIVE (max_blocks_per_request=%d)",
+        _MAX_OFFLOAD_BLOCKS,
+    )
+
+
+# ===========================================================================
 # entry point
 # ===========================================================================
 
 
 def apply_all() -> None:
-    global _PIN_DESCRIPTORS, _WAITSTREAM_ON_LOAD, _BATCH_LOG, _MAX_COPIES_PER_BATCH
+    global _PIN_DESCRIPTORS, _WAITSTREAM_ON_LOAD, _BATCH_LOG
+    global _MAX_COPIES_PER_BATCH, _MAX_OFFLOAD_BLOCKS
 
     _PIN_DESCRIPTORS = _flag("DSV4_PIN_DESCRIPTORS", "1")
     _WAITSTREAM_ON_LOAD = _flag("DSV4_PATCH_BUG2_WAITSTREAM", "0")
     _BATCH_LOG = _flag("DSV4_BATCH_LOG", "1")
-    _MAX_COPIES_PER_BATCH = _intenv("DSV4_MAX_COPIES_PER_BATCH", 0)
+    _MAX_COPIES_PER_BATCH = _intenv("DSV4_MAX_COPIES_PER_BATCH", 8192)
+    _MAX_OFFLOAD_BLOCKS = _intenv("DSV4_MAX_OFFLOAD_BLOCKS_PER_REQUEST", 0)
 
     logger.info(
         "[dsv4-patch] applying in pid=%d (%s)",
@@ -1168,6 +1264,11 @@ def apply_all() -> None:
         apply_num_blocks_guard()
     if _flag("DSV4_PATCH_TENSOR_ALIAS", "1"):
         apply_tensor_alias_fix()
+    # Install the eager-offload cap. The wrapper is a no-op passthrough at
+    # budget 0, so installing it unconditionally lets the knob flip at runtime
+    # without reimporting the module.
+    if _flag("DSV4_PATCH_OFFLOAD_BUDGET", "1"):
+        apply_offload_budget()
     # Applied last so the handler class is fully patched before any instance
     # exists.
     if _flag("DSV4_PATCH_BUG2_KEEPALIVE", "1"):

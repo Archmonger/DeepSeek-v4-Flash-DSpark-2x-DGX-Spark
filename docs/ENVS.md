@@ -70,6 +70,11 @@ PY
 | `KV_DISK_BYTES` | Per-node NVMe quota, default **150000000000**. |
 | `KV_SRC` | Host dir with the disk-tier modules + built `.so` (default `/opt/dsv4-kv`, both nodes). |
 | `KVDISK_DIR` | Per-node disk cache dir, default `${HOME}/kvdisk`. |
+| `DSV4_SG_THRESHOLD` | Descriptors at/above which a copy uses the scatter-gather `.so` instead of `cuMemcpyBatchAsync` (the driver segfaults above ~23k). Default **20000**; smaller copies use the faster driver path. |
+| `DSV4_SG_SO` | Path to the scatter-gather kernel, default `/usr/local/lib/libdsv4_batch_copy.so`. |
+| `DSV4_MAX_COPIES_PER_BATCH` | Bound on copies per driver/SG launch; slices with a per-slice stream sync so a huge restore can't submit one unbounded batch. Default **8192**. |
+| `DSV4_MAX_OFFLOAD_BLOCKS_PER_REQUEST` | Cap on offload keys a single request may store; `0` = unlimited. Stops an in-GPU prompt from spilling its whole prefix to disk. Default **0**. |
+| `DSV4_HOST_KV` | **Experimental.** Allocate the KV cache from `cudaHostAlloc` so the disk tier can DMA straight into it. Default **0**; requires `libdsv4_host_kv.so` built on each node (`kv-disk-tier/build.sh`). |
 | `VLLM_CACHE_ROOT` | vLLM cache root (compose sets path) |
 | `CUTE_DSL_ARCH` | **Not** `VLLM_*` — CuTeDSL/b12x compile target (`sm_121a` on GB10) |
 | `TILELANG_CACHE_DIR` | **Not** `VLLM_*`. Compose default `/cache/huggingface/tilelang-cache` (HF volume). Issue #65: in-image `~/.tilelang/cache` dies on container recreate. |
