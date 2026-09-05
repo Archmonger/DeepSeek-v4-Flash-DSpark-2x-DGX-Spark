@@ -65,6 +65,11 @@ PY
 | `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` | Issue #26: sparsify SWA prefix-cache checkpoints (default 4096). This is the warm-hit fix; the coordinator must still let SWA shrink the common hit (hotfix v2, issue #36). |
 | `VLLM_ENABLE_RESPONSES_API_STORE` | Native vLLM Responses state switch, normalized to exact `1`; default `0` keeps stock `serving.py` bytes. Enabled starts source-check and apply the bounded-store backport fail-closed on every rank. Stored state is lost on any process restart. Recreate every rank when changing it; a Docker restart preserves patched writable-layer bytes, not state. |
 | `DSPARK_RESPONSES_STORE_MAX_ENTRIES` | Terminal Responses bundle cap, default **256**. Positive decimal when the store is enabled; invalid values fail before remote side effects. Eviction removes response/message/background-event state together and LRU-touches retrieval/continuation. Queued, in-progress, pinned continuation, and tracked producer state may temporarily exceed the entry cap; this is not a retained-byte limit. |
+| `DSPARK_ENABLE_DISK_TIER` | Opt-in NVMe-backed KV cache (default **0**). `1` adds `--kv-transfer-config` (OffloadingConnector + per-node sharded tier), exports `PYTHONHASHSEED=0`, and unsets `PYTORCH_CUDA_ALLOC_CONF`. See `kv-disk-tier/`. |
+| `KV_CPU_BYTES` | Pinned CPU staging tier, default **4294967296**; caps the largest restorable prompt. |
+| `KV_DISK_BYTES` | Per-node NVMe quota, default **150000000000**. |
+| `KV_SRC` | Host dir with the disk-tier modules + built `.so` (default `/opt/dsv4-kv`, both nodes). |
+| `KVDISK_DIR` | Per-node disk cache dir, default `${HOME}/kvdisk`. |
 | `VLLM_CACHE_ROOT` | vLLM cache root (compose sets path) |
 | `CUTE_DSL_ARCH` | **Not** `VLLM_*` — CuTeDSL/b12x compile target (`sm_121a` on GB10) |
 | `TILELANG_CACHE_DIR` | **Not** `VLLM_*`. Compose default `/cache/huggingface/tilelang-cache` (HF volume). Issue #65: in-image `~/.tilelang/cache` dies on container recreate. |
