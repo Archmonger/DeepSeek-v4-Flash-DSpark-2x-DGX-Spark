@@ -654,7 +654,15 @@ class _BlockSizeFactorMixin:
         world_size = self.vllm_config.parallel_config.world_size
         cpu_bytes = int(self.extra_config["cpu_bytes_to_use"])
         if self.kv_cache_config.num_blocks > 0:
-            total_gpu_kv_bytes = sum(t.size for t in self.kv_cache_config.kv_cache_tensors)
+            # Packed KV layout (DeepSeek V4 / cross-layer): every KVCacheTensor
+            # aliases ONE backing allocation (each carries block_stride/offset),
+            # so summing t.size over-counts the real memory by the tensor count.
+            # Mirror CPUOffloadingSpec.__init__: use tensors[0].size when packed.
+            _tensors = self.kv_cache_config.kv_cache_tensors
+            _is_packed = any(t.block_stride for t in _tensors)
+            total_gpu_kv_bytes = (
+                _tensors[0].size if _is_packed else sum(t.size for t in _tensors)
+            )
             kv_bytes_per_block = (
                 total_gpu_kv_bytes // self.kv_cache_config.num_blocks
             ) * world_size
