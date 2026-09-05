@@ -98,7 +98,7 @@ holds **~549 blocks ≈ 562K tokens** of the main group — not a full 1M. A ful
   unlimited) caps how many offload keys one request may store, so an in-GPU
   prompt doesn't spill its whole prefix to disk.
 
-## Known limitation — NVRM driver OOM on very large contexts
+## NVRM driver OOM on very large contexts — fixed via `DSV4_ALLOW_EXPANDABLE_SEGMENTS=1`
 
 Large single-request contexts trigger a GPU-driver memory-descriptor exhaustion
 (`NVRM: nvCheckOkFailedNoLog … _memdescAllocInternal … NV_ERR_NO_MEMORY`), which
@@ -107,14 +107,19 @@ tier (via vLLM's generic KV-connector check) forced `PYTORCH_CUDA_ALLOC_CONF`
 empty, so the whole engine ran with `expandable_segments` off — each prefill
 allocation then created a burst of memdescs that exhausted the driver pool.
 
-`DSV4_ALLOW_EXPANDABLE_SEGMENTS=1` addresses this: a `sitecustomize` hook exempts
+`DSV4_ALLOW_EXPANDABLE_SEGMENTS=1` fixes this: a `sitecustomize` hook exempts
 the `OffloadingConnector` from that rejection (it does not pin KV memory, so
 expandable segments are safe), keeping `expandable_segments:True` across the
-engine. Verified on this fleet:
+engine. Verified on this fleet with the knob on — all single-request fills, no
+driver OOM, engine hang, or crash:
 
-- ~149K-token single-request fill → OK (TTFT ~42 s), restore ~7 s.
-- ~88K-token single-request fill → OK (TTFT ~20 s).
-- With the knob off: ~293K hung the engine and ~750K crashed the container.
+- ~750K-token fill → OK (TTFT ~604 s), restore ~2.3 s.
+- ~293K-token fill → OK (TTFT ~134 s), restore ~1.0 s.
+- ~149K-token fill → OK (TTFT ~42 s).
+- ~88K-token fill → OK (TTFT ~20 s).
 
-Larger-than-150K contexts remain untested and may still hit the driver ceiling;
-keep `gpu_clear.sh` as a recovery path when probing them.
+With the knob off: ~293K hung the engine and ~750K crashed the container. The
+fix collapses the memdesc pressure, so the driver-level ceiling is no longer the
+binding limit. The disk *quota* still caps cacheable tokens at ~562K; a larger
+prompt prefills fine but its blocks beyond the quota are simply not stored
+(`cannot store blocks` warnings).
