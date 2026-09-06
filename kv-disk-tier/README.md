@@ -17,6 +17,37 @@ descriptors. `libdsv4_host_kv.so` backs the experimental `KV_DISK_CACHE_HOST_KV=
 (`ghcr.io/anemll/dspark-vllm-gx10:0.1.1`) has none, so a separate build image is
 used (`IMG`).
 
+## Stage on both nodes
+
+The tier modules are bind-mounted from `KV_DISK_CACHE_SRC` (default
+`/opt/dsv4-kv`), which must exist on **both** nodes with byte-identical Python
+and `.so` artifacts. From a clean checkout:
+
+```bash
+KV_SRC=/opt/dsv4-kv
+for h in spark1 spark2; do
+  ssh "$h" mkdir -p "$KV_SRC"
+  scp kv-disk-tier/{dsv4_kv_disk_tier,dsv4_shard_tier,dsv4_vllm_patches,dsv4_sitecustomize}.py \
+      kv-disk-tier/{build.sh,gpu_clear.sh} "$h:$KV_SRC/"
+done
+
+# Build the CUDA kernels (sm_121a) on each node, or build once and scp the .so.
+for h in spark1 spark2; do
+  ssh "$h" "IMG=vllm-dspark-runtime:dspark-nvfp4-stage-c KV_SRC=$KV_SRC bash $KV_SRC/build.sh"
+done
+
+# Confirm both nodes received matching artifacts before booting.
+for h in spark1 spark2; do ssh "$h" "md5sum $KV_SRC/dsv4_*.py $KV_SRC/libdsv4_*.so"; done
+```
+
+Pinned identities: serving image
+`ghcr.io/anemll/dspark-vllm-gx10:0.1.1@sha256:a83948492cf13df455170fb42885f5ef4db54fefe0feff0f841ecbff464ac9d8`
+(vLLM `0.25.2.dev0+g752a3a504.d20260714`), build image
+`vllm-dspark-runtime:dspark-nvfp4-stage-c`, model
+`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp@6821d6ad3681a4b137b066b76094fa82ebd0a380`.
+The patches target that exact vLLM build; a drifted source tree fails the
+startup preflight rather than silently skipping a required patch.
+
 ## Enable
 
 Set in `.env.dspark` (start syncs it to the worker):
@@ -35,6 +66,13 @@ exempts its own `OffloadingConnector` from vLLM's generic rejection; set
 `KV_DISK_CACHE_ALLOW_EXPANDABLE_SEGMENTS=0` to unset it — see below).
 `PYTHONHASHSEED=0` is required (block hashes are salted from it). `gpu_clear.sh`
 clears a stale container and leftover `/dev/shm` staging before a relaunch.
+
+`KV_DISK_CACHE_CPU_BYTES` sizes the connector's **primary CPU tier** — the fast
+restore tier. It is mandatory (vLLM's `OffloadingConnector` requires a primary
+tier), and it determines how many evicted blocks stay in CPU RAM and restore
+without touching NVMe versus spilling to disk. Blocks beyond this budget cascade
+to the NVMe tier. Under `KV_DISK_CACHE_HOST_KV=1` the primary tier is still
+allocated (the connector requires it) but its staging copy is bypassed.
 
 ## Disable
 
@@ -113,3 +151,24 @@ of the direct round-trip: `KV_DISK_CACHE_DIRECT_VERIFY=1`.
   ~750K-token fill OK (TTFT ~604 s, restore ~2.3 s), ~293K OK (TTFT ~134 s,
   restore ~1.0 s), ~149K OK (TTFT ~42 s), ~88K OK (TTFT ~20 s). With the knob
   off, ~293K hung the engine and ~750K crashed the container.
+
+## Performance evidence
+
+Reproduced on the two-node TP=2 lane (pinned image/model above, all other knobs
+default). Cold prefill and decode via
+`scripts/benchmark-0731.py --base-url http://127.0.0.1:8000/v1 --model default
+--prompt-lengths 2048,8192,32768,65536 --concurrency 1 --max-tokens 1024`:
+
+| config | prefill tok/s @ 2K / 8K / 32K / 64K | decode tok/s |
+| --- | --- | --- |
+| `KV_DISK_CACHE_HOST_KV=0` | 1612 / 1714 / 1777 / 1752 | 63 / 66 / 46 / 55 |
+| `KV_DISK_CACHE_HOST_KV=1` | 1485 / 1586 / 1599 / 1394 | 63 / 58 / 58 / 58 |
+
+Restore vs cold fill (same prompt, evicted between): a 12k-token prefix restores
+from NVMe in ~1.9 s TTFT versus ~19 s cold fill; a buried needle is recalled
+byte-identically on restore (`/tmp/recall_test.py`), and
+`KV_DISK_CACHE_DIRECT_VERIFY=1` byte-checks each direct host-KV cell. These
+prompts fit the CPU tier; the disk tier itself is exercised by the large-context
+fills above (~750K-token fill → ~2.3 s restore), consistent with the corrected
+~36M-token disk capacity in [Capacity](#capacity).
+
