@@ -838,6 +838,18 @@ def _bind(fn, *args):
     return lambda: fn(*args)
 
 
+def _direct_io_enabled() -> bool:
+    """True only when the experimental direct host-KV I/O path is on.
+
+    The GPU-block-id registry (``_GPU_BLOCK_MAP``) is populated exclusively by
+    ``apply_host_kv_direct_map`` under ``KV_DISK_CACHE_HOST_KV=1``. In the
+    default staging path the lookup can only ever return None, so gating on
+    this keeps the head from logging a bogus "no GPU-block mapping" warning on
+    every store/load.
+    """
+    return os.environ.get("KV_DISK_CACHE_HOST_KV") == "1"
+
+
 def _lookup_gpu_blocks(bid: int):
     """Return the ordered GPU block ids for a staging slot (direct host-KV I/O).
 
@@ -1223,8 +1235,8 @@ class DistributedShardTier(SecondaryTierManager):
             self._num_agents, fkeys, False, time.monotonic() + self._job_timeout_s
         )
         self._n_store_jobs += 1
-        _gb = [_lookup_gpu_blocks(b) for b in fbids]
-        _missing = [b for b, g in zip(fbids, _gb) if not g]
+        _gb = [_lookup_gpu_blocks(b) for b in fbids] if _direct_io_enabled() else None
+        _missing = [b for b, g in zip(fbids, _gb) if not g] if _gb is not None else []
         if _missing:
             logger.warning(
                 "[dsv4-shard] STORE: %d/%d staging slots have no GPU-block "
@@ -1263,8 +1275,8 @@ class DistributedShardTier(SecondaryTierManager):
             self._num_agents, keys, True, time.monotonic() + self._job_timeout_s
         )
         self._n_load_jobs += 1
-        _gb = [_lookup_gpu_blocks(b) for b in bids]
-        _missing = [b for b, g in zip(bids, _gb) if not g]
+        _gb = [_lookup_gpu_blocks(b) for b in bids] if _direct_io_enabled() else None
+        _missing = [b for b, g in zip(bids, _gb) if not g] if _gb is not None else []
         if _missing:
             logger.warning(
                 "[dsv4-shard] LOAD: %d/%d staging slots have no GPU-block "

@@ -483,7 +483,10 @@ def _transfer_async_patched(self, job_id: int, src_spec, dst_spec) -> bool:
 
 
 def _get_finished_patched(self):
-    results = _ORIG_GET_FINISHED(self)
+    # Materialize once: the stock get_finished() may return a one-shot
+    # generator. Iterating it here and then returning the same object would
+    # hand the caller an already-exhausted iterator.
+    results = list(_ORIG_GET_FINISHED(self))
     inflight = getattr(self, "_dsv4_inflight", None)
     if inflight:
         pool = self._dsv4_pool
@@ -1732,6 +1735,12 @@ def apply_host_kv_direct_map() -> None:
         if isinstance(staging_spec, BlockIDsLoadStoreSpec):
             _map_staging_to_gpu(gpu_spec, staging_spec, _BLOCK_SIZE_FACTOR)
             if is_store:
+                # Serialization contract: this ad-hoc attribute rides the
+                # TransferJob through the scheduler -> worker metadata handoff
+                # (the OffloadingConnector passes the TransferJob object graph
+                # wholesale via metadata.store_jobs). The worker reads it back
+                # in apply_host_kv_direct_skip's prepare_store_kv patch. Do not
+                # rename it without updating that read site.
                 self._dsv4_keys = [
                     _SLOT_TO_KEY.get(int(s)) for s in staging_spec.block_ids
                 ]

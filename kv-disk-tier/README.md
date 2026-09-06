@@ -65,8 +65,10 @@ KV_DISK_CACHE_BYTES=150000000000       # per-node NVMe quota
 exempts its own `OffloadingConnector` from vLLM's generic rejection, because
 without expandable segments large prefills exhaust the driver's memdesc pool
 (see the NVRM note in [Design notes](#design-notes)). `PYTHONHASHSEED=0` is
-required (block hashes are salted from it). `gpu_clear.sh` clears a stale
-container and leftover `/dev/shm` staging before a relaunch.
+required (block hashes are salted from it). If a previous run wedged a GPU
+(NCCL-stuck worker holding memory), `gpu_clear.sh` is a manual helper: it
+removes the stale container, clears leftover `/dev/shm` staging, and waits for
+`nvidia-smi` to report no compute apps before the next launch.
 
 `KV_DISK_CACHE_CPU_BYTES` sizes the connector's **primary CPU tier** — the fast
 restore tier. It is mandatory (vLLM's `OffloadingConnector` requires a primary

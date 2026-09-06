@@ -237,12 +237,16 @@ if [ "$LEGACY_PROJECT_NAME" != "$PROJECT_NAME" ]; then
   stop_project "$LEGACY_PROJECT_NAME"
 fi
 
-# Always clean leaked /dev/shm offload-staging mmaps after stopping, on every
-# node (see cleanup_shmem above for why this is required).
-cleanup_shmem local
-cleanup_shmem remote "$WORKER_HOST"
-if [ -n "$WORKER2_HOST" ]; then
-  cleanup_shmem remote2 "$WORKER2_HOST"
+# Clean leaked /dev/shm offload-staging mmaps after stopping, on every node
+# (see cleanup_shmem above for why this is required). Only when the disk tier
+# is enabled: those mmaps come from the OffloadingConnector, and on a shared
+# host the glob must not delete another vLLM process's staging files.
+if [ "${KV_DISK_CACHE_ENABLE:-0}" = "1" ]; then
+  cleanup_shmem local
+  cleanup_shmem remote "$WORKER_HOST"
+  if [ -n "$WORKER2_HOST" ]; then
+    cleanup_shmem remote2 "$WORKER2_HOST"
+  fi
 fi
 
 if [ "$STOP_NFS" = "1" ]; then

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the disk-tier CUDA kernels. Must run on each node (or build once and
-# copy the .so, which is what up-dsv4-diskcache.sh does).
+# copy the .so).
 #
 # libdsv4_batch_copy.so is what makes large restores possible at all: the NVIDIA
 # driver segfaults inside libcuda.so.1 above ~23,000 cuMemcpyBatchAsync
