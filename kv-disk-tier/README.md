@@ -53,19 +53,20 @@ startup preflight rather than silently skipping a required patch.
 Set in `.env.dspark` (start syncs it to the worker):
 
 ```bash
-DSPARK_ENABLE_DISK_TIER=1              # the on/off switch
+KV_DISK_CACHE_ENABLE=1               # the on/off switch
 KV_DISK_CACHE_SRC=/opt/dsv4-kv         # host dir with the modules + built .so (both nodes)
 KV_DISK_CACHE_DIR=${HOME}/kvdisk       # per-node NVMe cache dir
 KV_DISK_CACHE_CPU_BYTES=4294967296     # pinned CPU staging tier; caps largest restorable prompt
 KV_DISK_CACHE_BYTES=150000000000       # per-node NVMe quota
 ```
 
-`--kv-transfer-config` and the tier JSON are assembled from those knobs, and
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is kept by default (the tier
-exempts its own `OffloadingConnector` from vLLM's generic rejection; set
-`KV_DISK_CACHE_ALLOW_EXPANDABLE_SEGMENTS=0` to unset it — see below).
-`PYTHONHASHSEED=0` is required (block hashes are salted from it). `gpu_clear.sh`
-clears a stale container and leftover `/dev/shm` staging before a relaunch.
+`--kv-transfer-config` and the tier JSON are assembled from those knobs.
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is required and kept: the tier
+exempts its own `OffloadingConnector` from vLLM's generic rejection, because
+without expandable segments large prefills exhaust the driver's memdesc pool
+(see the NVRM note in [Design notes](#design-notes)). `PYTHONHASHSEED=0` is
+required (block hashes are salted from it). `gpu_clear.sh` clears a stale
+container and leftover `/dev/shm` staging before a relaunch.
 
 `KV_DISK_CACHE_CPU_BYTES` sizes the connector's **primary CPU tier** — the fast
 restore tier. It is mandatory (vLLM's `OffloadingConnector` requires a primary
@@ -76,14 +77,12 @@ allocated (the connector requires it) but its staging copy is bypassed.
 
 ## Disable
 
-Remove `DSPARK_ENABLE_DISK_TIER` (or set it to `0`). Everything else is inert.
+Remove `KV_DISK_CACHE_ENABLE` (or set it to `0`). Everything else is inert.
 
 ## Capacity
 
 The offloaded block is one concatenated KV cell of 4,263,168 B (~4.06 MB) per
-worker — the true packed cell. (An earlier revision counted it as
-272,842,752 B by summing 64 aliased views of the same canonical tensor, which
-shrank the tier 64×.) With the shipped `dsv4_block_size_factor=4` geometry the
+worker. With the shipped `dsv4_block_size_factor=4` geometry the
 main MLA group covers **1024 tokens per offloaded block**. The CPU staging tier
 is 503 blocks (4 GiB ≈ 515K tokens of the main group), and the per-node disk
 quota (`KV_DISK_CACHE_BYTES=150000000000`) holds **~35,185 blocks ≈ 36M tokens**
@@ -112,45 +111,24 @@ of the direct round-trip: `KV_DISK_CACHE_DIRECT_VERIFY=1`.
   request may store (`0` = unlimited). A prompt that fits in GPU KV doesn't need
   to spill to disk; set this to stop one huge request from flushing its whole
   prefix.
-- `KV_DISK_CACHE_ALLOW_EXPANDABLE_SEGMENTS=1` (default) — keep
-  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` by exempting the
-  `OffloadingConnector` from vLLM's generic KV-connector check (the connector
-  does not pin KV memory, so expandable segments are safe). This collapses GPU
-  memdesc pressure during prefill and lifts the large-context ceiling — see the
-  NVRM OOM note below. Set `0` to unset `PYTORCH_CUDA_ALLOC_CONF` (the old
-  behaviour).
 
-## Recent fixes
+## Design notes
 
-- **64× disk over-allocation.** The packed KV layout aliases 64 views of one
-  canonical tensor, and the block-size accounting summed them as 64 cells
-  (272,842,752 B/block) instead of one (4,263,168 B). The tier now detects the
-  packed layout and sizes the cell once — raising the disk tier from ~549 blocks
-  (~562K tokens) to ~35,185 blocks (~36M tokens) at the default quota.
+- **Expandable segments are required.** `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+  collapses the per-allocation memdesc pressure that otherwise exhausts the
+  NVIDIA driver's fixed-size pool (NVRM `_memdescAllocInternal`
+  `NV_ERR_NO_MEMORY`) during large single-request prefills. vLLM rejects
+  `expandable_segments:True` for every KV connector, but the
+  `OffloadingConnector` used here copies GPU↔CPU staging with
+  `cuMemcpyBatchAsync` and persists to NVMe — it never pins KV memory — so a
+  `sitecustomize` hook exempts it from that check. Verified: ~750K-token fill
+  OK (TTFT ~604 s, restore ~2.3 s), ~293K OK (TTFT ~134 s, restore ~1.0 s),
+  ~149K OK (TTFT ~42 s), ~88K OK (TTFT ~20 s).
 
-- **Store race → disk write in the copy handler.** The direct-STORE path used to
-  read host-KV in the shard agent *after* `_remove_pending_job` freed the blocks.
-  The disk write now happens inside the copy handler (`transfer_async`), while
-  the connector still pins the GPU blocks; the agent only acks after verifying
-  each cell file exists with the right size.
-
-- **Store/load race (crash).** `_sliding_window_lookup_patched` uses the vLLM
-  0.25.x `LookupResult` enum and mirrors stock exactly (the old bool/`None`
-  contract counted every lookup as a hit and crashed EngineCore on shared
-  prefixes).
-
-- **Large-copy chunking + SG threshold.** Batches ≥ `KV_DISK_CACHE_SG_THRESHOLD`
-  (default `20000`) descriptors go through the scatter-gather kernel instead of
-  `cuMemcpyBatchAsync` (which segfaults above ~23k); larger batches are sliced
-  with a per-slice stream sync.
-
-- **NVRM memdesc OOM.** Large single-request contexts exhausted the GPU driver's
-  memory-descriptor pool because the tier forced `PYTORCH_CUDA_ALLOC_CONF` empty
-  (expandable segments off). The tier now exempts the `OffloadingConnector` from
-  that rejection (see `KV_DISK_CACHE_ALLOW_EXPANDABLE_SEGMENTS`). Verified:
-  ~750K-token fill OK (TTFT ~604 s, restore ~2.3 s), ~293K OK (TTFT ~134 s,
-  restore ~1.0 s), ~149K OK (TTFT ~42 s), ~88K OK (TTFT ~20 s). With the knob
-  off, ~293K hung the engine and ~750K crashed the container.
+- **Disk writes happen in the copy handler.** The store path writes the cell
+  file inside `transfer_async`, while the connector still pins the GPU blocks;
+  the shard agent acks only after verifying each cell file exists with the right
+  size, so a store can never race the block-free.
 
 ## Performance evidence
 
@@ -169,6 +147,6 @@ from NVMe in ~1.9 s TTFT versus ~19 s cold fill; a buried needle is recalled
 byte-identically on restore (`/tmp/recall_test.py`), and
 `KV_DISK_CACHE_DIRECT_VERIFY=1` byte-checks each direct host-KV cell. These
 prompts fit the CPU tier; the disk tier itself is exercised by the large-context
-fills above (~750K-token fill → ~2.3 s restore), consistent with the corrected
+fills above (~750K-token fill → ~2.3 s restore), consistent with the
 ~36M-token disk capacity in [Capacity](#capacity).
 

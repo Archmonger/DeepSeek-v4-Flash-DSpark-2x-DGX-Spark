@@ -11,10 +11,10 @@ The patches cannot be applied at startup -- vLLM is not imported yet -- so this 
 finishes loading, which is the earliest point the patch subject exists and still
 well before any KV cache is allocated or any config object is constructed.
 
-Two patches, each env-gated and a no-op otherwise:
+Two patches, both a no-op unless the master switch is on:
   * KV_DISK_CACHE_HOST_KV=1 -- route the KV cache through cudaHostAlloc (see apply_host_kv_alloc).
-  * KV_DISK_CACHE_ALLOW_EXPANDABLE_SEGMENTS=1 -- exempt the OffloadingConnector from vLLM's
-    expandable_segments rejection (see below).
+  * always -- exempt the OffloadingConnector from vLLM's expandable_segments
+    rejection (the disk tier requires expandable segments; see below).
 """
 import os
 import sys
@@ -26,7 +26,7 @@ _HOOKS = []  # (target_module_name, callable)
 # allocation changes leaked in by any other experimental knob. Everything below
 # is gated on this one flag so an off launch leaves Python/config untouched and
 # needs no staged KV_DISK_CACHE_SRC.
-_ENABLED = os.environ.get("DSPARK_ENABLE_DISK_TIER", "0").strip() == "1"
+_ENABLED = os.environ.get("KV_DISK_CACHE_ENABLE", "0").strip() == "1"
 
 
 def _apply_host_kv():
@@ -89,7 +89,7 @@ if _ENABLED and os.environ.get("KV_DISK_CACHE_HOST_KV") == "1":
     _HOOKS.append(("vllm.v1.worker.gpu_model_runner", _apply_host_kv))
     _HOOKS.append(("vllm.v1.worker.gpu.model_runner", _apply_host_kv_v2))
 
-if _ENABLED and os.environ.get("KV_DISK_CACHE_ALLOW_EXPANDABLE_SEGMENTS") == "1":
+if _ENABLED:
     _HOOKS.append(("vllm.config.vllm", _apply_expandable_segments_exempt))
 
 if _HOOKS:

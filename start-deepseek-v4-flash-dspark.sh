@@ -527,7 +527,7 @@ fi
 # the tier is enabled, so a default-off launch never requires a staged
 # KV_DISK_CACHE_SRC and leaves Python/config untouched.
 HEAD_COMPOSE_FILES="-f docker-compose.dspark.yml"
-if [ "$DSPARK_ENABLE_DISK_TIER" = "1" ]; then
+if [ "$KV_DISK_CACHE_ENABLE" = "1" ]; then
   HEAD_COMPOSE_FILES="$HEAD_COMPOSE_FILES -f docker-compose.dspark-disk-tier.override.yml"
   WORKER_COMPOSE_FILES="$WORKER_COMPOSE_FILES -f docker-compose.dspark-disk-tier.override.yml"
   WORKER2_COMPOSE_FILES="$WORKER2_COMPOSE_FILES -f docker-compose.dspark-disk-tier.override.yml"
@@ -1295,7 +1295,7 @@ if [ "$DSPARK_WORKER_HF_NFS" = "1" ]; then
   [ -f "$NFS_OVERRIDE_FILE" ] || { echo "Missing NFS compose override: $NFS_OVERRIDE_FILE" >&2; exit 1; }
   scp "$NFS_OVERRIDE_FILE" "${WORKER_HOST}:${REMOTE_NFS_OVERRIDE_FILE}"
 fi
-if [ "$DSPARK_ENABLE_DISK_TIER" = "1" ]; then
+if [ "$KV_DISK_CACHE_ENABLE" = "1" ]; then
   scp "$SCRIPT_DIR/docker-compose.dspark-disk-tier.override.yml" \
       "${WORKER_HOST}:${REMOTE_WORKER_DIR}/docker-compose.dspark-disk-tier.override.yml"
 fi

@@ -1,5 +1,5 @@
 # Disk-backed KV cache volumes. Included by start-deepseek-v4-flash-dspark.sh
-# ONLY when DSPARK_ENABLE_DISK_TIER=1, so a default-off launch never mounts
+# ONLY when KV_DISK_CACHE_ENABLE=1, so a default-off launch never mounts
 # (or requires) a staged KV_DISK_CACHE_SRC and leaves sitecustomize untouched.
 services:
   vllm-dspark:
