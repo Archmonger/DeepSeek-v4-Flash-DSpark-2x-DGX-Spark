@@ -39,14 +39,10 @@ services:
 
     volumes:
       - ${HF_CACHE:-${HOME}/.cache/huggingface}:/cache/huggingface
-      # Disk backed KV cache (kv-disk-tier).
-      - ${KV_DISK_CACHE_SRC:-/opt/dsv4-kv}/dsv4_kv_disk_tier.py:/usr/local/lib/python3.12/dist-packages/dsv4_kv_disk_tier.py:ro
-      - ${KV_DISK_CACHE_SRC:-/opt/dsv4-kv}/dsv4_shard_tier.py:/usr/local/lib/python3.12/dist-packages/dsv4_shard_tier.py:ro
-      - ${KV_DISK_CACHE_SRC:-/opt/dsv4-kv}/dsv4_vllm_patches.py:/usr/local/lib/python3.12/dist-packages/dsv4_vllm_patches.py:ro
-      - ${KV_DISK_CACHE_SRC:-/opt/dsv4-kv}/dsv4_sitecustomize.py:/usr/lib/python3.12/sitecustomize.py:ro
-      - ${KV_DISK_CACHE_SRC:-/opt/dsv4-kv}/libdsv4_batch_copy.so:/usr/local/lib/libdsv4_batch_copy.so:ro
-      - ${KV_DISK_CACHE_SRC:-/opt/dsv4-kv}/libdsv4_host_kv.so:/usr/local/lib/libdsv4_host_kv.so:ro
-      - ${KV_DISK_CACHE_DIR:-${HOME}/kvdisk}:/kvdisk
+      # Disk backed KV cache (kv-disk-tier): its volumes live in
+      # docker-compose.dspark-disk-tier.override.yml, added by the launcher only
+      # when DSPARK_ENABLE_DISK_TIER=1 so an off launch needs no staged
+      # KV_DISK_CACHE_SRC and leaves sitecustomize untouched.
       # Optional Stage-C overlay: host proposer only when path exists on the
       # Anemll layout (vLLM ships DSpark under v1/worker/gpu/spec_decode).
       # GB10 hybrid plugin tree for ENABLE_VLLM_GB10_PATCH=1 only.

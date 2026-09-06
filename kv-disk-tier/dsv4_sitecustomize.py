@@ -21,6 +21,13 @@ import sys
 
 _HOOKS = []  # (target_module_name, callable)
 
+# The disk tier is default-off. When the master switch is off this module must
+# be a complete no-op: no import hooks, no monkeypatches, and no host-KV
+# allocation changes leaked in by any other experimental knob. Everything below
+# is gated on this one flag so an off launch leaves Python/config untouched and
+# needs no staged KV_DISK_CACHE_SRC.
+_ENABLED = os.environ.get("DSPARK_ENABLE_DISK_TIER", "0").strip() == "1"
+
 
 def _apply_host_kv():
     import dsv4_vllm_patches
@@ -55,20 +62,34 @@ def _apply_expandable_segments_exempt():
         return
 
     def _patched(self):
-        kt = self.kv_transfer_config
-        if kt is not None and kt.kv_connector == "OffloadingConnector":
-            return
-        return _orig(self)
+        # Run the stock check first so every unrelated check it performs (no
+        # connector, expandable_segments not set, cumem allocator, and any
+        # future additions) is preserved. We only swallow the ONE rejection we
+        # know is over-broad for this tier: the expandable_segments guard that
+        # protects RDMA-pinning connectors. The OffloadingConnector copies
+        # GPU<->CPU staging with cuMemcpyBatchAsync and persists to NVMe, so it
+        # never pins KV memory and CUDA VMM remapping is harmless.
+        try:
+            _orig(self)
+        except ValueError as e:
+            kt = self.kv_transfer_config
+            if (
+                kt is not None
+                and kt.kv_connector == "OffloadingConnector"
+                and "expandable_segments" in str(e)
+            ):
+                return
+            raise
 
     _patched._dsv4_exempt = True
     VllmConfig._verify_kv_transfer_compat = _patched
 
 
-if os.environ.get("KV_DISK_CACHE_HOST_KV") == "1":
+if _ENABLED and os.environ.get("KV_DISK_CACHE_HOST_KV") == "1":
     _HOOKS.append(("vllm.v1.worker.gpu_model_runner", _apply_host_kv))
     _HOOKS.append(("vllm.v1.worker.gpu.model_runner", _apply_host_kv_v2))
 
-if os.environ.get("KV_DISK_CACHE_ALLOW_EXPANDABLE_SEGMENTS") == "1":
+if _ENABLED and os.environ.get("KV_DISK_CACHE_ALLOW_EXPANDABLE_SEGMENTS") == "1":
     _HOOKS.append(("vllm.config.vllm", _apply_expandable_segments_exempt))
 
 if _HOOKS:

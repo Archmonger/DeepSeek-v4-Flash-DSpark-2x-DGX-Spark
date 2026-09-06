@@ -818,10 +818,16 @@ class ShardAgent:
         elif kind == "rehello":
             # The head asks us to re-report our on-disk inventory (e.g. after a
             # peer reconnected with a changed inventory). Rescan and re-send the
-            # same hello frame we send at startup.
+            # same hello frame we send at startup, echoing the round number so
+            # the head can drop late replies from older rounds.
             sock.send(
                 _ENC.encode(
-                    {"t": "hello", "rank": self._rank, "keys": self._inventory()}
+                    {
+                        "t": "hello",
+                        "rank": self._rank,
+                        "keys": self._inventory(),
+                        "gen": msg.get("gen", 0),
+                    }
                 )
             )
         elif kind == "bye":
@@ -856,7 +862,8 @@ def _lookup_gpu_blocks(bid: int):
 class _JobAcc:
     """Completion accumulator for one job, across all nodes."""
 
-    __slots__ = ("need", "acks", "ok", "deadline", "keys", "is_promotion")
+    __slots__ = ("need", "acks", "ok", "deadline", "keys", "is_promotion",
+                 "abandoned")
 
     def __init__(self, need: int, keys: list[bytes], is_promotion: bool,
                  deadline: float) -> None:
@@ -866,6 +873,11 @@ class _JobAcc:
         self.keys = keys
         self.is_promotion = is_promotion
         self.deadline = deadline
+        # Set on the FIRST timeout: the job is abandoned (results discarded)
+        # but still held so a live agent's in-flight I/O can finish touching its
+        # staging slots before the primary tier reuses them. A second timeout
+        # means the agents are presumed dead and the job is force-failed.
+        self.abandoned = False
 
 
 class DistributedShardTier(SecondaryTierManager):
@@ -920,6 +932,10 @@ class DistributedShardTier(SecondaryTierManager):
         self._identities: dict[bytes, int] = {}
         self._hellos: dict[int, list[bytes]] = {}
         self._ready = False
+        # Monotonic hello round: a reconnect bumps it, agents echo it, and any
+        # hello from an older round is ignored. This stops a late reply from
+        # restarting reconciliation after the head has already reached READY.
+        self._epoch = 0
 
         self._evicted_blocks = 0
         self._evicted_bytes = 0
@@ -989,23 +1005,33 @@ class DistributedShardTier(SecondaryTierManager):
         rank = int(msg["rank"])
         self._identities[ident] = rank
 
+        # Ignore hellos from an older round: a late rehello reply must not
+        # restart reconciliation after READY, and a spontaneous hello that raced
+        # a reconnect must not be counted into the new round.
+        gen = int(msg.get("gen", 0))
+        if gen < self._epoch:
+            return
+
         # A re-registration after READY means an agent reconnected with a
         # possibly-changed inventory (e.g. its process restarted). The
         # reconciled index is now stale, so discard it and ask EVERY agent to
-        # re-report before serving again -- otherwise the reconnect leaves
-        # _hellos at 1/N forever and the head keeps serving a stale index.
+        # re-report before serving again -- including the triggering one (its
+        # in-flight hello has gen < new epoch and is ignored above), otherwise
+        # a half-registered set leaves _hellos at 1/N forever.
         if self._ready:
+            self._epoch += 1
             logger.warning(
                 "[dsv4-shard] agent rank=%d reconnected after READY; discarding "
                 "the stale reconciled index and re-requesting inventory from "
-                "all %d agents",
-                rank, self._num_agents,
+                "all %d agents (epoch %d)",
+                rank, self._num_agents, self._epoch,
             )
             self._ready = False
             self._present.clear()
             self._bytes = 0
             self._hellos.clear()
-            self._broadcast({"t": "rehello"})
+            self._broadcast({"t": "rehello", "gen": self._epoch})
+            return
 
         self._hellos[rank] = [bytes(k) for k in msg.get("keys", ())]
         logger.info(
@@ -1262,15 +1288,36 @@ class DistributedShardTier(SecondaryTierManager):
         if self._jobs:
             now = time.monotonic()
             for job_id, acc in list(self._jobs.items()):
-                if now > acc.deadline:
-                    self._n_timeouts += 1
-                    logger.error(
+                if now <= acc.deadline:
+                    continue
+                if not acc.abandoned:
+                    # First timeout: discard the result but HOLD the job so a
+                    # live agent's queued/running I/O can still finish touching
+                    # its staging slots. Releasing now would let the primary
+                    # tier hand those slots to a new job while the old read/write
+                    # is still in flight. Give the agents one more full window
+                    # to ack; a live agent acks as soon as its I/O completes.
+                    acc.abandoned = True
+                    acc.deadline = now + self._job_timeout_s
+                    logger.warning(
                         "[dsv4-shard] job %d timed out after %.0fs with %d/%d "
-                        "acks -- failing it so the primary tier can release "
-                        "its blocks", job_id, self._job_timeout_s, acc.acks,
+                        "acks -- holding it for one more window so in-flight "
+                        "peer I/O can drain before its staging slots are "
+                        "reused", job_id, self._job_timeout_s, acc.acks,
                         acc.need,
                     )
-                    self._finish(job_id, acc, False)
+                    continue
+                # Second timeout: agents are presumed dead/hung. Nothing can
+                # still be touching the slots except a genuinely wedged thread;
+                # fail the job so the primary tier releases its blocks.
+                self._n_timeouts += 1
+                logger.error(
+                    "[dsv4-shard] job %d still unacked after %.0fs grace with "
+                    "%d/%d acks -- failing it so the primary tier can release "
+                    "its blocks", job_id, self._job_timeout_s, acc.acks,
+                    acc.need,
+                )
+                self._finish(job_id, acc, False)
         out = self._done
         self._done = []
         return out

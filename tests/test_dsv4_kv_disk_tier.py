@@ -26,13 +26,52 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "kv-disk-tier"))
 
+
+def _missing_external_dependency(err: Exception) -> bool:
+    """True only when a top-level third-party dep is absent on this host.
+
+    A ``ModuleNotFoundError`` naming ``vllm`` / ``zmq`` / ``msgspec`` (or one of
+    their submodules) means the environment genuinely lacks the dependency and
+    the suite should skip. Anything else -- a syntax error, a ``NameError``, an
+    ``ImportError: cannot import name ...`` from our own modules or a drifted
+    vLLM API -- is a real bug and must fail the suite, not hide it.
+    """
+    name = getattr(err, "name", None)
+    return (
+        isinstance(err, ModuleNotFoundError)
+        and bool(name)
+        and name.split(".")[0] in ("vllm", "zmq", "msgspec")
+    )
+
+
 try:
-    import dsv4_shard_tier
+    import dsv4_shard_tier  # noqa: F401
+    import dsv4_kv_disk_tier  # noqa: F401
+except ImportError as e:
+    if _missing_external_dependency(e):
+        # vllm/zmq/msgspec unavailable on this host: skip the whole suite.
+        dsv4_shard_tier = None
+        dsv4_kv_disk_tier = None
+        _HAVE_TIER = False
+    else:
+        raise  # our own import bug: fail loudly
+else:
+    _HAVE_TIER = True
+
+if _HAVE_TIER:
+    # Our own symbols: an import failure here is a real bug, never a missing dep.
     from dsv4_kv_disk_tier import CappedFileSystemTierManager, _load_block_buffered
-    from vllm.v1.kv_offload.tiering.base import LookupResult
-    from vllm.v1.kv_offload.tiering.fs.manager import FileSystemTierManager
-except Exception:  # pragma: no cover - env-dependent import
-    dsv4_shard_tier = None
+
+    try:
+        from vllm.v1.kv_offload.tiering.base import LookupResult
+        from vllm.v1.kv_offload.tiering.fs.manager import FileSystemTierManager
+    except ImportError as e:
+        if _missing_external_dependency(e):
+            LookupResult = None
+            FileSystemTierManager = None
+        else:
+            raise
+else:
     CappedFileSystemTierManager = None
     _load_block_buffered = None
     LookupResult = None
@@ -104,6 +143,111 @@ class TestShardTierAccounting(unittest.TestCase):
         t._jobs = {1: object()}
         t._done = []
         self.assertTrue(t.has_pending_work())
+
+
+def make_head():
+    t = dsv4_shard_tier.DistributedShardTier.__new__(
+        dsv4_shard_tier.DistributedShardTier
+    )
+    t._num_agents = 2
+    t._identities = {}
+    t._hellos = {}
+    t._ready = False
+    t._epoch = 0
+    t._slice_bytes = SLICE
+    t._present = OrderedDict()
+    t._bytes = 0
+    t._pinned = {}
+    t._jobs = {}
+    t._done = []
+    t._n_timeouts = 0
+    t._sent = []
+    t._broadcast = lambda payload: (t._sent.append(payload), True)[1]
+    return t
+
+
+def _jacc(need, keys, deadline, abandoned=False):
+    return type(
+        "Acc",
+        (),
+        {
+            "need": need,
+            "acks": 0,
+            "ok": True,
+            "deadline": deadline,
+            "keys": keys,
+            "is_promotion": False,
+            "abandoned": abandoned,
+        },
+    )()
+
+
+@unittest.skipIf(dsv4_shard_tier is None, "vllm/zmq not importable")
+class TestRecoveryTransitions(unittest.TestCase):
+    def test_timeout_holds_then_fails(self):
+        t = make_head()
+        t._drain = lambda: None
+        t._job_timeout_s = 10.0
+        t._pinned = {b"a": 1}
+        t._present = OrderedDict([(b"a", None)])
+        t._bytes = SLICE
+        acc = _jacc(2, [b"a"], deadline=0.0)
+        t._jobs = {1: acc}
+
+        # First call: past deadline, not yet abandoned -> hold, no result.
+        out = list(t.get_finished())
+        self.assertEqual(out, [])
+        self.assertTrue(acc.abandoned)
+        self.assertIn(1, t._jobs)  # still held so peer I/O can drain
+
+        # Simulate the grace window expiring with the agents still silent.
+        acc.deadline = 0.0
+        # Second call: still past deadline -> force-fail and release.
+        out = list(t.get_finished())
+        self.assertEqual(len(out), 1)
+        self.assertFalse(out[0].success)
+        self.assertEqual(t._n_timeouts, 1)
+        self.assertNotIn(1, t._jobs)
+
+    def test_reconcile_drops_partial_shards(self):
+        t = make_head()
+        t._on_hello(b"id0", {"rank": 0, "keys": [b"shared", b"only0"]})
+        t._on_hello(b"id1", {"rank": 1, "keys": [b"shared", b"only1"]})
+        self.assertTrue(t._ready)
+        self.assertIn(b"shared", t._present)
+        self.assertNotIn(b"only0", t._present)
+        self.assertNotIn(b"only1", t._present)
+        evicts = [p for p in t._sent if p.get("t") == "evict"]
+        self.assertTrue(evicts)
+
+    def test_reconnect_drops_stale_hellos(self):
+        t = make_head()
+        # Round 0: both agents register, reconcile -> READY.
+        t._on_hello(b"id0", {"rank": 0, "keys": [b"a"]})
+        t._on_hello(b"id1", {"rank": 1, "keys": [b"a"]})
+        self.assertTrue(t._ready)
+        self.assertEqual(t._epoch, 0)
+
+        # Agent 0 reconnects with a changed inventory.
+        t._on_hello(b"id0", {"rank": 0, "keys": [b"b"]})
+        self.assertFalse(t._ready)
+        self.assertEqual(t._epoch, 1)
+        self.assertEqual(t._hellos, {})  # triggering hello dropped
+        self.assertTrue(
+            any(p.get("t") == "rehello" and p.get("gen") == 1 for p in t._sent)
+        )
+
+        # A late hello from the OLD round (gen 0) must not start a new round.
+        t._on_hello(b"id1", {"rank": 1, "keys": [b"a"], "gen": 0})
+        self.assertNotIn(1, t._hellos)
+        self.assertFalse(t._ready)
+
+        # Fresh round-1 hellos reconcile again.
+        t._on_hello(b"id0", {"rank": 0, "keys": [b"b"], "gen": 1})
+        t._on_hello(b"id1", {"rank": 1, "keys": [b"b"], "gen": 1})
+        self.assertTrue(t._ready)
+        self.assertIn(b"b", t._present)
+        self.assertNotIn(b"a", t._present)
 
 
 @unittest.skipIf(
