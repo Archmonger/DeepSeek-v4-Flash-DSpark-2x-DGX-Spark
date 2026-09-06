@@ -95,11 +95,16 @@ of the main group — comfortably past a full 1M-token context. Raise
 
 `KV_DISK_CACHE_HOST_KV=1` allocates the KV cache from `cudaHostAlloc` so the
 disk tier can DMA straight into it, skipping the GPU↔CPU staging copy on store
-and load. Measured (2026-09-05, 2× DGX Spark): **~8–20% slower prefill** (KV
-writes land in host-pinned memory; the penalty grows with prompt length — ~8% at
-2k tokens, ~20% at 64k), decode unchanged. The staging tier it is meant to
-replace is 4 GiB/node (`KV_DISK_CACHE_CPU_BYTES`); as shipped that tier is still
-allocated, so the win is the I/O shortcut, not a RAM saving. Byte-verification
+and load. **It trades prefill throughput for a faster large-restore path.**
+Measured (2026-09-05, 2× DGX Spark): **~8–20% slower prefill** (KV writes land
+in host-pinned memory; the penalty grows with prompt length — ~8% at 2k tokens,
+~20% at 64k), decode unchanged. In exchange, large restores skip one copy
+(disk → host-KV instead of disk → staging → GPU). The staging tier it is meant
+to replace is 4 GiB/node (`KV_DISK_CACHE_CPU_BYTES`); as shipped that tier is
+still allocated (vLLM requires a primary tier) and its capacity bounds how many
+disk blocks can be concurrently promoted, so the win is the I/O shortcut on
+large restores — not a RAM saving and not a free win. **Off by default**;
+enable it only for a workload dominated by very large restores. Byte-verification
 of the direct round-trip: `KV_DISK_CACHE_DIRECT_VERIFY=1`.
 
 ## Optional tuning

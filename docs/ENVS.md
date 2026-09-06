@@ -74,7 +74,7 @@ PY
 | `KV_DISK_CACHE_SG_SO` | Path to the scatter-gather kernel, default `/usr/local/lib/libdsv4_batch_copy.so`. |
 | `KV_DISK_CACHE_MAX_COPIES_PER_BATCH` | Bound on copies per driver/SG launch; slices with a per-slice stream sync so a huge restore can't submit one unbounded batch. Default **8192**. |
 | `KV_DISK_CACHE_MAX_OFFLOAD_BLOCKS_PER_REQUEST` | Cap on offload keys a single request may store; `0` = unlimited. Stops an in-GPU prompt from spilling its whole prefix to disk. Default **0**. |
-| `KV_DISK_CACHE_HOST_KV` | **Experimental.** Allocate the KV cache from `cudaHostAlloc` so the disk tier can DMA straight into it. Default **0**; requires `libdsv4_host_kv.so` built on each node (`kv-disk-tier/build.sh`). |
+| `KV_DISK_CACHE_HOST_KV` | **Experimental.** Allocate the KV cache from `cudaHostAlloc` so the disk tier can DMA straight into it, trading prefill throughput for a faster large-restore path (measured ~8–20% slower prefill, decode unchanged; the staging tier is still allocated). Default **0**; requires `libdsv4_host_kv.so` built on each node (`kv-disk-tier/build.sh`). |
 | `KV_DISK_CACHE_HOST_KV_SO` | Path to the host-KV allocator, default `/usr/local/lib/libdsv4_host_kv.so`. |
 | `KV_DISK_CACHE_DIRECT_VERIFY` | Byte-verify every direct host-KV store/load cell against its buffers (default **0**). |
 | `KV_DISK_CACHE_SHARD_HEAD` / `KV_DISK_CACHE_SHARD_PORT` | ZMQ address the shard agents connect to (default `tcp://${MASTER_ADDR}:25055`). |
