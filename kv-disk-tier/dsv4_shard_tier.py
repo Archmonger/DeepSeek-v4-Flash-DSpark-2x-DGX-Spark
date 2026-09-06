@@ -290,6 +290,45 @@ def _slice_buffers(buffers, skip: int):
     return out
 
 
+_VERIFY_DIRECT = os.environ.get("DSV4_DIRECT_VERIFY", "0").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+_VERIFY_OK = [0]
+
+
+def _verify_file_matches_buffers(path: str, buffers, total: int) -> None:
+    """Byte-compare a stored/loaded cell against the host-KV buffers.
+
+    Proves the direct I/O round-trip is byte-exact: the file's bytes equal the
+    host-KV bytes at the addresses the scheduler's mapping produced. Any torn
+    write, short read, or off-by-N address shows up as a divergence here and
+    fails the job rather than persisting a bad cell.
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+    if len(data) != total:
+        raise RuntimeError(
+            f"[dsv4-shard] verify: {path} size {len(data)} != expected {total}"
+        )
+    off = 0
+    for b in buffers:
+        n = len(b)
+        chunk = data[off:off + n]
+        if chunk != b.tobytes():
+            a = b.tobytes()
+            i = next((j for j in range(n) if a[j] != chunk[j]), -1)
+            raise RuntimeError(
+                f"[dsv4-shard] verify FAILED: {path} diverges at byte "
+                f"{off + i} of {total} (chunk {n})"
+            )
+        off += n
+    _VERIFY_OK[0] += 1
+    if _VERIFY_OK[0] % 50 == 0:
+        logger.info(
+            "[dsv4-shard] verify ok: %d cells byte-exact", _VERIFY_OK[0],
+        )
+
+
 def _load_one_direct(path: str, iov) -> None:
     """Scatter-read one block cell directly into host-KV tensor addresses.
 
@@ -330,6 +369,8 @@ def _load_one_direct(path: str, iov) -> None:
     finally:
         if fd >= 0:
             os.close(fd)
+    if _VERIFY_DIRECT:
+        _verify_file_matches_buffers(path, buffers, total)
 
 
 def _store_one_direct(path: str, iov) -> None:
@@ -375,6 +416,8 @@ def _store_one_direct(path: str, iov) -> None:
         if fd >= 0:
             os.close(fd)
     os.replace(tmp, path)
+    if _VERIFY_DIRECT:
+        _verify_file_matches_buffers(path, buffers, total)
 
 
 class ShardAgent:
@@ -478,6 +521,7 @@ class ShardAgent:
         self._direct_cell = 0
         self._zero_buf = None
         self._zero_addr = 0
+        self._zero_discard_addr = 0
         if direct_tensors is not None:
             self._direct_layout = [
                 (int(t.data_ptr()), int(t.stride(0)), int(t.shape[1]))
@@ -490,10 +534,17 @@ class ShardAgent:
             self._direct_cell = sum(
                 size * self._direct_bf for _, _, size in self._direct_layout
             )
-            # One shared zero-filled sub-block used for null/skipped positions
-            # so every cell keeps its full F*size length in file order.
-            self._zero_buf = np.zeros(self._direct_layout[0][2], dtype=np.uint8)
-            self._zero_addr = int(self._zero_buf.ctypes.data)
+            # Null/skipped sub-blocks must keep every cell at its full F*size
+            # length. A STORE writes from an IMMUTABLE zero buffer (so a
+            # concurrent LOAD's discard read can never mutate what the store
+            # wrote, which would otherwise trip byte-verification). A LOAD
+            # discards into a separate mutable buffer.
+            _z = np.zeros(self._direct_layout[0][2], dtype=np.uint8)
+            _z.setflags(write=False)
+            self._zero_buf = _z
+            self._zero_addr = int(_z.ctypes.data)
+            _discard = np.zeros(self._direct_layout[0][2], dtype=np.uint8)
+            self._zero_discard_addr = int(_discard.ctypes.data)
             logger.info(
                 "[dsv4-shard] direct host-KV I/O enabled: %d canonical tensors, "
                 "block_size_factor=%d, cell=%d B (staging slice=%d B)",
@@ -531,15 +582,15 @@ class ShardAgent:
     def _offset(self, block_id: int) -> int:
         return block_id * self._row_stride + self._slot_off
 
-    def _direct_iovecs(self, gpu_blocks):
+    def _direct_iovecs(self, gpu_blocks, for_write: bool = True):
         """Scatter/gather iovecs for one offloaded block, in file order.
 
         ``gpu_blocks`` is the ORDERED list of GPU block ids this cell holds
         (one entry per sub-block, computed by the scheduler and forwarded by
-        the head). A 0 entry is a null/skipped sub-block and is filled with a
-        shared zero buffer so the cell keeps its full F*size length. NOT a
-        staging slot id -- staging slots are an LRU-reused namespace that never
-        corresponds to GPU block addresses.
+        the head). A 0 entry is a null/skipped sub-block: for a store it is
+        filled from an immutable zero buffer; for a load it is discarded into a
+        separate mutable buffer. NOT a staging slot id -- staging slots are an
+        LRU-reused namespace that never corresponds to GPU block addresses.
         """
         if not gpu_blocks:
             # The staging copy was skipped (direct mode), so a missing mapping
@@ -550,13 +601,14 @@ class ShardAgent:
                 "[dsv4-shard] direct host-KV I/O requested but no GPU block ids "
                 "were recorded for this staging slot; failing the job (safe)"
             )
+        zaddr = self._zero_addr if for_write else self._zero_discard_addr
         iov = []
         for ptr, stride, size in self._direct_layout:
             for g in gpu_blocks:
                 if int(g) > 0:
                     iov.append((ptr + int(g) * stride, size))
                 else:
-                    iov.append((self._zero_addr, size))
+                    iov.append((zaddr, size))
         return iov
 
     def _ensure_dir(self, path: str) -> None:
@@ -696,7 +748,7 @@ class ShardAgent:
                         job_id,
                         len(keys),
                         [
-                            _bind(_store_one_direct, p, self._direct_iovecs(gb))
+                            _bind(_store_one_direct, p, self._direct_iovecs(gb, True))
                             for p, gb in zip(paths, _gb)
                         ],
                     )
@@ -717,7 +769,7 @@ class ShardAgent:
                         job_id,
                         len(keys),
                         [
-                            _bind(_load_one_direct, p, self._direct_iovecs(gb))
+                            _bind(_load_one_direct, p, self._direct_iovecs(gb, False))
                             for p, gb in zip(paths, _gb)
                         ],
                     )
