@@ -143,14 +143,14 @@ DEFAULT_PORT = 25055
 def _head_addr_from_env() -> str:
     """Resolve the head endpoint agents dial.
 
-    ``DSV4_SHARD_HEAD`` wins; otherwise fall back to the same master address
+    ``KV_DISK_CACHE_SHARD_HEAD`` wins; otherwise fall back to the same master address
     vLLM's own multinode bootstrap uses, so a stock launch needs no new env.
     """
-    explicit = os.environ.get("DSV4_SHARD_HEAD")
+    explicit = os.environ.get("KV_DISK_CACHE_SHARD_HEAD")
     if explicit:
         return explicit
     host = os.environ.get("MASTER_ADDR") or os.environ.get("VLLM_HOST_IP") or "127.0.0.1"
-    port = os.environ.get("DSV4_SHARD_PORT", str(DEFAULT_PORT))
+    port = os.environ.get("KV_DISK_CACHE_SHARD_PORT", str(DEFAULT_PORT))
     return f"tcp://{host}:{port}"
 
 
@@ -175,7 +175,7 @@ def _head_addr_from_env() -> str:
 # Persisting only this node's slice is what made the length divisible; the stock
 # full-row I/O unit could never be aligned. Falls back to buffered on EINVAL so a
 # different filesystem or block size degrades instead of failing.
-_USE_ODIRECT = os.environ.get("DSV4_SHARD_ODIRECT", "1") != "0"
+_USE_ODIRECT = os.environ.get("KV_DISK_CACHE_SHARD_ODIRECT", "1") != "0"
 _ODIRECT_OK = _USE_ODIRECT
 
 
@@ -290,7 +290,7 @@ def _slice_buffers(buffers, skip: int):
     return out
 
 
-_VERIFY_DIRECT = os.environ.get("DSV4_DIRECT_VERIFY", "0").strip().lower() in (
+_VERIFY_DIRECT = os.environ.get("KV_DISK_CACHE_DIRECT_VERIFY", "0").strip().lower() in (
     "1", "true", "yes", "on",
 )
 _VERIFY_OK = [0]
@@ -511,7 +511,7 @@ class ShardAgent:
         self._n_load = 0
         self._n_evict = 0
         self._n_fail = 0
-        # Direct host-KV I/O (DSV4_HOST_KV=1): the agent reads/writes the
+        # Direct host-KV I/O (KV_DISK_CACHE_HOST_KV=1): the agent reads/writes the
         # cudaHostAlloc-backed KV tensors directly, skipping the staging mmap.
         # direct_tensors are the worker's canonical GPU 2D views
         # (num_blocks, page_size) with stride (row_stride, 1); the file cell is
@@ -1413,14 +1413,14 @@ def maybe_start_shard_agent(offloading_spec, handlers) -> None:
 
     direct_tensors = None
     direct_bf = 0
-    if os.environ.get("DSV4_HOST_KV") == "1":
+    if os.environ.get("KV_DISK_CACHE_HOST_KV") == "1":
         _lh = getattr(handlers, "_load_handler", None)
         if _lh is None or not getattr(_lh, "dst_tensors", None):
-            # The staging copy is skipped under DSV4_HOST_KV=1, so falling back
+            # The staging copy is skipped under KV_DISK_CACHE_HOST_KV=1, so falling back
             # to the staging path would read/write bytes that were never copied
             # -- silent corruption. Refuse to start.
             raise RuntimeError(
-                "[dsv4-shard] DSV4_HOST_KV=1 but the worker's load handler "
+                "[dsv4-shard] KV_DISK_CACHE_HOST_KV=1 but the worker's load handler "
                 "exposed no host-KV tensors; direct host-KV I/O cannot start"
             )
         direct_tensors = list(_lh.dst_tensors)
@@ -1430,7 +1430,7 @@ def maybe_start_shard_agent(offloading_spec, handlers) -> None:
         # layout). Any other geometry would write the cell in the wrong order.
         if len(direct_tensors) != 1 or direct_bf <= 0:
             raise RuntimeError(
-                "[dsv4-shard] DSV4_HOST_KV=1 but the KV layout is not the "
+                "[dsv4-shard] KV_DISK_CACHE_HOST_KV=1 but the KV layout is not the "
                 f"single-tensor packed form (n_tensors={len(direct_tensors)}, "
                 f"bf={direct_bf}); direct host-KV I/O cannot map the cell safely"
             )

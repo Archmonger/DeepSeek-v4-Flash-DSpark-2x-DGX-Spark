@@ -12,29 +12,29 @@ Every patch is individually gated by an environment variable so the whole set
 can be bisected without editing code. Defaults are the recommended
 first-restart configuration.
 
-    DSV4_PATCH_BUG2_KEEPALIVE=1   retain cuMemcpyBatchAsync descriptor arrays
+    KV_DISK_CACHE_PATCH_BUG2_KEEPALIVE=1   retain cuMemcpyBatchAsync descriptor arrays
                                   until the transfer's end_event completes
-    DSV4_PATCH_BUG2_WAITSTREAM=0  make CPU->GPU loads wait on the compute
+    KV_DISK_CACHE_PATCH_BUG2_WAITSTREAM=0  make CPU->GPU loads wait on the compute
                                   stream (hunk 2; keep OFF on the first run so
                                   the two mechanisms stay bisectable)
-    DSV4_PIN_DESCRIPTORS=1        page-lock the descriptor buffers
-    DSV4_PATCH_TENSOR_ALIAS=1     stop shutdown() of one handler emptying the
+    KV_DISK_CACHE_PIN_DESCRIPTORS=1        page-lock the descriptor buffers
+    KV_DISK_CACHE_PATCH_TENSOR_ALIAS=1     stop shutdown() of one handler emptying the
                                   other handler's tensor lists
-    DSV4_PATCH_BUG1_IO=1          O_DIRECT alignment + non-destructive load
-    DSV4_PATCH_SWLOOKUP=1         stop the 7.4x over-promotion on SWA groups
-    DSV4_PATCH_NUMBLOCKS_GUARD=1  actionable error instead of "cannot mmap an
+    KV_DISK_CACHE_PATCH_BUG1_IO=1          O_DIRECT alignment + non-destructive load
+    KV_DISK_CACHE_PATCH_SWLOOKUP=1         stop the 7.4x over-promotion on SWA groups
+    KV_DISK_CACHE_PATCH_NUMBLOCKS_GUARD=1  actionable error instead of "cannot mmap an
                                   empty file" when the CPU tier rounds to 0
-    DSV4_BATCH_LOG=1              log num_copy_ops / refs-per-group per transfer
-    DSV4_MAX_COPIES_PER_BATCH=8192  bound copies per driver/SG launch (default
+    KV_DISK_CACHE_BATCH_LOG=1              log num_copy_ops / refs-per-group per transfer
+    KV_DISK_CACHE_MAX_COPIES_PER_BATCH=8192  bound copies per driver/SG launch (default
                                   8192). Slices the batch with a per-slice
                                   stream sync so a huge restore can't submit one
                                   unbounded batch to the driver.
-    DSV4_SG_THRESHOLD=20000       batches with >= this many descriptors go
+    KV_DISK_CACHE_SG_THRESHOLD=20000       batches with >= this many descriptors go
                                   through the scatter-gather kernel; below it
                                   the driver's cuMemcpyBatchAsync path is faster
                                   and is used directly (the driver segfaults
                                   above ~23k descriptors, so 20000 stays clear).
-    DSV4_MAX_OFFLOAD_BLOCKS_PER_REQUEST=0  cap on the number of offload keys a
+    KV_DISK_CACHE_MAX_OFFLOAD_BLOCKS_PER_REQUEST=0  cap on the number of offload keys a
                                   single request may store (0 = unlimited).
                                   Stops a prompt that fits in GPU KV from
                                   spilling its whole prefix to disk.
@@ -349,7 +349,7 @@ def _swap_blocks_batch_patched(
     # Retain until get_finished() proves end_event completed.
     captured.append(buf)
 
-    # Above DSV4_SG_THRESHOLD descriptors, bypass cuMemcpyBatchAsync entirely and
+    # Above KV_DISK_CACHE_SG_THRESHOLD descriptors, bypass cuMemcpyBatchAsync entirely and
     # do the scatter-gather in our own kernel. The driver segfaults INSIDE
     # libcuda.so.1 above ~23k descriptors (core dump: PC in libcuda's range, x0=0,
     # i.e. an unchecked NULL from a failed internal allocation; dmesg shows NVRM
@@ -409,7 +409,7 @@ def _swap_blocks_batch_patched(
     # refinement. Sub-batches after the first have a non-zero storage_offset;
     # TensorBase::data_ptr() accounts for storage_offset, so the C++ side sees
     # the sub-batch base.
-    # DSV4_CHUNK_SYNC bounds the copies the driver has PENDING, not just the
+    # KV_DISK_CACHE_CHUNK_SYNC bounds the copies the driver has PENDING, not just the
     # number per call. Chunking alone was measured NOT to fix the large-restore
     # segfault (chunk=16384 verified applied in the log, same fault at the same
     # copy_ops), which is consistent with a limit on outstanding work per stream
@@ -417,7 +417,7 @@ def _swap_blocks_batch_patched(
     # is the only way to tell those two apart, and the only remaining lever on
     # the ~20k-descriptor wall. Cheap: the copy is ~0.145 s for a 1M restore
     # against ~1.7 s of NVMe feeding it, so a dozen syncs cost nothing.
-    sync_between = _flag("DSV4_CHUNK_SYNC", "0")
+    sync_between = _flag("KV_DISK_CACHE_CHUNK_SYNC", "0")
     for lo in range(0, n, chunk):
         hi = min(lo + chunk, n)
         _ORIG_SWAP_BLOCKS_BATCH(
@@ -1176,7 +1176,7 @@ def check_multinode_safe(vllm_config) -> None:
 
     if world <= local:
         return
-    if not _flag("DSV4_ALLOW_MULTINODE_TIER", "0"):
+    if not _flag("KV_DISK_CACHE_ALLOW_MULTINODE_TIER", "0"):
         raise RuntimeError(
             "dsv4-patch: refusing to build a disk/secondary KV tier on a "
             f"MULTI-NODE deployment (world_size={world}, local GPUs={local}).\n"
@@ -1187,7 +1187,7 @@ def check_multinode_safe(vllm_config) -> None:
             "promo_ok, hit-rate and IO-failure metrics all look perfect. "
             "Verified here by needle test: secret recovered cold, LOST after a "
             "disk restore.\nUse single-node TP, or set "
-            "DSV4_ALLOW_MULTINODE_TIER=1 if you have verified all workers "
+            "KV_DISK_CACHE_ALLOW_MULTINODE_TIER=1 if you have verified all workers "
             "share the scheduler's /dev/shm."
         )
     logger.warning(
@@ -1224,7 +1224,7 @@ def _multinode_guard_patched(self, *args, **kwargs):
     all ``world_size`` workers are on this node. ``torch.cuda.device_count()``
     is the local world size.
 
-    DSV4_ALLOW_MULTINODE_TIER=1 bypasses this ONLY if you have verified every
+    KV_DISK_CACHE_ALLOW_MULTINODE_TIER=1 bypasses this ONLY if you have verified every
     worker shares the scheduler's /dev/shm (true single-node TP).
     """
     try:
@@ -1236,7 +1236,7 @@ def _multinode_guard_patched(self, *args, **kwargs):
         return _ORIG_TIERING_GET_MANAGER(self, *args, **kwargs)
 
     if world > local:
-        if not _flag("DSV4_ALLOW_MULTINODE_TIER", "0"):
+        if not _flag("KV_DISK_CACHE_ALLOW_MULTINODE_TIER", "0"):
             raise RuntimeError(
                 "dsv4-patch: refusing to build a disk/secondary KV tier on a "
                 f"MULTI-NODE deployment (world_size={world}, local GPUs="
@@ -1248,7 +1248,7 @@ def _multinode_guard_patched(self, *args, **kwargs):
                 "and IO-failure metrics all look perfect. Verified here with a "
                 "needle test: the secret was recovered cold and LOST after a "
                 "disk restore.\nUse single-node TP, or set "
-                "DSV4_ALLOW_MULTINODE_TIER=1 if you have verified that all "
+                "KV_DISK_CACHE_ALLOW_MULTINODE_TIER=1 if you have verified that all "
                 "workers share the scheduler's /dev/shm."
             )
         logger.warning(
@@ -1275,7 +1275,7 @@ def apply_multinode_guard() -> None:
 
 
 # ===========================================================================
-# Bound eager offload (DSV4_MAX_OFFLOAD_BLOCKS_PER_REQUEST)
+# Bound eager offload (KV_DISK_CACHE_MAX_OFFLOAD_BLOCKS_PER_REQUEST)
 # ===========================================================================
 #
 # vLLM's offloading scheduler (kv_role=kv_both) stores EVERY request's prompt
@@ -1371,11 +1371,11 @@ def apply_all() -> None:
     global _PIN_DESCRIPTORS, _WAITSTREAM_ON_LOAD, _BATCH_LOG
     global _MAX_COPIES_PER_BATCH, _MAX_OFFLOAD_BLOCKS
 
-    _PIN_DESCRIPTORS = _flag("DSV4_PIN_DESCRIPTORS", "1")
-    _WAITSTREAM_ON_LOAD = _flag("DSV4_PATCH_BUG2_WAITSTREAM", "0")
-    _BATCH_LOG = _flag("DSV4_BATCH_LOG", "1")
-    _MAX_COPIES_PER_BATCH = _intenv("DSV4_MAX_COPIES_PER_BATCH", 8192)
-    _MAX_OFFLOAD_BLOCKS = _intenv("DSV4_MAX_OFFLOAD_BLOCKS_PER_REQUEST", 0)
+    _PIN_DESCRIPTORS = _flag("KV_DISK_CACHE_PIN_DESCRIPTORS", "1")
+    _WAITSTREAM_ON_LOAD = _flag("KV_DISK_CACHE_PATCH_BUG2_WAITSTREAM", "0")
+    _BATCH_LOG = _flag("KV_DISK_CACHE_BATCH_LOG", "1")
+    _MAX_COPIES_PER_BATCH = _intenv("KV_DISK_CACHE_MAX_COPIES_PER_BATCH", 8192)
+    _MAX_OFFLOAD_BLOCKS = _intenv("KV_DISK_CACHE_MAX_OFFLOAD_BLOCKS_PER_REQUEST", 0)
 
     logger.info(
         "[dsv4-patch] applying in pid=%d (%s)",
@@ -1384,27 +1384,27 @@ def apply_all() -> None:
     )
 
     # P0 first: abort before anything else if this deployment would corrupt.
-    if _flag("DSV4_PATCH_MULTINODE_GUARD", "1"):
+    if _flag("KV_DISK_CACHE_PATCH_MULTINODE_GUARD", "1"):
         apply_multinode_guard()
-    if _flag("DSV4_PATCH_BUG1_IO", "1"):
+    if _flag("KV_DISK_CACHE_PATCH_BUG1_IO", "1"):
         apply_bug1_io()
-    if _flag("DSV4_PATCH_SWLOOKUP", "1"):
+    if _flag("KV_DISK_CACHE_PATCH_SWLOOKUP", "1"):
         apply_sliding_window_lookup()
-    if _flag("DSV4_PATCH_NUMBLOCKS_GUARD", "1"):
+    if _flag("KV_DISK_CACHE_PATCH_NUMBLOCKS_GUARD", "1"):
         apply_num_blocks_guard()
-    if _flag("DSV4_PATCH_TENSOR_ALIAS", "1"):
+    if _flag("KV_DISK_CACHE_PATCH_TENSOR_ALIAS", "1"):
         apply_tensor_alias_fix()
     # Install the eager-offload cap. The wrapper is a no-op passthrough at
     # budget 0, so installing it unconditionally lets the knob flip at runtime
     # without reimporting the module.
-    if _flag("DSV4_PATCH_OFFLOAD_BUDGET", "1"):
+    if _flag("KV_DISK_CACHE_PATCH_OFFLOAD_BUDGET", "1"):
         apply_offload_budget()
     # Applied last so the handler class is fully patched before any instance
     # exists.
-    if _flag("DSV4_PATCH_BUG2_KEEPALIVE", "1"):
+    if _flag("KV_DISK_CACHE_PATCH_BUG2_KEEPALIVE", "1"):
         apply_bug2_keepalive()
     # Opt-in: off by default until proven under the real MLA/DSpark kernels.
-    if _flag("DSV4_HOST_KV", "0"):
+    if _flag("KV_DISK_CACHE_HOST_KV", "0"):
         apply_host_kv_alloc()
         try:
             apply_host_kv_alloc_v2()
@@ -1452,7 +1452,7 @@ def apply_all() -> None:
 _HOST_KV_POOL = None  # module-level: the pool must outlive every tensor from it
 _HOST_KV_ALLOC = None
 
-_HOST_KV_SO = os.environ.get("DSV4_HOST_KV_SO", "/usr/local/lib/libdsv4_host_kv.so")
+_HOST_KV_SO = os.environ.get("KV_DISK_CACHE_HOST_KV_SO", "/usr/local/lib/libdsv4_host_kv.so")
 
 
 def _build_host_kv_pool():
@@ -1464,7 +1464,7 @@ def _build_host_kv_pool():
 
     if not os.path.exists(_HOST_KV_SO):
         raise RuntimeError(
-            f"dsv4-patch: DSV4_HOST_KV=1 but {_HOST_KV_SO} is missing. Build it with:\n"
+            f"dsv4-patch: KV_DISK_CACHE_HOST_KV=1 but {_HOST_KV_SO} is missing. Build it with:\n"
             "  nvcc -O3 -arch=sm_121a -shared -Xcompiler -fPIC "
             "-o /usr/local/lib/libdsv4_host_kv.so dsv4_host_kv_alloc.cu"
         )
@@ -1763,7 +1763,7 @@ def apply_host_kv_direct_map() -> None:
 def apply_host_kv_direct_skip() -> None:
     """Skip the staging<->KV copy where the direct path replaces it.
 
-    With DSV4_HOST_KV=1 the STORE direction writes host-KV straight to NVMe
+    With KV_DISK_CACHE_HOST_KV=1 the STORE direction writes host-KV straight to NVMe
     inside the copy handler (transfer_async -> swap_blocks_batch interception),
     while the GPU blocks are still pinned -- so the GPU->staging copy is
     redundant and is skipped. The LOAD direction is written straight into
@@ -1859,7 +1859,7 @@ def _sg_copy_threshold() -> int:
     # wall, the driver's cuMemcpyBatchAsync is faster and is used directly. A
     # bare `vllm serve` (no compose env) still gets the SG fallback above the
     # wall rather than segfaulting the driver.
-    return _intenv("DSV4_SG_THRESHOLD", 20000)
+    return _intenv("KV_DISK_CACHE_SG_THRESHOLD", 20000)
 
 
 def _sg_load():
@@ -1867,9 +1867,9 @@ def _sg_load():
     global _SG_LIB, _SG_FN
     if _SG_FN is not None:
         return _SG_FN
-    path = os.environ.get("DSV4_SG_SO", "/usr/local/lib/libdsv4_batch_copy.so")
+    path = os.environ.get("KV_DISK_CACHE_SG_SO", "/usr/local/lib/libdsv4_batch_copy.so")
     if not os.path.exists(path):
-        raise RuntimeError(f"DSV4_SG_THRESHOLD set but {path} is missing")
+        raise RuntimeError(f"KV_DISK_CACHE_SG_THRESHOLD set but {path} is missing")
     _SG_LIB = ctypes.CDLL(path)
     fn = _SG_LIB.dsv4_batch_copy
     fn.argtypes = [
