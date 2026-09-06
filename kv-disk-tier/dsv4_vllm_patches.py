@@ -172,6 +172,91 @@ def _new_descriptor_buffers(num_copy_ops: int):
         )
 
 
+def _direct_store_disk(ctx, src_ptrs, dst_ptrs, sizes) -> None:
+    """Write host-KV blocks straight to NVMe, skipping the staging copy.
+
+    Called from _swap_blocks_batch_patched for the STORE direction while the
+    connector still pins the GPU blocks. Files are laid out exactly as the
+    agent's direct LOAD expects them (block_size_factor sub-blocks in file
+    order, zero-filled at null/skipped positions via ftruncate + positioned
+    writes).
+    """
+    import ctypes
+
+    import numpy as np
+    import os
+    import torch
+
+    import dsv4_shard_tier as _shard
+
+    handler = ctx["handler"]
+    slot_to_key = ctx.get("slot_to_key") or {}
+    if not slot_to_key:
+        return
+
+    # The original transfer_async enqueues stream.wait_stream(compute_stream)
+    # before the copy; that gates the COPY engine, but we read the host-KV
+    # directly from the host, so sync the transfer stream (which carries that
+    # barrier) with the host before reading. The store is deferred to the start
+    # of a later engine step anyway, so this is a no-op in the common case.
+    torch.cuda.current_stream().synchronize()
+
+    src = np.asarray(src_ptrs, dtype=np.uint64)
+    dst = np.asarray(dst_ptrs, dtype=np.uint64)
+    sz = np.asarray(sizes, dtype=np.int64)
+
+    staging = handler.dst_tensors[0]
+    base = int(staging.data_ptr())
+    row = int(staging.stride(0))
+    cell = int(staging.shape[1])
+
+    n = int(src_ptrs.numel())
+    by_slot: dict[int, list[int]] = {}
+    for i in range(n):
+        slot = (int(dst[i]) - base) // row
+        by_slot.setdefault(slot, []).append(i)
+
+    agent = getattr(_shard, "_AGENT", None)
+    if agent is None:
+        raise RuntimeError("[dsv4-patch] direct store: shard agent not started")
+
+    for slot, idxs in by_slot.items():
+        key = slot_to_key.get(slot)
+        if key is None:
+            raise RuntimeError(
+                f"[dsv4-patch] direct store: no key recorded for staging "
+                f"slot {slot}"
+            )
+        path = agent._path(bytes(key))
+        d = os.path.dirname(path)
+        if d not in getattr(agent, "_known_dirs", set()):
+            os.makedirs(d, exist_ok=True)
+            agent._known_dirs.add(d)
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident():x}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.ftruncate(fd, cell)
+            for i in idxs:
+                off = (int(dst[i]) - base) % row
+                buf = np.ctypeslib.as_array(
+                    ctypes.cast(
+                        ctypes.c_void_p(int(src[i])),
+                        ctypes.POINTER(ctypes.c_ubyte),
+                    ),
+                    shape=(int(sz[i]),),
+                )
+                os.pwrite(fd, buf, off)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+
+
 def _swap_blocks_batch_patched(
     src_ptrs, dst_ptrs, sizes, is_src_access_order_any: bool = False
 ):
@@ -183,6 +268,23 @@ def _swap_blocks_batch_patched(
         return _ORIG_SWAP_BLOCKS_BATCH(
             src_ptrs, dst_ptrs, sizes, is_src_access_order_any=is_src_access_order_any
         )
+
+    # Direct host-KV STORE: write the GPU (host-KV) pointers straight to NVMe,
+    # skipping the staging copy. Runs synchronously here, inside transfer_async,
+    # while the connector still pins the GPU blocks, so the host-KV content is
+    # stable for the whole write. The staging pointers (dst_ptrs) are only used
+    # to recover each copy op's staging slot and sub-block offset.
+    #
+    # Any failure (missing key, disk full, ...) is logged and swallowed: the
+    # staging copy is still skipped, the store job is reported done, and the
+    # tier's agent-side existence check then fails the store safely (primary
+    # tier recomputes). Raising here would crash the worker mid-execute_model.
+    if ctx.get("slot_to_key"):
+        try:
+            _direct_store_disk(ctx, src_ptrs, dst_ptrs, sizes)
+        except Exception:
+            logger.exception("[dsv4-patch] direct store: disk write failed")
+        return None
 
     handler = ctx["handler"]
     captured = ctx["captured"]
@@ -349,12 +451,25 @@ def _transfer_async_patched(self, job_id: int, src_spec, dst_spec) -> bool:
     if _WAITSTREAM_ON_LOAD and not self.gpu_to_cpu:
         compute_stream = torch.cuda.current_stream()
 
+    # Direct host-KV STORE: recover staging-slot -> key for this job's cells so
+    # the disk write inside swap_blocks_batch can name each file.
+    slot_to_key = None
+    if self.gpu_to_cpu:
+        keys = _JOB_KEYS.pop(job_id, None)
+        if keys:
+            bids = getattr(dst_spec, "block_ids", None)
+            if bids is not None:
+                slot_to_key = {
+                    int(s): k for s, k in zip(bids, keys) if k is not None
+                }
+
     prev = _CTX
     _CTX = {
         "handler": self,
         "captured": captured,
         "job_id": job_id,
         "compute_stream": compute_stream,
+        "slot_to_key": slot_to_key,
     }
     try:
         return _ORIG_TRANSFER_ASYNC(self, job_id, src_spec, dst_spec)
@@ -1552,6 +1667,8 @@ def _map_staging_to_gpu(gpu_spec, staging_spec, block_size_factor: int) -> None:
 
 
 _BLOCK_SIZE_FACTOR = 1
+_SLOT_TO_KEY: dict[int, bytes] = {}  # scheduler process: staging slot -> key
+_JOB_KEYS: dict[int, list] = {}  # worker process: connector job_id -> ordered keys
 
 
 def apply_host_kv_direct_map() -> None:
@@ -1564,6 +1681,12 @@ def apply_host_kv_direct_map() -> None:
     global, and TransferJob.__init__ is wrapped to record the mapping at
     construction time -- robust to whatever the methods do with the job dict
     afterwards.
+
+    For the direct-STORE path it also threads the ordered OffloadKeys onto the
+    TransferJob (aligned with the staging spec's block_ids), so the worker's
+    copy handler can write each cell to the right file while the GPU blocks are
+    still pinned. The slot->key mapping is captured from PrepareStoreOutput
+    (keys_to_store is ordered and aligned with store_spec.block_ids).
     """
     global _BLOCK_SIZE_FACTOR
     if "hostkv_direct_map" in _APPLIED:
@@ -1578,9 +1701,21 @@ def apply_host_kv_direct_map() -> None:
         from vllm.v1.kv_offload.base import (
             BlockIDsLoadStoreSpec,
             GPULoadStoreSpec,
+            PrepareStoreOutput,
         )
     except ImportError:
         return
+
+    _orig_pso_init = PrepareStoreOutput.__init__
+
+    def _patched_pso_init(self, keys_to_store, store_spec, evicted_keys=None):
+        _orig_pso_init(self, keys_to_store, store_spec, evicted_keys)
+        bids = getattr(store_spec, "block_ids", None)
+        if bids is not None:
+            for k, s in zip(keys_to_store, bids):
+                _SLOT_TO_KEY[int(s)] = bytes(k)
+
+    PrepareStoreOutput.__init__ = _patched_pso_init
 
     _orig_tj_init = TransferJob.__init__
 
@@ -1588,12 +1723,18 @@ def apply_host_kv_direct_map() -> None:
         _orig_tj_init(self, req_id, src_spec, dst_spec)
         if isinstance(src_spec, GPULoadStoreSpec):
             gpu_spec, staging_spec = src_spec, dst_spec
+            is_store = True
         elif isinstance(dst_spec, GPULoadStoreSpec):
             gpu_spec, staging_spec = dst_spec, src_spec
+            is_store = False
         else:
             return
         if isinstance(staging_spec, BlockIDsLoadStoreSpec):
             _map_staging_to_gpu(gpu_spec, staging_spec, _BLOCK_SIZE_FACTOR)
+            if is_store:
+                self._dsv4_keys = [
+                    _SLOT_TO_KEY.get(int(s)) for s in staging_spec.block_ids
+                ]
 
     _orig_usa = OffloadingConnectorScheduler.update_state_after_alloc
 
@@ -1615,26 +1756,31 @@ def apply_host_kv_direct_map() -> None:
     _APPLIED.add("hostkv_direct_map")
     logger.info(
         "[dsv4-patch] hostkv direct: recording staging-slot -> GPU-block map "
-        "at TransferJob construction"
+        "and threading store keys at TransferJob construction"
     )
 
 
 def apply_host_kv_direct_skip() -> None:
-    """Skip the staging<->KV copy when the disk agent writes KV directly.
+    """Skip the staging<->KV copy where the direct path replaces it.
 
-    With DSV4_HOST_KV=1 the ShardAgent reads/writes the cudaHostAlloc-backed KV
-    tensors straight from/to NVMe, so the worker's cuMemcpyBatchAsync staging
-    copy is redundant -- and, worse, it would copy empty staging over the
-    directly-written KV. Make CPUOffloadingWorker report every transfer as
-    immediately done. This is safe because the connector only schedules that
-    copy in a LATER engine step (after the disk tier's complete_write), i.e.
-    after the direct I/O has already finished.
+    With DSV4_HOST_KV=1 the STORE direction writes host-KV straight to NVMe
+    inside the copy handler (transfer_async -> swap_blocks_batch interception),
+    while the GPU blocks are still pinned -- so the GPU->staging copy is
+    redundant and is skipped. The LOAD direction is written straight into
+    host-KV by the ShardAgent, so the staging->GPU copy is also skipped and
+    CPUOffloadingWorker.submit_load reports immediately done.
+
+    submit_store is left intact so transfer_async still runs (it is where the
+    disk write now happens, at the pinned snapshot point).
     """
     if "hostkv_direct_skip" in _APPLIED:
         return
     try:
         from vllm.v1.kv_offload.base import TransferResult
         from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
+            OffloadingConnectorWorker,
+        )
     except ImportError:
         # V1-only image (no vllm.v1.kv_offload.cpu.gpu_worker): nothing to skip.
         return
@@ -1648,6 +1794,9 @@ def apply_host_kv_direct_skip() -> None:
         _orig_init(self, *a, **kw)
         self._dsv4_direct_done = []
 
+    _orig_get_finished = CPUOffloadingWorker.get_finished
+    _orig_wait = CPUOffloadingWorker.wait
+
     def _done(self, job_id):
         done = getattr(self, "_dsv4_direct_done", None)
         if done is None:
@@ -1660,28 +1809,40 @@ def apply_host_kv_direct_skip() -> None:
         )
         return True
 
-    def _skip_store(self, job_id, src_spec, dst_spec):
-        return _done(self, job_id)
-
     def _skip_load(self, job_id, src_spec, dst_spec):
         return _done(self, job_id)
 
     def _get_finished(self):
-        out = self._dsv4_direct_done
+        # Stores complete via the original handlers (their disk write ran
+        # inside transfer_async); loads complete via the immediate-done list.
+        out = list(_orig_get_finished(self))
+        out.extend(self._dsv4_direct_done)
         self._dsv4_direct_done = []
         return out
 
     def _wait(self, job_ids):
-        return None
+        _orig_wait(self, job_ids)
+
+    # Worker-side key threading: stash the ordered keys the scheduler attached
+    # to each store TransferJob, so transfer_async can look them up by job_id.
+    _orig_psk = OffloadingConnectorWorker.prepare_store_kv
+
+    def _patched_psk(self, metadata):
+        for job_id, entry in metadata.store_jobs.items():
+            _JOB_KEYS[job_id] = getattr(entry, "_dsv4_keys", None)
+        return _orig_psk(self, metadata)
 
     CPUOffloadingWorker.__init__ = _init
-    CPUOffloadingWorker.submit_store = _skip_store
     CPUOffloadingWorker.submit_load = _skip_load
     CPUOffloadingWorker.get_finished = _get_finished
     CPUOffloadingWorker.wait = _wait
+    OffloadingConnectorWorker.prepare_store_kv = _patched_psk
     CPUOffloadingWorker._dsv4_direct = True
     _APPLIED.add("hostkv_direct_skip")
-    logger.info("[dsv4-patch] hostkv direct: staging<->KV copy will be skipped")
+    logger.info(
+        "[dsv4-patch] hostkv direct: LOAD copy skipped; STORE writes disk in "
+        "the copy handler"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -740,19 +740,29 @@ class ShardAgent:
             gblocks = msg.get("gpu_blocks")
             _gb = gblocks if gblocks is not None else [None] * len(keys)
             if kind == "store":
-                for p in paths:
-                    self._ensure_dir(p)
                 self._n_store += len(keys)
                 if self._direct_layout is not None:
-                    self._pool.enqueue_store(
-                        job_id,
-                        len(keys),
-                        [
-                            _bind(_store_one_direct, p, self._direct_iovecs(gb, True))
-                            for p, gb in zip(paths, _gb)
-                        ],
-                    )
+                    # Direct host-KV STORE: the disk write already happened in
+                    # the worker's copy handler (transfer_async), while the GPU
+                    # blocks were still pinned. The agent only acks -- but
+                    # verify each cell file exists with the right size first, so
+                    # a failed copy-handler write fails the store instead of
+                    # admitting a block that is not actually on disk.
+                    ok = True
+                    for p in paths:
+                        try:
+                            if os.path.getsize(p) != self._direct_cell:
+                                ok = False
+                                break
+                        except OSError:
+                            ok = False
+                            break
+                    if not ok:
+                        self._n_fail += 1
+                    sock.send(_ENC.encode({"t": "ack", "job": job_id, "ok": ok}))
                 else:
+                    for p in paths:
+                        self._ensure_dir(p)
                     self._pool.enqueue_store(
                         job_id,
                         len(keys),
