@@ -1296,6 +1296,8 @@ def apply_all() -> None:
         except ImportError:
             # V1-only vLLM image: no vllm.v1.worker.gpu.model_runner module.
             pass
+        apply_host_kv_direct_skip()
+        apply_host_kv_direct_map()
 
     logger.info("[dsv4-patch] active patches: %s", sorted(_APPLIED))
 
@@ -1480,6 +1482,206 @@ def apply_host_kv_alloc_v2() -> None:
     _mr.init_kv_cache = patched
     _APPLIED.add("hostkv_v2")
     logger.info("[dsv4-patch] hostkv (V2): init_kv_cache will be cudaHostAlloc-backed")
+
+
+# ---------------------------------------------------------------------------
+# Direct host-KV I/O: GPU block-id registry.
+#
+# The ShardAgent (worker process) reads/writes the cudaHostAlloc-backed KV
+# tensors straight from/to NVMe, but it is only told the *staging slot id* of
+# each block by the head (DistributedShardTier, scheduler process). Staging
+# slots are an LRU-reused namespace that has nothing to do with GPU block ids,
+# so the agent cannot derive the KV addresses from them.
+#
+# The scheduler is the one place where the two namespaces meet: its
+# update_state_after_alloc() (loads) and _build_store_jobs() (stores) build a
+# TransferJob whose GPULoadStoreSpec carries the ordered GPU block ids +
+# group_sizes/block_indices, next to a BlockIDsLoadStoreSpec carrying the
+# staging slots. We record staging-slot -> [gpu block ids in file order] here,
+# in the scheduler process, and DistributedShardTier.submit_store/load reads it
+# and forwards the ids to the agent over ZMQ.
+#
+# The mapping mirrors SingleDirectionOffloadingHandler.transfer_async exactly:
+# for a group of `group_size` GPU blocks with a `block_idx % F` alignment skip,
+# staging slot `group_dst[local_i]` covers GPU blocks
+# `group_src[local_i*F - skip : local_i*F - skip + F]` (clamped), in file order.
+# ---------------------------------------------------------------------------
+
+_GPU_BLOCK_MAP: dict[int, list[int]] = {}
+
+
+def get_gpu_blocks(bid: int) -> list[int] | None:
+    """Return the ordered GPU block ids for a staging slot, or None."""
+    return _GPU_BLOCK_MAP.get(int(bid))
+
+
+def _map_staging_to_gpu(gpu_spec, staging_spec, block_size_factor: int) -> None:
+    """Record staging-slot -> [gpu block ids | 0] for one TransferJob's specs.
+
+    Each slot's list is exactly block_size_factor entries long, in file order
+    (sub-block 0..F-1). A 0 entry marks a null/skipped sub-block whose bytes are
+    stale in the staging path; the direct I/O writes/reads zeros there and the
+    load side never reads them back, so their content is irrelevant.
+    """
+    try:
+        gpu_blocks = [int(b) for b in gpu_spec.block_ids]
+        staging = [int(b) for b in staging_spec.block_ids]
+        group_sizes = list(gpu_spec.group_sizes)
+        block_indices = list(gpu_spec.block_indices)
+    except (AttributeError, TypeError):
+        return
+    F = max(1, int(block_size_factor or 0))
+    src_off = 0
+    dst_off = 0
+    for group_size, block_idx in zip(group_sizes, block_indices):
+        if not group_size:
+            continue
+        skip = int(block_idx) % F
+        dst_count = (group_size + skip + F - 1) // F
+        group_dst = staging[dst_off:dst_off + dst_count]
+        group_src = gpu_blocks[src_off:src_off + group_size]
+        for local_i, slot in enumerate(group_dst):
+            start = local_i * F - skip
+            sub = []
+            for j in range(F):
+                p = start + j
+                sub.append(int(group_src[p]) if 0 <= p < group_size else 0)
+            _GPU_BLOCK_MAP[int(slot)] = sub
+        src_off += group_size
+        dst_off += dst_count
+
+
+_BLOCK_SIZE_FACTOR = 1
+
+
+def apply_host_kv_direct_map() -> None:
+    """Capture staging-slot -> GPU-block-id mapping in the scheduler process.
+
+    The GPU block ids are only known where a TransferJob is constructed: its
+    GPULoadStoreSpec carries them next to the staging BlockIDsLoadStoreSpec.
+    Both construction sites (update_state_after_alloc for loads and
+    _build_store_jobs for stores) are wrapped to set the block_size_factor
+    global, and TransferJob.__init__ is wrapped to record the mapping at
+    construction time -- robust to whatever the methods do with the job dict
+    afterwards.
+    """
+    global _BLOCK_SIZE_FACTOR
+    if "hostkv_direct_map" in _APPLIED:
+        return
+    try:
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+            TransferJob,
+        )
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+            OffloadingConnectorScheduler,
+        )
+        from vllm.v1.kv_offload.base import (
+            BlockIDsLoadStoreSpec,
+            GPULoadStoreSpec,
+        )
+    except ImportError:
+        return
+
+    _orig_tj_init = TransferJob.__init__
+
+    def _patched_tj_init(self, req_id, src_spec, dst_spec):
+        _orig_tj_init(self, req_id, src_spec, dst_spec)
+        if isinstance(src_spec, GPULoadStoreSpec):
+            gpu_spec, staging_spec = src_spec, dst_spec
+        elif isinstance(dst_spec, GPULoadStoreSpec):
+            gpu_spec, staging_spec = dst_spec, src_spec
+        else:
+            return
+        if isinstance(staging_spec, BlockIDsLoadStoreSpec):
+            _map_staging_to_gpu(gpu_spec, staging_spec, _BLOCK_SIZE_FACTOR)
+
+    _orig_usa = OffloadingConnectorScheduler.update_state_after_alloc
+
+    def _patched_usa(self, request, blocks, num_external_tokens):
+        global _BLOCK_SIZE_FACTOR
+        _BLOCK_SIZE_FACTOR = int(getattr(self.config, "block_size_factor", 1) or 1)
+        return _orig_usa(self, request, blocks, num_external_tokens)
+
+    _orig_bsj = OffloadingConnectorScheduler._build_store_jobs
+
+    def _patched_bsj(self, scheduler_output):
+        global _BLOCK_SIZE_FACTOR
+        _BLOCK_SIZE_FACTOR = int(getattr(self.config, "block_size_factor", 1) or 1)
+        return _orig_bsj(self, scheduler_output)
+
+    TransferJob.__init__ = _patched_tj_init
+    OffloadingConnectorScheduler.update_state_after_alloc = _patched_usa
+    OffloadingConnectorScheduler._build_store_jobs = _patched_bsj
+    _APPLIED.add("hostkv_direct_map")
+    logger.info(
+        "[dsv4-patch] hostkv direct: recording staging-slot -> GPU-block map "
+        "at TransferJob construction"
+    )
+
+
+def apply_host_kv_direct_skip() -> None:
+    """Skip the staging<->KV copy when the disk agent writes KV directly.
+
+    With DSV4_HOST_KV=1 the ShardAgent reads/writes the cudaHostAlloc-backed KV
+    tensors straight from/to NVMe, so the worker's cuMemcpyBatchAsync staging
+    copy is redundant -- and, worse, it would copy empty staging over the
+    directly-written KV. Make CPUOffloadingWorker report every transfer as
+    immediately done. This is safe because the connector only schedules that
+    copy in a LATER engine step (after the disk tier's complete_write), i.e.
+    after the direct I/O has already finished.
+    """
+    if "hostkv_direct_skip" in _APPLIED:
+        return
+    try:
+        from vllm.v1.kv_offload.base import TransferResult
+        from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+    except ImportError:
+        # V1-only image (no vllm.v1.kv_offload.cpu.gpu_worker): nothing to skip.
+        return
+    if getattr(CPUOffloadingWorker, "_dsv4_direct", False):
+        _APPLIED.add("hostkv_direct_skip")
+        return
+
+    _orig_init = CPUOffloadingWorker.__init__
+
+    def _init(self, *a, **kw):
+        _orig_init(self, *a, **kw)
+        self._dsv4_direct_done = []
+
+    def _done(self, job_id):
+        done = getattr(self, "_dsv4_direct_done", None)
+        if done is None:
+            done = []
+            self._dsv4_direct_done = done
+        done.append(
+            TransferResult(
+                job_id=job_id, success=True, transfer_size=0, transfer_time=0.0
+            )
+        )
+        return True
+
+    def _skip_store(self, job_id, src_spec, dst_spec):
+        return _done(self, job_id)
+
+    def _skip_load(self, job_id, src_spec, dst_spec):
+        return _done(self, job_id)
+
+    def _get_finished(self):
+        out = self._dsv4_direct_done
+        self._dsv4_direct_done = []
+        return out
+
+    def _wait(self, job_ids):
+        return None
+
+    CPUOffloadingWorker.__init__ = _init
+    CPUOffloadingWorker.submit_store = _skip_store
+    CPUOffloadingWorker.submit_load = _skip_load
+    CPUOffloadingWorker.get_finished = _get_finished
+    CPUOffloadingWorker.wait = _wait
+    CPUOffloadingWorker._dsv4_direct = True
+    _APPLIED.add("hostkv_direct_skip")
+    logger.info("[dsv4-patch] hostkv direct: staging<->KV copy will be skipped")
 
 
 # ---------------------------------------------------------------------------

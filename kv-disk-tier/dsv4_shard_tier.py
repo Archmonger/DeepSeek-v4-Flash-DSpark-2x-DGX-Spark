@@ -88,6 +88,7 @@ impossible to observe rather than merely unlikely.
 
 from __future__ import annotations
 
+import ctypes
 import errno
 import os
 import threading
@@ -96,6 +97,7 @@ from collections import OrderedDict
 from collections.abc import Collection, Iterable
 
 import msgspec.msgpack
+import numpy as np
 import zmq
 from typing_extensions import override
 
@@ -268,6 +270,113 @@ def _load_one(path: str, mv: memoryview, offset: int, nbytes: int) -> None:
     # permanent cache loss (stock tiering/fs/io.py does exactly that).
 
 
+def _buf_at(addr: int, n: int):
+    """Zero-copy writable buffer over a raw host address (cudaHostAlloc)."""
+    return np.ctypeslib.as_array(
+        ctypes.cast(ctypes.c_void_p(addr), ctypes.POINTER(ctypes.c_ubyte)),
+        shape=(n,),
+    )
+
+
+def _slice_buffers(buffers, skip: int):
+    """Return buffers with the first `skip` bytes removed (zero-copy views)."""
+    out = []
+    for b in buffers:
+        if skip >= len(b):
+            skip -= len(b)
+            continue
+        out.append(b[skip:])
+        skip = 0
+    return out
+
+
+def _load_one_direct(path: str, iov) -> None:
+    """Scatter-read one block cell directly into host-KV tensor addresses.
+
+    ``iov`` is a list of ``(addr, nbytes)`` in the exact order the cell was
+    written (concatenation of each canonical tensor's block_size_factor
+    sub-blocks). The file is one contiguous cell, so readv fans it out.
+    """
+    global _ODIRECT_OK
+    buffers = [_buf_at(addr, n) for addr, n in iov]
+    total = sum(n for _, n in iov)
+    direct = _aligned(0, total)
+    try:
+        fd = os.open(path, os.O_RDONLY | (os.O_DIRECT if direct else 0))
+    except OSError:
+        direct = False
+        fd = os.open(path, os.O_RDONLY)
+    try:
+        got = 0
+        while got < total:
+            try:
+                n = os.readv(fd, _slice_buffers(buffers, got))
+            except OSError as e:
+                if direct and e.errno == errno.EINVAL and got == 0:
+                    _ODIRECT_OK = False
+                    logger.warning(
+                        "[dsv4-shard] O_DIRECT read rejected (EINVAL); "
+                        "falling back to buffered I/O for the rest of this run"
+                    )
+                    os.close(fd)
+                    fd = -1
+                    fd = os.open(path, os.O_RDONLY)
+                    direct = False
+                    continue
+                raise
+            if n == 0:
+                raise OSError(f"short read of {path}: {got}/{total} bytes")
+            got += n
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _store_one_direct(path: str, iov) -> None:
+    """Gather-write one block cell directly from host-KV tensor addresses."""
+    global _ODIRECT_OK
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident():x}.tmp"
+    buffers = [_buf_at(addr, n) for addr, n in iov]
+    total = sum(n for _, n in iov)
+    direct = _aligned(0, total)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if direct:
+        flags |= os.O_DIRECT
+    try:
+        fd = os.open(tmp, flags, 0o600)
+    except OSError:
+        direct = False
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        written = 0
+        while written < total:
+            try:
+                written += os.writev(fd, _slice_buffers(buffers, written))
+            except OSError as e:
+                if direct and e.errno == errno.EINVAL and written == 0:
+                    _ODIRECT_OK = False
+                    logger.warning(
+                        "[dsv4-shard] O_DIRECT write rejected (EINVAL); "
+                        "falling back to buffered I/O for the rest of this run"
+                    )
+                    os.close(fd)
+                    fd = -1
+                    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    direct = False
+                    continue
+                raise
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    os.replace(tmp, path)
+
+
 class ShardAgent:
     """Per-node disk worker. One instance per vLLM worker process.
 
@@ -287,6 +396,8 @@ class ShardAgent:
         head_addr: str,
         n_read_threads: int = 16,
         n_write_threads: int = 16,
+        direct_tensors=None,
+        direct_bf: int = 0,
     ) -> None:
         self._slice_bytes = int(slice_bytes)
         # GLM53-ROW-STRIDE: newer vLLM builds SharedOffloadRegion with
@@ -357,6 +468,38 @@ class ShardAgent:
         self._n_load = 0
         self._n_evict = 0
         self._n_fail = 0
+        # Direct host-KV I/O (DSV4_HOST_KV=1): the agent reads/writes the
+        # cudaHostAlloc-backed KV tensors directly, skipping the staging mmap.
+        # direct_tensors are the worker's canonical GPU 2D views
+        # (num_blocks, page_size) with stride (row_stride, 1); the file cell is
+        # their concatenation with each tensor expanded by block_size_factor.
+        self._direct_layout = None
+        self._direct_bf = int(direct_bf or 0)
+        self._direct_cell = 0
+        self._zero_buf = None
+        self._zero_addr = 0
+        if direct_tensors is not None:
+            self._direct_layout = [
+                (int(t.data_ptr()), int(t.stride(0)), int(t.shape[1]))
+                for t in direct_tensors
+            ]
+            # The true per-block cell is the concatenation of the canonical
+            # tensors' block_size_factor sub-blocks -- NOT cpu_page_size_per_
+            # worker, which over-allocates the staging region by the group-
+            # size ratio (measured 64x: 272842752 vs 4263168 B/block).
+            self._direct_cell = sum(
+                size * self._direct_bf for _, _, size in self._direct_layout
+            )
+            # One shared zero-filled sub-block used for null/skipped positions
+            # so every cell keeps its full F*size length in file order.
+            self._zero_buf = np.zeros(self._direct_layout[0][2], dtype=np.uint8)
+            self._zero_addr = int(self._zero_buf.ctypes.data)
+            logger.info(
+                "[dsv4-shard] direct host-KV I/O enabled: %d canonical tensors, "
+                "block_size_factor=%d, cell=%d B (staging slice=%d B)",
+                len(self._direct_layout), self._direct_bf, self._direct_cell,
+                self._slice_bytes,
+            )
         self._thread = threading.Thread(
             target=self._run, name="dsv4-shard-agent", daemon=True
         )
@@ -387,6 +530,34 @@ class ShardAgent:
 
     def _offset(self, block_id: int) -> int:
         return block_id * self._row_stride + self._slot_off
+
+    def _direct_iovecs(self, gpu_blocks):
+        """Scatter/gather iovecs for one offloaded block, in file order.
+
+        ``gpu_blocks`` is the ORDERED list of GPU block ids this cell holds
+        (one entry per sub-block, computed by the scheduler and forwarded by
+        the head). A 0 entry is a null/skipped sub-block and is filled with a
+        shared zero buffer so the cell keeps its full F*size length. NOT a
+        staging slot id -- staging slots are an LRU-reused namespace that never
+        corresponds to GPU block addresses.
+        """
+        if not gpu_blocks:
+            # The staging copy was skipped (direct mode), so a missing mapping
+            # cannot be recovered by falling back to the staging path: those
+            # bytes were never written. Fail the job instead of writing an
+            # empty/torn cell under a valid block key.
+            raise RuntimeError(
+                "[dsv4-shard] direct host-KV I/O requested but no GPU block ids "
+                "were recorded for this staging slot; failing the job (safe)"
+            )
+        iov = []
+        for ptr, stride, size in self._direct_layout:
+            for g in gpu_blocks:
+                if int(g) > 0:
+                    iov.append((ptr + int(g) * stride, size))
+                else:
+                    iov.append((self._zero_addr, size))
+        return iov
 
     def _ensure_dir(self, path: str) -> None:
         d = os.path.dirname(path)
@@ -426,7 +597,14 @@ class ShardAgent:
                         st = os.stat(os.path.join(dirpath, fn))
                     except OSError:
                         continue
-                    if st.st_size != self._slice_bytes:
+                    # Direct host-KV stores the true cell (no 64x staging
+                    # padding); the staging path stores the full worker slice.
+                    _expected = (
+                        self._direct_cell
+                        if self._direct_layout is not None
+                        else self._slice_bytes
+                    )
+                    if st.st_size != _expected:
                         # Truncated or written by a different geometry.
                         continue
                     try:
@@ -502,30 +680,57 @@ class ShardAgent:
                 sock.send(_ENC.encode({"t": "ack", "job": job_id, "ok": True}))
                 return
             paths = [self._path(k) for k in keys]
+            # Direct host-KV I/O: gpu_blocks[i] is the ORDERED list of GPU block
+            # ids for bids[i] (recorded by the scheduler and forwarded by the
+            # head). None means "no mapping" -> _direct_iovecs raises and the
+            # job fails safely (staging was skipped, so falling back would read
+            # stale bytes).
+            gblocks = msg.get("gpu_blocks")
+            _gb = gblocks if gblocks is not None else [None] * len(keys)
             if kind == "store":
                 for p in paths:
                     self._ensure_dir(p)
                 self._n_store += len(keys)
-                self._pool.enqueue_store(
-                    job_id,
-                    len(keys),
-                    [
-                        _bind(_store_one, p, self._mv, self._offset(int(b)),
-                              self._slice_bytes)
-                        for p, b in zip(paths, bids)
-                    ],
-                )
+                if self._direct_layout is not None:
+                    self._pool.enqueue_store(
+                        job_id,
+                        len(keys),
+                        [
+                            _bind(_store_one_direct, p, self._direct_iovecs(gb))
+                            for p, gb in zip(paths, _gb)
+                        ],
+                    )
+                else:
+                    self._pool.enqueue_store(
+                        job_id,
+                        len(keys),
+                        [
+                            _bind(_store_one, p, self._mv, self._offset(int(b)),
+                                  self._slice_bytes)
+                            for p, b in zip(paths, bids)
+                        ],
+                    )
             else:
                 self._n_load += len(keys)
-                self._pool.enqueue_load(
-                    job_id,
-                    len(keys),
-                    [
-                        _bind(_load_one, p, self._mv, self._offset(int(b)),
-                              self._slice_bytes)
-                        for p, b in zip(paths, bids)
-                    ],
-                )
+                if self._direct_layout is not None:
+                    self._pool.enqueue_load(
+                        job_id,
+                        len(keys),
+                        [
+                            _bind(_load_one_direct, p, self._direct_iovecs(gb))
+                            for p, gb in zip(paths, _gb)
+                        ],
+                    )
+                else:
+                    self._pool.enqueue_load(
+                        job_id,
+                        len(keys),
+                        [
+                            _bind(_load_one, p, self._mv, self._offset(int(b)),
+                                  self._slice_bytes)
+                            for p, b in zip(paths, bids)
+                        ],
+                    )
         elif kind == "evict":
             for k in msg["keys"]:
                 try:
@@ -563,6 +768,24 @@ class ShardAgent:
 
 def _bind(fn, *args):
     return lambda: fn(*args)
+
+
+def _lookup_gpu_blocks(bid: int):
+    """Return the ordered GPU block ids for a staging slot (direct host-KV I/O).
+
+    The scheduler records the mapping via dsv4_vllm_patches.apply_host_kv_direct_map;
+    the head (same process) forwards it here. Returns None when direct mode is
+    off or the slot has no recorded mapping (then the agent falls back to the
+    staging path).
+    """
+    try:
+        import dsv4_vllm_patches as _p
+    except Exception:
+        return None
+    fn = getattr(_p, "get_gpu_blocks", None)
+    if fn is None:
+        return None
+    return fn(bid)
 
 
 # ----------------------------------------------------------------- head side
@@ -912,8 +1135,22 @@ class DistributedShardTier(SecondaryTierManager):
             self._num_agents, fkeys, False, time.monotonic() + self._job_timeout_s
         )
         self._n_store_jobs += 1
+        _gb = [_lookup_gpu_blocks(b) for b in fbids]
+        _missing = [b for b, g in zip(fbids, _gb) if not g]
+        if _missing:
+            logger.warning(
+                "[dsv4-shard] STORE: %d/%d staging slots have no GPU-block "
+                "mapping (slots=%s); direct I/O will fail these safely",
+                len(_missing), len(fbids), _missing[:8],
+            )
         if not self._broadcast(
-            {"t": "store", "job": job_id, "keys": fkeys, "bids": fbids}
+            {
+                "t": "store",
+                "job": job_id,
+                "keys": fkeys,
+                "bids": fbids,
+                "gpu_blocks": _gb,
+            }
         ):
             self._finish(job_id, self._jobs[job_id], False)
 
@@ -938,8 +1175,22 @@ class DistributedShardTier(SecondaryTierManager):
             self._num_agents, keys, True, time.monotonic() + self._job_timeout_s
         )
         self._n_load_jobs += 1
+        _gb = [_lookup_gpu_blocks(b) for b in bids]
+        _missing = [b for b, g in zip(bids, _gb) if not g]
+        if _missing:
+            logger.warning(
+                "[dsv4-shard] LOAD: %d/%d staging slots have no GPU-block "
+                "mapping (slots=%s); direct I/O will fail these safely",
+                len(_missing), len(bids), _missing[:8],
+            )
         if not self._broadcast(
-            {"t": "load", "job": job_id, "keys": keys, "bids": bids}
+            {
+                "t": "load",
+                "job": job_id,
+                "keys": keys,
+                "bids": bids,
+                "gpu_blocks": _gb,
+            }
         ):
             self._finish(job_id, self._jobs[job_id], False)
 
@@ -1098,6 +1349,50 @@ def maybe_start_shard_agent(offloading_spec, handlers) -> None:
         _global_rank = int(pc.rank)
         _slice_bytes = int(offloading_spec.cpu_page_size_per_worker)
 
+    direct_tensors = None
+    direct_bf = 0
+    if os.environ.get("DSV4_HOST_KV") == "1":
+        _lh = getattr(handlers, "_load_handler", None)
+        if _lh is None or not getattr(_lh, "dst_tensors", None):
+            # The staging copy is skipped under DSV4_HOST_KV=1, so falling back
+            # to the staging path would read/write bytes that were never copied
+            # -- silent corruption. Refuse to start.
+            raise RuntimeError(
+                "[dsv4-shard] DSV4_HOST_KV=1 but the worker's load handler "
+                "exposed no host-KV tensors; direct host-KV I/O cannot start"
+            )
+        direct_tensors = list(_lh.dst_tensors)
+        direct_bf = int(getattr(_lh, "src_block_size_factor", 0) or 0)
+        # The file cell is only laid out as a simple sub-block concatenation
+        # when there is exactly ONE canonical tensor (the DeepSeek V4 packed
+        # layout). Any other geometry would write the cell in the wrong order.
+        if len(direct_tensors) != 1 or direct_bf <= 0:
+            raise RuntimeError(
+                "[dsv4-shard] DSV4_HOST_KV=1 but the KV layout is not the "
+                f"single-tensor packed form (n_tensors={len(direct_tensors)}, "
+                f"bf={direct_bf}); direct host-KV I/O cannot map the cell safely"
+            )
+        logger.info(
+            "[dsv4-shard] host-KV diag: n_dst=%d n_src=%d src_bf=%d "
+            "dst_bf=%d slice=%d",
+            len(_lh.dst_tensors), len(_lh.src_tensors),
+            getattr(_lh, "src_block_size_factor", -1),
+            getattr(_lh, "dst_block_size_factor", -1),
+            _slice_bytes,
+        )
+        for _i, _t in enumerate(_lh.dst_tensors):
+            logger.info(
+                "[dsv4-shard] host-KV diag dst[%d] shape=%s stride=%s "
+                "ptr=0x%x",
+                _i, tuple(_t.shape), tuple(_t.stride()), _t.data_ptr(),
+            )
+        for _i, _t in enumerate(_lh.src_tensors):
+            logger.info(
+                "[dsv4-shard] host-KV diag src[%d] shape=%s stride=%s "
+                "ptr=0x%x",
+                _i, tuple(_t.shape), tuple(_t.stride()), _t.data_ptr(),
+            )
+
     _AGENT = ShardAgent(
         region=region,
         slice_bytes=_slice_bytes,
@@ -1108,6 +1403,8 @@ def maybe_start_shard_agent(offloading_spec, handlers) -> None:
         head_addr=_head_addr_from_env(),
         n_read_threads=int(cfg.get("n_read_threads", 16)),
         n_write_threads=int(cfg.get("n_write_threads", 16)),
+        direct_tensors=direct_tensors,
+        direct_bf=direct_bf,
     )
     _AGENT.start()
 
