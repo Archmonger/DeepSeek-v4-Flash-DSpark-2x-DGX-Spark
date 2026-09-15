@@ -79,7 +79,11 @@ allocated (the connector requires it) but its staging copy is bypassed.
 
 ## Disable
 
-Remove `KV_DISK_CACHE_ENABLE` (or set it to `0`). Everything else is inert.
+Remove `KV_DISK_CACHE_ENABLE` (or set it to `0`). Everything else is inert: the
+tier's mounts and its environment delta both live in
+`docker-compose.dspark-disk-tier.override.yml`, which the launcher merges only
+when the switch is on, so an off launch renders the stock service unchanged and
+needs no staged `KV_DISK_CACHE_SRC`.
 
 ## Capacity
 

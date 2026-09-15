@@ -34,6 +34,7 @@ for f in \
   scripts/bench-patches.sh \
   lmcache/run-lmcache-server.sh \
   scripts/test-lmcache-compose-gate.sh \
+  scripts/test-kv-disk-tier-compose-gate.sh \
   scripts/selftest-runtime-ablation.sh \
   patches/*.sh
 do
@@ -204,6 +205,8 @@ bash scripts/test-nccl-ib-hca-gid-resolve.sh -q
 ok "test-nccl-ib-hca-gid-resolve"
 bash scripts/test-lmcache-compose-gate.sh -q
 ok "test-lmcache-compose-gate"
+bash scripts/test-kv-disk-tier-compose-gate.sh -q
+ok "test-kv-disk-tier-compose-gate"
 
 echo "== recipe guards (do not re-ship known regressions) =="
 

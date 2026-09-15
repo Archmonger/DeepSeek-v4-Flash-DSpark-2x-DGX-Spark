@@ -1,3 +1,8 @@
+## 2026-09-15
+
+### Fixed
+- **`kv-disk-tier` is default-off in the shared launch path again**: the tier's container environment (`KV_DISK_CACHE_*`, plus `VLLM_ENGINE_READY_TIMEOUT_S=3600` and `VLLM_SKIP_INIT_MEMORY_CHECK=1`) moved out of `docker-compose.dspark.yml` into `docker-compose.dspark-disk-tier.override.yml`, which the launcher merges only when `KV_DISK_CACHE_ENABLE=1` — with the switch off the rendered service env is the pre-existing one instead of silently raising the engine-ready timeout and skipping vLLM's init memory check for every install. `start-deepseek-v4-flash-dspark.sh` normalizes `KV_DISK_CACHE_ENABLE="${KV_DISK_CACHE_ENABLE:-0}"` before its first use under `set -u` (an existing `.env.dspark` predating the knob aborted every launch), and the head compose file list is an argv array seeded with the operator's `COMPOSE_FILE`, so `COMPOSE_FILE` overrides work again and an absolute path containing spaces stays one `-f` element. `scripts/test-kv-disk-tier-compose-gate.sh`, registered in `scripts/ci-validate.sh`, runs the real launcher under argv recorders for the off / on / custom-path cases and checks the off-vs-on rendered compose delta against the documented tier keys.
+
 ## 2026-09-08
 
 ### Fixed

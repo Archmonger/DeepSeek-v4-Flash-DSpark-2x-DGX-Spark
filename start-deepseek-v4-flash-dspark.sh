@@ -740,12 +740,19 @@ if [ "$DSPARK_WORKER_HF_NFS" = "1" ]; then
   fi
 fi
 
-# Disk-backed KV cache: its volumes (and sitecustomize) are mounted only when
-# the tier is enabled, so a default-off launch never requires a staged
-# KV_DISK_CACHE_SRC and leaves Python/config untouched.
-HEAD_COMPOSE_FILES="-f docker-compose.dspark.yml"
+# Disk-backed KV cache: its volume mounts and its env delta live in
+# docker-compose.dspark-disk-tier.override.yml, merged only when the tier is
+# enabled, so a default-off launch never requires a staged KV_DISK_CACHE_SRC
+# and renders the stock service env unchanged. The flag is normalized here
+# because this script runs under `set -u` and an existing .env.dspark may
+# predate the knob.
+KV_DISK_CACHE_ENABLE="${KV_DISK_CACHE_ENABLE:-0}"
+# COMPOSE_FILE stays the caller's base file (absolute, possibly with spaces),
+# so the head file list is an argv array — like AUTH_HEADER_ARGS — never a
+# word-split string.
+HEAD_COMPOSE_FILES=(-f "$COMPOSE_FILE")
 if [ "$KV_DISK_CACHE_ENABLE" = "1" ]; then
-  HEAD_COMPOSE_FILES="$HEAD_COMPOSE_FILES -f docker-compose.dspark-disk-tier.override.yml"
+  HEAD_COMPOSE_FILES+=(-f "$SCRIPT_DIR/docker-compose.dspark-disk-tier.override.yml")
   WORKER_COMPOSE_FILES="$WORKER_COMPOSE_FILES -f docker-compose.dspark-disk-tier.override.yml"
   WORKER2_COMPOSE_FILES="$WORKER2_COMPOSE_FILES -f docker-compose.dspark-disk-tier.override.yml"
 fi
@@ -1183,7 +1190,7 @@ compose_base() {
     DSV4_ABLATE_LAYERS="${DSV4_ABLATE_LAYERS:-10-42}" \
     NODE_RANK="$1" \
     HEADLESS="$2" \
-    docker compose -p "$PROJECT_NAME" --env-file "$COMPOSE_ENV_FILE" $HEAD_COMPOSE_FILES "${@:3}"
+    docker compose -p "$PROJECT_NAME" --env-file "$COMPOSE_ENV_FILE" "${HEAD_COMPOSE_FILES[@]}" "${@:3}"
 }
 
 remote_nccl_env2() {
