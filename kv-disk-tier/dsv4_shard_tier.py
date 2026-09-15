@@ -1154,18 +1154,35 @@ class DistributedShardTier(SecondaryTierManager):
                 break
         self._identities[ident] = rank
 
-        # Ignore hellos from an older round: a late rehello reply must not
-        # restart reconciliation after READY. Two cases are NOT ignorable, and
-        # dropping them is what left the tier stuck below READY:
-        #   * not READY: a round is in flight, this identity was not registered
-        #     when the round's rehello broadcast went out (an agent that
-        #     (re)started mid-round), so nothing would ever ask it to report.
-        #     Re-poll it alone; the next hello carries the current gen.
+        # Ignore hellos from an older round: a late reply must not restart
+        # reconciliation after READY, and must never be counted into the round
+        # in flight. "no gen field" and "gen=0" are different frames: a
+        # spontaneous hello (agent start) carries no gen at all, while a gen=0
+        # reply is a round-0 answer arriving late. Reading both as 0
+        # (`int(msg.get("gen", 0))`) let a stale round-0 reply look like a
+        # restart and discard the reconciled index after READY.
+        # Two cases are NOT ignorable, and dropping them is what left the tier
+        # stuck below READY:
+        #   * not READY: a round is in flight and this identity's report is
+        #     missing -- it was not registered when the round's rehello
+        #     broadcast went out (an agent that (re)started mid-round), or its
+        #     reply is for an older round. Re-poll it alone; its answer for the
+        #     current round carries the current gen.
         #   * READY and gen absent: a spontaneous hello is an agent (re)start
         #     whose inventory may have changed, so it must re-reconcile (the
         #     branch below). A gen-bearing late reply stays ignored.
-        gen = int(msg.get("gen", 0))
-        if gen < self._epoch:
+        gen_field = msg.get("gen")
+        gen = None if gen_field is None else int(gen_field)
+        if gen is None:
+            if not self._ready and self._epoch:
+                logger.warning(
+                    "[dsv4-shard] agent rank=%d helloed while round %d was in "
+                    "flight; re-polling that identity so the round can "
+                    "complete", rank, self._epoch,
+                )
+                self._send_rehello(ident, self._epoch)
+                return
+        elif gen < self._epoch:
             if not self._ready:
                 logger.warning(
                     "[dsv4-shard] agent rank=%d helloed with gen=%d while round "
@@ -1173,16 +1190,15 @@ class DistributedShardTier(SecondaryTierManager):
                     "complete", rank, gen, self._epoch,
                 )
                 self._send_rehello(ident, self._epoch)
-                return
-            if gen != 0:
-                return
+            return
 
         # A re-registration after READY means an agent reconnected with a
         # possibly-changed inventory (e.g. its process restarted). The
         # reconciled index is now stale, so discard it and ask EVERY agent to
-        # re-report before serving again -- including the triggering one (its
-        # in-flight hello has gen < new epoch and is ignored above), otherwise
-        # a half-registered set leaves _hellos at 1/N forever.
+        # re-report before serving again -- the triggering one included,
+        # otherwise a half-registered set leaves _hellos at 1/N forever. (A
+        # reply it had already queued for the previous round carries an older
+        # gen and is handled by the stanza above.)
         if self._ready:
             self._epoch += 1
             logger.warning(

@@ -5,7 +5,9 @@ These exercise the tier managers' pure-Python bookkeeping (byte counters, LRU
 pinning, job completion) by constructing instances with ``__new__`` and stubbing
 the parent methods, so no GPU, ZMQ socket, or ``/kvdisk`` is needed. They run
 anywhere vLLM + zmq + msgspec are importable (the CI container or the serving
-image); on a host without those they are skipped, never failed.
+image); a host that lacks one of those top-level packages skips the suite, while
+a missing vLLM submodule, a drifted symbol or a broken import fails it -- see
+``_missing_external_dependency``.
 
 The cases pin the specific bugs fixed over the life of this module:
   * ``_forget`` never decremented ``_bytes`` (membership-only ``OrderedDict``).
@@ -14,15 +16,19 @@ The cases pin the specific bugs fixed over the life of this module:
   * ``has_pending_work`` ignored the already-completed ``_done`` queue.
   * ``CappedFileSystemTierManager.lookup`` used truthiness on a ``LookupResult``.
   * ``CappedFileSystemTierManager`` kept phantom entries after a failed store.
-  * the fs_capped completion hook had no old-API name, so its pins (and the byte
-    cap) were never released on a vLLM that calls ``get_finished()``.
+  * the fs_capped completion hook released no load pins, so every resident
+    block stayed pinned and the byte cap was silently bypassed.
   * a failed load left its unreadable block file accounted (and on disk).
   * a failed-store reconcile un-accounted a path that was present on disk.
   * an out-of-range block id clamped a memoryview instead of failing the job.
   * a mid-round agent (re)connect was dropped, stalling the tier below READY.
+  * a gen-less spontaneous hello and a stale ``gen=0`` reply were conflated, so
+    a late round-0 reply discarded the reconciled index after READY.
   * an agent-side job failure sent no ack, holding the head's job to timeout.
   * direct-I/O mappings survived their owning job (stale slot -> GPU block ids)
     and used 0 both as a real GPU block id and as the null-sub-block sentinel.
+  * slot invalidation took the truth of a real numpy ``block_ids``, which raised
+    for a multi-slot spec and skipped the single slot 0.
 """
 from __future__ import annotations
 
@@ -38,21 +44,23 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "kv-disk-tier"))
 
 
-def _missing_external_dependency(err: Exception) -> bool:
-    """True only when a top-level third-party dep is absent on this host.
+_OPTIONAL_DEPENDENCIES = ("vllm", "zmq", "msgspec")
 
-    A ``ModuleNotFoundError`` naming ``vllm`` / ``zmq`` / ``msgspec`` (or one of
-    their submodules) means the environment genuinely lacks the dependency and
-    the suite should skip. Anything else -- a syntax error, a ``NameError``, an
-    ``ImportError: cannot import name ...`` from our own modules or a drifted
-    vLLM API -- is a real bug and must fail the suite, not hide it.
+
+def _missing_external_dependency(err: Exception) -> bool:
+    """True only when the dependency ITSELF is absent on this host.
+
+    ``ModuleNotFoundError.name`` is the first name in the requested import chain
+    that could not be found, so only an exact top-level match -- ``vllm``, never
+    ``vllm.v1.kv_offload...`` -- means the environment genuinely lacks the
+    dependency and the suite may skip. A dotted name means the package IS
+    installed and the submodule or API the tier needs has drifted, which is a
+    real failure and must fail the suite. Same for a syntax error, a
+    ``NameError``, or an ``ImportError: cannot import name ...`` raised inside
+    our own modules or inside vLLM.
     """
     name = getattr(err, "name", None)
-    return (
-        isinstance(err, ModuleNotFoundError)
-        and bool(name)
-        and name.split(".")[0] in ("vllm", "zmq", "msgspec")
-    )
+    return isinstance(err, ModuleNotFoundError) and name in _OPTIONAL_DEPENDENCIES
 
 
 try:
@@ -75,10 +83,14 @@ if _HAVE_TIER:
     from dsv4_kv_disk_tier import CappedFileSystemTierManager, _load_block_buffered
 
     try:
+        from vllm.v1.kv_offload.base import GPULoadStoreSpec
+        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
         from vllm.v1.kv_offload.tiering.base import LookupResult
         from vllm.v1.kv_offload.tiering.fs.manager import FileSystemTierManager
     except ImportError as e:
         if _missing_external_dependency(e):
+            GPULoadStoreSpec = None
+            CPULoadStoreSpec = None
             LookupResult = None
             FileSystemTierManager = None
         else:
@@ -86,6 +98,8 @@ if _HAVE_TIER:
 else:
     CappedFileSystemTierManager = None
     _load_block_buffered = None
+    GPULoadStoreSpec = None
+    CPULoadStoreSpec = None
     LookupResult = None
     FileSystemTierManager = None
     dsv4_vllm_patches = None
@@ -304,6 +318,28 @@ class TestRecoveryTransitions(unittest.TestCase):
         self.assertEqual(t._epoch, 2)
         self.assertEqual(t._hellos, {})
 
+    def test_stale_zero_reply_while_ready_is_ignored(self):
+        t = make_head()
+        # Round 0 reconciles (gen-less hellos), then rank 0 reconnects and
+        # everyone answers for epoch 1.
+        t._on_hello(b"id0", {"rank": 0, "keys": [b"a"]})
+        t._on_hello(b"id1", {"rank": 1, "keys": [b"a"]})
+        t._on_hello(b"id0", {"rank": 0, "keys": [b"b"]})
+        t._on_hello(b"id0", {"rank": 0, "keys": [b"b"], "gen": 1})
+        t._on_hello(b"id1", {"rank": 1, "keys": [b"b"], "gen": 1})
+        self.assertTrue(t._ready)
+        self.assertEqual(t._epoch, 1)
+        sent = len(t._sent)
+        # A round-0 reply (gen=0, explicitly present) arriving late is stale --
+        # not a spontaneous restart. Conflating "gen absent" with "gen=0" would
+        # discard the reconciled index and re-poll every agent for nothing.
+        t._on_hello(b"id1", {"rank": 1, "keys": [b"zzz"], "gen": 0})
+        self.assertTrue(t._ready)
+        self.assertEqual(t._epoch, 1)
+        self.assertEqual(len(t._sent), sent)
+        self.assertIn(b"b", t._present)
+        self.assertNotIn(b"zzz", t._present)
+
     def test_duplicate_rank_is_reported(self):
         t = make_head()
         t._on_hello(b"id0", {"rank": 0, "keys": [b"a"]})
@@ -368,34 +404,26 @@ class TestFsCapped(unittest.TestCase):
         self.assertIn("/c", cm._lru)
         self.assertEqual(cm._total_bytes, 100)
 
-    def test_finished_hook_serves_both_vllm_generations(self):
-        # Older (DeepSeek-image) vLLM exposes only get_finished() and calls that
-        # name: if the pin retirement is bound to the new name alone, it never
-        # runs there -- every resident block stays pinned, _evict_for() stops
-        # evicting, and the byte cap is silently bypassed while the disk fills.
-        # Exercise exactly that surface, then the new-API one.
-        cm = self._make()
-        cm._load_job_keys = {1: ["/x/k"]}
-        cm._pinned = {"/x/k": 1}
-        Res = type("Res", (), {"job_id": 1, "success": True})
-        has_jobs = "get_finished_jobs" in FileSystemTierManager.__dict__
-        jobs = FileSystemTierManager.__dict__.get("get_finished_jobs")
-        has_old = "get_finished" in FileSystemTierManager.__dict__
-        old = FileSystemTierManager.__dict__.get("get_finished")
-        if has_jobs:
-            del FileSystemTierManager.get_finished_jobs
-        FileSystemTierManager.get_finished = lambda self: iter([Res()])
-        try:
-            self.assertEqual(len(list(cm.get_finished())), 1)
-        finally:
-            if has_old:
-                FileSystemTierManager.get_finished = old
-            else:
-                del FileSystemTierManager.get_finished
-            if has_jobs:
-                FileSystemTierManager.get_finished_jobs = jobs
-        self.assertEqual(cm._pinned, {})
-        self.assertTrue(hasattr(cm, "get_finished_jobs"))
+    def test_completion_releases_load_pins(self):
+        # The pinned image polls get_finished_jobs() (tiering/base.py's abstract
+        # hook, implemented by FileSystemTierManager). The pins a load takes in
+        # submit_load() must be released when that job is reported finished: a
+        # pin that outlives its job is skipped by _evict_for() forever, so the
+        # byte cap is bypassed while the disk fills. Both published hook names
+        # must reach that same body.
+        for hook in ("get_finished_jobs", "get_finished"):
+            with self.subTest(hook=hook):
+                cm = self._make()
+                cm._load_job_keys = {1: ["/x/k"]}
+                cm._pinned = {"/x/k": 1}
+                Res = type("Res", (), {"job_id": 1, "success": True})
+                orig = FileSystemTierManager.get_finished_jobs
+                try:
+                    FileSystemTierManager.get_finished_jobs = lambda self: iter([Res()])
+                    self.assertEqual(len(list(getattr(cm, hook)())), 1)
+                finally:
+                    FileSystemTierManager.get_finished_jobs = orig
+                self.assertEqual(cm._pinned, {})
 
     def test_failed_load_drops_retired_block_accounting(self):
         cm = self._make()
@@ -560,6 +588,15 @@ class TestShardInventory(unittest.TestCase):
 
 @unittest.skipIf(dsv4_vllm_patches is None, "vllm/zmq not importable")
 class TestDirectIoMapping(unittest.TestCase):
+    """Scheduler-side staging-slot -> GPU-block map bookkeeping.
+
+    The fixtures are the pinned image's real specs, whose ``block_ids`` is a
+    numpy array built by ``BlockIDsLoadStoreSpec.__init__``
+    (vllm/v1/kv_offload/base.py:355-356). That type is the whole point: a list
+    fixture cannot reproduce either the multi-slot ``ValueError`` or the
+    single-element ``[0]`` false negative of a truthiness test.
+    """
+
     def setUp(self):
         self._saved = dict(dsv4_vllm_patches._GPU_BLOCK_MAP)
 
@@ -568,21 +605,17 @@ class TestDirectIoMapping(unittest.TestCase):
         dsv4_vllm_patches._GPU_BLOCK_MAP.update(self._saved)
 
     @staticmethod
-    def _spec(block_ids, group_sizes=None, block_indices=None):
-        return type(
-            "Spec",
-            (),
-            {
-                "block_ids": block_ids,
-                "group_sizes": group_sizes,
-                "block_indices": block_indices,
-            },
-        )()
+    def _gpu(block_ids, group_sizes, block_indices):
+        return GPULoadStoreSpec(block_ids, group_sizes, block_indices)
+
+    @staticmethod
+    def _staging(block_ids):
+        return CPULoadStoreSpec(block_ids)
 
     def test_new_owner_of_a_slot_replaces_the_old_mapping(self):
-        staging = self._spec([5])
+        staging = self._staging([5])
         dsv4_vllm_patches._map_staging_to_gpu(
-            self._spec([10, 11], [2], [0]), staging, 2
+            self._gpu([10, 11], [2], [0]), staging, 2
         )
         self.assertEqual(dsv4_vllm_patches.get_gpu_blocks(5), [10, 11])
         # The next job reuses slot 5 but carries no usable spec: its slots are
@@ -592,20 +625,75 @@ class TestDirectIoMapping(unittest.TestCase):
         self.assertIsNone(dsv4_vllm_patches.get_gpu_blocks(5))
 
     def test_shifted_mapping_is_not_recorded(self):
-        staging = self._spec([7])  # a 4-block group at F=2 needs 2 slots
+        staging = self._staging([7])  # a 4-block group at F=2 needs 2 slots
         dsv4_vllm_patches._map_staging_to_gpu(
-            self._spec([10, 11, 12, 13], [4], [0]), staging, 2
+            self._gpu([10, 11, 12, 13], [4], [0]), staging, 2
         )
         self.assertIsNone(dsv4_vllm_patches.get_gpu_blocks(7))
 
     def test_null_sub_blocks_use_a_negative_sentinel(self):
         dsv4_vllm_patches._map_staging_to_gpu(
-            self._spec([10], [1], [1]), self._spec([3]), 2
+            self._gpu([10], [1], [1]), self._staging([3]), 2
         )
         self.assertEqual(
             dsv4_vllm_patches.get_gpu_blocks(3),
             [dsv4_vllm_patches._NULL_BLOCK, 10],
         )
+
+    def test_multi_slot_invalidation_does_not_raise(self):
+        # A two-element block_ids array is ambiguous as a condition: a
+        # truthiness test raises inside TransferJob.__init__ (the engine's
+        # scheduler path), and neither slot is invalidated.
+        staging = self._staging([0, 5])
+        dsv4_vllm_patches._map_staging_to_gpu(
+            self._gpu([10, 11, 12, 13], [2, 2], [0, 0]), staging, 2
+        )
+        self.assertEqual(dsv4_vllm_patches.get_gpu_blocks(0), [10, 11])
+        self.assertEqual(dsv4_vllm_patches.get_gpu_blocks(5), [12, 13])
+        dsv4_vllm_patches._forget_staging_slots(staging)
+        self.assertIsNone(dsv4_vllm_patches.get_gpu_blocks(0))
+        self.assertIsNone(dsv4_vllm_patches.get_gpu_blocks(5))
+
+    def test_slot_zero_is_invalidated_not_skipped(self):
+        # [0] is a one-element array, i.e. falsy: a truthiness test names no
+        # slot, so the mapping of real GPU block 0's slot survives its owner
+        # and is read as the next job's blocks.
+        dsv4_vllm_patches._map_staging_to_gpu(
+            self._gpu([42, 43], [2], [0]), self._staging([0]), 2
+        )
+        self.assertEqual(dsv4_vllm_patches.get_gpu_blocks(0), [42, 43])
+        dsv4_vllm_patches._forget_staging_slots(self._staging([0]))
+        self.assertIsNone(dsv4_vllm_patches.get_gpu_blocks(0))
+
+
+class TestOptionalDependencySkipContract(unittest.TestCase):
+    """The suite may skip only when a top-level optional dependency is absent.
+
+    A skipped suite reads as success to a plain unittest exit status, so an
+    over-broad guard turns a drifted vLLM API into a green qualification run.
+    Needs no vllm on purpose: this contract must hold on every host.
+    """
+
+    def test_only_top_level_absence_skips(self):
+        self.assertTrue(
+            _missing_external_dependency(
+                ModuleNotFoundError("No module named 'vllm'", name="vllm")
+            )
+        )
+        for err in (
+            # vLLM is installed; the module the tier imports is not there.
+            ModuleNotFoundError("No module named 'vllm.v1'", name="vllm.v1"),
+            ModuleNotFoundError(
+                "No module named 'vllm.v1.kv_offload'", name="vllm.v1.kv_offload"
+            ),
+            # Some other dependency of vLLM is missing: not this suite's skip.
+            ModuleNotFoundError("No module named 'torch'", name="torch"),
+            ImportError("cannot import name 'LookupResult' from 'vllm'"),
+            NameError("name 'LookupResult' is not defined"),
+            ModuleNotFoundError("No module named 'x'", name=None),
+        ):
+            with self.subTest(err=repr(err)):
+                self.assertFalse(_missing_external_dependency(err))
 
 
 if __name__ == "__main__":

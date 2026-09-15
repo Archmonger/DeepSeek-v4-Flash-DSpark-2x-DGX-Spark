@@ -448,14 +448,16 @@ class CappedFileSystemTierManager(FileSystemTierManager):
         so _evict_for() can never unlink a file a read thread is about to open.
         """
         try:
-            # Newer vLLM renamed this hook to get_finished_jobs, and the parent
-            # may carry only one of the two names. Resolving it here is what
-            # makes the override actually run on the older (DeepSeek-image)
-            # vLLM, which calls get_finished(): with only get_finished_jobs
-            # defined, the pins were never released and _evict_for() found every
-            # resident block pinned, silently bypassing the byte cap.
+            # The pinned image polls get_finished_jobs() (tiering/base.py's
+            # abstract hook, implemented in tiering/fs/manager.py), so the body
+            # must stay reachable under BOTH names: the override below is only
+            # as good as the name the framework actually calls, and a hook whose
+            # pin retirement never runs leaves every resident block pinned --
+            # _evict_for() then finds no evictable block and the byte cap is
+            # silently bypassed while the disk fills. Resolve the parent by
+            # whichever name it carries.
             parent_get_finished = super().get_finished_jobs
-        except AttributeError:  # older vLLM (DeepSeek image)
+        except AttributeError:  # parent exposes only the other hook name
             parent_get_finished = super().get_finished
         for result in parent_get_finished():
             paths = self._load_job_keys.pop(result.job_id, None)
@@ -492,8 +494,9 @@ class CappedFileSystemTierManager(FileSystemTierManager):
                             self._total_bytes -= self._lru.pop(p)
             yield result
 
-    # GLM53-ABC-PORT: newer vLLM renamed this hook; both names stay bound so the
-    # pin retirement above runs on either vLLM generation (see get_finished).
+    # GLM53-ABC-PORT: both hook names stay bound to the same body -- the pinned
+    # image calls get_finished_jobs(), and an image that names the hook
+    # get_finished() must still release the load pins (see get_finished).
     def get_finished_jobs(self):
         return self.get_finished()
 

@@ -1401,20 +1401,29 @@ def apply_offload_budget() -> None:
 
 
 def _module_available(name: str) -> bool:
-    """True when `name` (and its parent packages) can be imported on this image.
+    """True only when `name` is absent from this image, not when it is broken.
 
     Used to pick between vLLM runner generations: each image ships one of
     ``vllm.v1.worker.gpu_model_runner`` (V1) or ``vllm.v1.worker.gpu.model_runner``
-    (V2). find_spec imports the parent packages, so a missing parent raises
-    ModuleNotFoundError -- "not on this image" -- while anything else propagates
-    instead of being swallowed as absence.
+    (V2). A module that is simply not there makes find_spec return None, and an
+    absent parent package makes it raise ModuleNotFoundError naming the first
+    missing component -- both are "not on this image".
+
+    Every other failure comes from inside a package that IS present: a
+    dependency the runner imports, or an API its module re-exports. Reporting
+    those as absence would silently skip the host-KV patch on an image that
+    needs it (the engine then runs with the stock allocator and the direct-I/O
+    path never arms), so they propagate to the caller.
     """
     import importlib.util
 
     try:
         return importlib.util.find_spec(name) is not None
-    except ImportError:
-        return False
+    except ModuleNotFoundError as e:
+        missing = getattr(e, "name", None)
+        if missing and (missing == name or name.startswith(f"{missing}.")):
+            return False
+        raise
 
 
 def apply_all() -> None:
@@ -1458,9 +1467,9 @@ def apply_all() -> None:
         # Each runner generation is optional and independent: the V1 runner
         # module is absent on a V2-only image and vice versa (sitecustomize
         # hooks BOTH paths for exactly that reason). Apply each only when its
-        # module is importable -- an unguarded V1 call raised ImportError out of
-        # apply_all, which is imported by dsv4_kv_disk_tier, and killed the
-        # engine at startup.
+        # module is genuinely absent -- an unguarded V1 call raised ImportError
+        # out of apply_all, which is imported by dsv4_kv_disk_tier, and killed
+        # the engine at startup.
         for _apply, _mod in (
             (apply_host_kv_alloc, "vllm.v1.worker.gpu_model_runner"),
             (apply_host_kv_alloc_v2, "vllm.v1.worker.gpu.model_runner"),
@@ -1714,7 +1723,23 @@ def _forget_staging_slots(staging_spec) -> None:
     mapping and whenever a job produces none: a missing mapping already fails
     the job safely on the head, a stale one silently corrupts KV.
     """
-    for b in getattr(staging_spec, "block_ids", None) or ():
+    if staging_spec is None:
+        return
+    block_ids = getattr(staging_spec, "block_ids", None)
+    # block_ids is a numpy array on the pinned image
+    # (vllm/v1/kv_offload/base.py: BlockIDsLoadStoreSpec.__init__ builds
+    # np.array(block_ids, dtype=int64)), so it must never be used as a
+    # condition: `or ()` raises "truth value of an array ... is ambiguous" for
+    # a multi-slot spec, and for the single-element [0] it is falsy, so the
+    # only slot would be skipped and the previous owner's mapping would survive
+    # as this job's. None -- not an empty-ish array -- is "names no slots".
+    if block_ids is None:
+        return
+    try:
+        slots = iter(block_ids)
+    except TypeError:
+        return
+    for b in slots:
         try:
             _GPU_BLOCK_MAP.pop(int(b), None)
         except (TypeError, ValueError):
