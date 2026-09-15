@@ -87,6 +87,34 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 _dspark_env_clean="$(mktemp)"
 chmod 600 "$_dspark_env_clean"
+# Preserve explicit one-shot runtime-ablation overrides across sourcing the
+# persistent env file. This makes `ABLATE=1 ./start-...` behave as expected;
+# the resolved values are also injected into the worker compose command.
+_dspark_ambient_ablate_has=0
+_dspark_ambient_ablate=""
+_dspark_ambient_ablate_lambda_has=0
+_dspark_ambient_ablate_lambda=""
+_dspark_ambient_ablate_layers_has=0
+_dspark_ambient_ablate_layers=""
+_dspark_ambient_ablate_source_has=0
+_dspark_ambient_ablate_source=""
+if [ -n "${ABLATE+x}" ]; then
+  _dspark_ambient_ablate_has=1
+  _dspark_ambient_ablate="$ABLATE"
+fi
+if [ -n "${DSV4_ABLATE_LAMBDA+x}" ]; then
+  _dspark_ambient_ablate_lambda_has=1
+  _dspark_ambient_ablate_lambda="$DSV4_ABLATE_LAMBDA"
+fi
+if [ -n "${DSV4_ABLATE_LAYERS+x}" ]; then
+  _dspark_ambient_ablate_layers_has=1
+  _dspark_ambient_ablate_layers="$DSV4_ABLATE_LAYERS"
+fi
+if [ -n "${DSPARK_ABLATE_SOURCE_FILE+x}" ]; then
+  _dspark_ambient_ablate_source_has=1
+  _dspark_ambient_ablate_source="$DSPARK_ABLATE_SOURCE_FILE"
+fi
+
 # DSPARK_API_KEYS ambient guard (begin)
 _dspark_ambient_has=0
 _dspark_ambient_keys=""
@@ -105,6 +133,18 @@ if [ "$_dspark_ambient_has" = "1" ] && [ "$_dspark_ambient_keys" != "${DSPARK_AP
   exit 2
 fi
 # DSPARK_API_KEYS ambient guard (end)
+if [ "$_dspark_ambient_ablate_has" = "1" ]; then
+  ABLATE="$_dspark_ambient_ablate"
+fi
+if [ "$_dspark_ambient_ablate_lambda_has" = "1" ]; then
+  DSV4_ABLATE_LAMBDA="$_dspark_ambient_ablate_lambda"
+fi
+if [ "$_dspark_ambient_ablate_layers_has" = "1" ]; then
+  DSV4_ABLATE_LAYERS="$_dspark_ambient_ablate_layers"
+fi
+if [ "$_dspark_ambient_ablate_source_has" = "1" ]; then
+  DSPARK_ABLATE_SOURCE_FILE="$_dspark_ambient_ablate_source"
+fi
 COMPOSE_ENV_FILE="$_dspark_env_clean"
 
 # GPU util comes from GPU_MEMORY_UTILIZATION_TEXT (default 0.835).
@@ -124,22 +164,84 @@ if [ "${DSPARK_TP3:-0}" = "1" ]; then
   export MAX_NUM_SEQS
 fi
 
-# Checkpoint flag: official Vision-Exp vs Keys abliterated weights.
-#   ABLITERATED=0 → DSPARK_MODEL_OFFICIAL
-#   ABLITERATED=1 → DSPARK_MODEL_ABLITERATED
+# Checkpoint flag: official Vision-Exp vs gated runtime ablation.
+#   ABLITERATED=0 → official weights, stock decoder
+#   ABLITERATED=1 → official weights + runtime direction (not the 157 GiB
+#                   Keys checkpoint). Requires a prior gated Hub download.
 DSPARK_MODEL_OFFICIAL="${DSPARK_MODEL_OFFICIAL:-deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}"
 DSPARK_MODEL_ABLITERATED="${DSPARK_MODEL_ABLITERATED:-drowzeys/keys-DeepSeekV4Flash-Vision-EXP-ablit}"
 DEFAULT_OFFICIAL_REVISION="86f746b36186f0e567729a5c06a8c918caba82a9"
-if [ "${ABLITERATED:-0}" = "1" ]; then
-  DSPARK_MODEL="$DSPARK_MODEL_ABLITERATED"
-  DSPARK_REVISION="${DSPARK_REVISION_ABLITERATED:-}"
-else
-  DSPARK_MODEL="$DSPARK_MODEL_OFFICIAL"
-  if [ -z "${DSPARK_REVISION+x}" ]; then
-    DSPARK_REVISION="$DEFAULT_OFFICIAL_REVISION"
-  fi
+DSPARK_MODEL="$DSPARK_MODEL_OFFICIAL"
+if [ -z "${DSPARK_REVISION+x}" ]; then
+  DSPARK_REVISION="$DEFAULT_OFFICIAL_REVISION"
 fi
 export ABLITERATED DSPARK_MODEL DSPARK_MODEL_OFFICIAL DSPARK_MODEL_ABLITERATED DSPARK_REVISION
+
+# Runtime refusal-direction projection. User-facing switch is ABLITERATED=1;
+# that implies ABLATE=1 after the gated 18 KiB direction is on disk.
+DSV4_ABLATE_LAMBDA="${DSV4_ABLATE_LAMBDA:-3.5}"
+DSV4_ABLATE_LAYERS="${DSV4_ABLATE_LAYERS:-10-42}"
+DSPARK_ABLATE_DIRECTION_SHA256="${DSPARK_ABLATE_DIRECTION_SHA256:-6e4d8a8f3aa9e21795faab2c5b14d29b019acdf2ddbfbd8238430458a5837fe0}"
+_ablate_cache="${HF_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}}"
+_ablate_gate_dir="${_ablate_cache}/dspark-ablation"
+_ablate_gate_terms="${_ablate_gate_dir}/RESPONSIBLE_USE.md"
+_ablate_gate_direction="${_ablate_gate_dir}/direction_r1.pt"
+if [ "${ABLITERATED:-0}" = "1" ]; then
+  ABLATE=1
+elif [ "${ABLATE:-0}" = "1" ]; then
+  echo "ABLATE=1 is gated on ABLITERATED=1. Agree to the Keys Hub terms at" >&2
+  echo "  https://huggingface.co/${DSPARK_MODEL_ABLITERATED}" >&2
+  echo "then run: ./prepare-dspark-model-cache.sh --abliterated" >&2
+  exit 2
+else
+  ABLATE=0
+fi
+DSPARK_ABLATE_SOURCE_FILE="${DSPARK_ABLATE_SOURCE_FILE:-$_ablate_gate_direction}"
+case "$ABLATE" in
+  0|1) ;;
+  *) echo "ABLATE must be 0 or 1 (got: $ABLATE)" >&2; exit 2 ;;
+esac
+if [ "$ABLATE" = "1" ]; then
+  if [[ ! "$DSV4_ABLATE_LAYERS" =~ ^([0-9]+)[[:space:]]*-[[:space:]]*([0-9]+)$ ]]; then
+    echo "DSV4_ABLATE_LAYERS must look like 10-42 (got: $DSV4_ABLATE_LAYERS)" >&2
+    exit 2
+  fi
+  _ablate_layer_lo="${BASH_REMATCH[1]}"
+  _ablate_layer_hi="${BASH_REMATCH[2]}"
+  if (( 10#$_ablate_layer_lo > 10#$_ablate_layer_hi || 10#$_ablate_layer_hi > 42 )); then
+    echo "DSV4_ABLATE_LAYERS must be an ordered range within target layers 0-42 (got: $DSV4_ABLATE_LAYERS)" >&2
+    exit 2
+  fi
+  if ! python3 - "$DSV4_ABLATE_LAMBDA" <<'PY'
+import math
+import sys
+try:
+    value = float(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(value) and value >= 0.0 else 1)
+PY
+  then
+    echo "DSV4_ABLATE_LAMBDA must be a finite non-negative number (got: $DSV4_ABLATE_LAMBDA)" >&2
+    exit 2
+  fi
+  if [[ "$DSPARK_ABLATE_SOURCE_FILE" != /* ]]; then
+    DSPARK_ABLATE_SOURCE_FILE="$SCRIPT_DIR/$DSPARK_ABLATE_SOURCE_FILE"
+  fi
+  if [ ! -f "$_ablate_gate_terms" ] || [ ! -f "$DSPARK_ABLATE_SOURCE_FILE" ]; then
+    echo "ABLITERATED=1 requires a gated Hugging Face download (Keys terms + 18 KiB direction)." >&2
+    echo "Agree at https://huggingface.co/${DSPARK_MODEL_ABLITERATED}" >&2
+    echo "then run: ./prepare-dspark-model-cache.sh --abliterated" >&2
+    echo "Missing: $_ablate_gate_terms and/or $DSPARK_ABLATE_SOURCE_FILE" >&2
+    exit 1
+  fi
+  _ablate_actual_sha="$(sha256sum "$DSPARK_ABLATE_SOURCE_FILE" | awk '{print $1}')"
+  if [ "$_ablate_actual_sha" != "$DSPARK_ABLATE_DIRECTION_SHA256" ]; then
+    echo "Ablation direction SHA-256 mismatch (got $_ablate_actual_sha, expected $DSPARK_ABLATE_DIRECTION_SHA256)" >&2
+    exit 1
+  fi
+fi
+export ABLATE DSV4_ABLATE_LAMBDA DSV4_ABLATE_LAYERS DSPARK_ABLATE_SOURCE_FILE DSPARK_ABLATE_DIRECTION_SHA256
 
 # Vision-Exp: Anemll SpeculativeConfig requires
 # num_speculative_tokens % num_nextn_predict_layers == 0 when k > n_predict.
@@ -395,6 +497,53 @@ if [ "${DSPARK_ENABLE_DSPARK_BLOCK_K:-0}" = "1" ] && { [ ! -f "$DSPARK_DSPARK_BL
   exit 1
 fi
 export DSPARK_DSPARK_BLOCK_K_HOTFIX DSPARK_ENABLE_DSPARK_BLOCK_K
+DSPARK_ROPE_SWA_FIX_HOTFIX="${DSPARK_ROPE_SWA_FIX_HOTFIX:-$SCRIPT_DIR/patches/hotfix-vllm-rope-swa-fix.py}"
+if [ "${DSPARK_ENABLE_ROPE_SWA_FIX:-0}" = "1" ] && { [ ! -f "$DSPARK_ROPE_SWA_FIX_HOTFIX" ] || [ -L "$DSPARK_ROPE_SWA_FIX_HOTFIX" ]; }; then
+  echo "RoPE SWA fix is enabled but its local patcher is missing or not a regular file: $DSPARK_ROPE_SWA_FIX_HOTFIX" >&2
+  exit 1
+fi
+export DSPARK_ROPE_SWA_FIX_HOTFIX DSPARK_ENABLE_ROPE_SWA_FIX
+DSPARK_DSPARK_SWA_PREFIX_HOTFIX="${DSPARK_DSPARK_SWA_PREFIX_HOTFIX:-$SCRIPT_DIR/patches/hotfix-vllm-dspark-swa-prefix.py}"
+if [ "${DSPARK_ENABLE_DSPARK_SWA_PREFIX:-0}" = "1" ] && { [ ! -f "$DSPARK_DSPARK_SWA_PREFIX_HOTFIX" ] || [ -L "$DSPARK_DSPARK_SWA_PREFIX_HOTFIX" ]; }; then
+  echo "DSpark SWA prefix fix is enabled but its local patcher is missing or not a regular file: $DSPARK_DSPARK_SWA_PREFIX_HOTFIX" >&2
+  exit 1
+fi
+export DSPARK_DSPARK_SWA_PREFIX_HOTFIX DSPARK_ENABLE_DSPARK_SWA_PREFIX
+DSPARK_DSML_RECOVERY_HOTFIX="${DSPARK_DSML_RECOVERY_HOTFIX:-$SCRIPT_DIR/patches/hotfix-vllm-dsml-recovery.py}"
+if [ "${DSPARK_ENABLE_DSML_RECOVERY:-0}" = "1" ] && { [ ! -f "$DSPARK_DSML_RECOVERY_HOTFIX" ] || [ -L "$DSPARK_DSML_RECOVERY_HOTFIX" ]; }; then
+  echo "DSML recovery is enabled but its local patcher is missing or not a regular file: $DSPARK_DSML_RECOVERY_HOTFIX" >&2
+  exit 1
+fi
+export DSPARK_DSML_RECOVERY_HOTFIX DSPARK_ENABLE_DSML_RECOVERY
+DSPARK_ISSUE144_EFFORT_ALIGN_HOTFIX="${DSPARK_ISSUE144_EFFORT_ALIGN_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-issue144-effort-align.py}"
+if [ "${DSPARK_ENABLE_ISSUE144_EFFORT_ALIGN:-0}" = "1" ] && { [ ! -f "$DSPARK_ISSUE144_EFFORT_ALIGN_HOTFIX" ] || [ -L "$DSPARK_ISSUE144_EFFORT_ALIGN_HOTFIX" ]; }; then
+  echo "Issue #144 effort alignment is enabled but its local patcher is missing or not a regular file: $DSPARK_ISSUE144_EFFORT_ALIGN_HOTFIX" >&2
+  exit 1
+fi
+export DSPARK_ISSUE144_EFFORT_ALIGN_HOTFIX DSPARK_ENABLE_ISSUE144_EFFORT_ALIGN
+# MXFP4 indexer K cache (opt-in, item8 design §3): gate relaxation + enablement arg.
+DSPARK_MXFP4_INDEXER_CACHE_HOTFIX="${DSPARK_MXFP4_INDEXER_CACHE_HOTFIX:-$SCRIPT_DIR/patches/hotfix-vllm-mxfp4-indexer-cache.py}"
+if [ "${DSPARK_ENABLE_MXFP4_INDEXER_CACHE:-0}" = "1" ] && { [ ! -f "$DSPARK_MXFP4_INDEXER_CACHE_HOTFIX" ] || [ -L "$DSPARK_MXFP4_INDEXER_CACHE_HOTFIX" ]; }; then
+  echo "MXFP4 indexer K cache is enabled but its local patcher is missing or not a regular file: $DSPARK_MXFP4_INDEXER_CACHE_HOTFIX" >&2
+  exit 1
+fi
+if [ "${DSPARK_ENABLE_MXFP4_INDEXER_CACHE:-0}" = "1" ] && [ "${DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS:-0}" != "1" ]; then
+  echo "error: DSPARK_ENABLE_MXFP4_INDEXER_CACHE=1 requires DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS=1 (the fp4 mqa-logits kernels are not in the persisted DeepGEMM JIT cache; the GB10 JIT compile needs the sm121 alias headers)" >&2
+  exit 1
+fi
+export DSPARK_MXFP4_INDEXER_CACHE_HOTFIX DSPARK_ENABLE_MXFP4_INDEXER_CACHE
+
+# C128A prefill conversion cache: same metadata lifetime, no persistent buffers.
+DSPARK_C128A_PREFILL_CACHE_HOTFIX="${DSPARK_C128A_PREFILL_CACHE_HOTFIX:-$SCRIPT_DIR/patches/hotfix-vllm-c128a-prefill-cache.py}"
+case "$DSPARK_C128A_PREFILL_CACHE_HOTFIX" in
+  /*) ;;
+  *) DSPARK_C128A_PREFILL_CACHE_HOTFIX="$SCRIPT_DIR/${DSPARK_C128A_PREFILL_CACHE_HOTFIX#./}" ;;
+esac
+if [ "${DSPARK_ENABLE_C128A_PREFILL_CACHE:-0}" = "1" ] && { [ ! -f "$DSPARK_C128A_PREFILL_CACHE_HOTFIX" ] || [ -L "$DSPARK_C128A_PREFILL_CACHE_HOTFIX" ]; }; then
+  echo "C128A prefill cache is enabled but its local patcher is missing or not a regular file: $DSPARK_C128A_PREFILL_CACHE_HOTFIX" >&2
+  exit 1
+fi
+export DSPARK_C128A_PREFILL_CACHE_HOTFIX DSPARK_ENABLE_C128A_PREFILL_CACHE
 
 : "${WORKER_HOST:?WORKER_HOST must be set in $ENV_FILE}"
 : "${MASTER_ADDR:?MASTER_ADDR must be set in $ENV_FILE}"
@@ -482,6 +631,12 @@ REMOTE_ISSUE191_MODE="$(printf '%q' "${DSPARK_ISSUE191_TOOLCALL_MODE:-failclosed
 REMOTE_ISSUE191_THINKOFF="$(printf '%q' "${DSPARK_ISSUE191_TOOLCALL_THINKOFF_FALLBACK:-1}")"
 REMOTE_ASYNC_SCHEDULING="$(printf '%q' "${DSPARK_ASYNC_SCHEDULING:-1}")"
 REMOTE_DSPARK_BLOCK_K="$(printf '%q' "${DSPARK_ENABLE_DSPARK_BLOCK_K:-0}")"
+REMOTE_ROPE_SWA_FIX="$(printf '%q' "${DSPARK_ENABLE_ROPE_SWA_FIX:-0}")"
+REMOTE_DSPARK_SWA_PREFIX="$(printf '%q' "${DSPARK_ENABLE_DSPARK_SWA_PREFIX:-0}")"
+REMOTE_DSML_RECOVERY="$(printf '%q' "${DSPARK_ENABLE_DSML_RECOVERY:-0}")"
+REMOTE_ISSUE144_EFFORT_ALIGN="$(printf '%q' "${DSPARK_ENABLE_ISSUE144_EFFORT_ALIGN:-0}")"
+REMOTE_MXFP4_INDEXER="$(printf '%q' "${DSPARK_ENABLE_MXFP4_INDEXER_CACHE:-0}")"
+REMOTE_C128A_PREFILL_CACHE="$(printf '%q' "${DSPARK_ENABLE_C128A_PREFILL_CACHE:-0}")"
 REMOTE_COMPOSE="cd $REMOTE_WORKER_DIR && env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS COMPOSE_DISABLE_ENV_FILE=1"
 STARTUP_LOG_SINCE=""
 
@@ -490,6 +645,68 @@ need_cmd() {
     echo "Missing required command: $1" >&2
     exit 1
   fi
+}
+
+_stage_ablation_direction_remote() {
+  local host="$1" cache_dir="$2" label="$3" expected="$4"
+  local remote_dir remote_target remote_dir_q remote_target_q expected_q
+  remote_dir="${cache_dir}/dspark-ablation"
+  remote_target="${remote_dir}/direction_r1.pt"
+  printf -v remote_dir_q '%q' "$remote_dir"
+  printf -v remote_target_q '%q' "$remote_target"
+  printf -v expected_q '%q' "$expected"
+  if ! ssh "$host" "
+    set -euo pipefail
+    _dir=$remote_dir_q
+    _target=$remote_target_q
+    _expected=$expected_q
+    mkdir -p \"\$_dir\"
+    _tmp=\"\${_target}.tmp.\$\$\"
+    trap 'rm -f -- \"\$_tmp\"' EXIT
+    cat > \"\$_tmp\"
+    _actual=\$(sha256sum \"\$_tmp\" | awk '{print \$1}')
+    [ \"\$_actual\" = \"\$_expected\" ] || { echo '${label} ablation direction SHA-256 mismatch' >&2; exit 1; }
+    chmod 0644 \"\$_tmp\"
+    mv -f -- \"\$_tmp\" \"\$_target\"
+    trap - EXIT
+  " < "$DSPARK_ABLATE_SOURCE_FILE"; then
+    echo "Failed to stage the ablation direction on $label $host" >&2
+    return 1
+  fi
+}
+
+stage_ablation_direction() {
+  [ "$ABLATE" = "1" ] || return 0
+  [ -n "${HF_CACHE:-}" ] || { echo "ABLATE=1 requires HF_CACHE" >&2; return 1; }
+  [ -n "${WORKER_HF_CACHE:-}" ] || { echo "ABLATE=1 requires WORKER_HF_CACHE or HF_CACHE" >&2; return 1; }
+
+  local expected local_dir local_target local_tmp
+  expected="$(sha256sum "$DSPARK_ABLATE_SOURCE_FILE" | awk '{print $1}')"
+  local_dir="${HF_CACHE}/dspark-ablation"
+  local_target="${local_dir}/direction_r1.pt"
+  mkdir -p "$local_dir"
+  local_tmp="$(mktemp "${local_target}.tmp.XXXXXX")"
+  if ! cp "$DSPARK_ABLATE_SOURCE_FILE" "$local_tmp"; then
+    rm -f -- "$local_tmp"
+    return 1
+  fi
+  chmod 0644 "$local_tmp"
+  if [ "$(sha256sum "$local_tmp" | awk '{print $1}')" != "$expected" ]; then
+    rm -f -- "$local_tmp"
+    echo "Local staged ablation direction failed SHA-256 verification" >&2
+    return 1
+  fi
+  mv -f -- "$local_tmp" "$local_target"
+
+  # NFS workers mount the head HF_CACHE read-only, so the local copy is what
+  # the container sees. Still copy onto each worker cache for the non-NFS path
+  # and as a belt-and-suspenders check of the file bytes.
+  _stage_ablation_direction_remote "$WORKER_HOST" "$WORKER_HF_CACHE" "worker" "$expected" || return 1
+  if [ "${DSPARK_TP3:-0}" = "1" ]; then
+    [ -n "${WORKER2_HF_CACHE:-}" ] || { echo "ABLATE=1 with TP=3 requires WORKER2_HF_CACHE" >&2; return 1; }
+    _stage_ablation_direction_remote "$WORKER2_HOST" "$WORKER2_HF_CACHE" "worker2" "$expected" || return 1
+  fi
+  echo "Runtime-ablation direction staged on both nodes (sha256=$expected)"
 }
 
 # Strip user@ from ssh targets / host strings → bare host or IPv4.
@@ -920,7 +1137,7 @@ remote_nccl_env() {
   # compose interpolation, and the shared entrypoint normalization makes the
   # defined-empty variable truly absent in the container (NCCL would parse a
   # defined-empty value as GID index 0).
-  printf "NCCL_IB_HCA='%s' NCCL_SOCKET_IFNAME='%s' TP_SOCKET_IFNAME='%s' GLOO_SOCKET_IFNAME='%s' NCCL_IB_GID_INDEX='%s' NCCL_IB_MERGE_NICS='%s' NCCL_IB_SUBNET_AWARE_ROUTING='%s' NCCL_IB_SUBNET_PREFIX_LEN='%s' VLLM_HOST='%s' VLLM_PORT='%s'" \
+  printf "NCCL_IB_HCA='%s' NCCL_SOCKET_IFNAME='%s' TP_SOCKET_IFNAME='%s' GLOO_SOCKET_IFNAME='%s' NCCL_IB_GID_INDEX='%s' NCCL_IB_MERGE_NICS='%s' NCCL_IB_SUBNET_AWARE_ROUTING='%s' NCCL_IB_SUBNET_PREFIX_LEN='%s' VLLM_HOST='%s' VLLM_PORT='%s' ABLATE='%s' DSV4_ABLATE_LAMBDA='%s' DSV4_ABLATE_LAYERS='%s'" \
     "$WORKER_NCCL_IB_HCA" \
     "$WORKER_NCCL_SOCKET_IFNAME" \
     "$WORKER_TP_SOCKET_IFNAME" \
@@ -930,7 +1147,10 @@ remote_nccl_env() {
     "${NCCL_IB_SUBNET_AWARE_ROUTING:-}" \
     "${NCCL_IB_SUBNET_PREFIX_LEN:-}" \
     "$VLLM_HOST" \
-    "$VLLM_PORT"
+    "$VLLM_PORT" \
+    "${ABLATE:-0}" \
+    "${DSV4_ABLATE_LAMBDA:-3.5}" \
+    "${DSV4_ABLATE_LAYERS:-10-42}"
 }
 
 compose_base() {
@@ -958,13 +1178,16 @@ compose_base() {
     TP_SIZE="$TP_SIZE" \
     NNODES="$NNODES" \
     TP3_PATCH_DIR="${TP3_PATCH_DIR:-$SCRIPT_DIR/patches/tp3}" \
+    ABLATE="${ABLATE:-0}" \
+    DSV4_ABLATE_LAMBDA="${DSV4_ABLATE_LAMBDA:-3.5}" \
+    DSV4_ABLATE_LAYERS="${DSV4_ABLATE_LAYERS:-10-42}" \
     NODE_RANK="$1" \
     HEADLESS="$2" \
     docker compose -p "$PROJECT_NAME" --env-file "$COMPOSE_ENV_FILE" $HEAD_COMPOSE_FILES "${@:3}"
 }
 
 remote_nccl_env2() {
-  printf "NCCL_IB_HCA='%s' NCCL_SOCKET_IFNAME='%s' TP_SOCKET_IFNAME='%s' GLOO_SOCKET_IFNAME='%s' NCCL_IB_GID_INDEX='%s' NCCL_IB_MERGE_NICS='%s' NCCL_IB_SUBNET_AWARE_ROUTING='%s' NCCL_IB_SUBNET_PREFIX_LEN='%s' VLLM_HOST='%s' VLLM_PORT='%s'" \
+  printf "NCCL_IB_HCA='%s' NCCL_SOCKET_IFNAME='%s' TP_SOCKET_IFNAME='%s' GLOO_SOCKET_IFNAME='%s' NCCL_IB_GID_INDEX='%s' NCCL_IB_MERGE_NICS='%s' NCCL_IB_SUBNET_AWARE_ROUTING='%s' NCCL_IB_SUBNET_PREFIX_LEN='%s' VLLM_HOST='%s' VLLM_PORT='%s' ABLATE='%s' DSV4_ABLATE_LAMBDA='%s' DSV4_ABLATE_LAYERS='%s'" \
     "$WORKER2_NCCL_IB_HCA" \
     "$WORKER2_NCCL_SOCKET_IFNAME" \
     "$WORKER2_TP_SOCKET_IFNAME" \
@@ -974,22 +1197,20 @@ remote_nccl_env2() {
     "${NCCL_IB_SUBNET_AWARE_ROUTING:-}" \
     "${NCCL_IB_SUBNET_PREFIX_LEN:-}" \
     "$VLLM_HOST" \
-    "$VLLM_PORT"
+    "$VLLM_PORT" \
+    "${ABLATE:-0}" \
+    "${DSV4_ABLATE_LAMBDA:-3.5}" \
+    "${DSV4_ABLATE_LAYERS:-10-42}"
 }
 
 remote_compose() {
   # The head may use an absolute local mount override; the worker always uses
   # the canonical synced relative path.
-  ssh "$WORKER_HOST" "$REMOTE_COMPOSE DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX=$REMOTE_ISSUE136_ENABLE DSPARK_ISSUE136_XGRAMMAR_HOTFIX='./patches/hotfix-vllm-issue136-xgrammar-termination.py' DSPARK_ENABLE_ISSUE191_TOOLCALL_FAILCLOSED=$REMOTE_ISSUE191_ENABLE DSPARK_ISSUE191_TOOLCALL_HOTFIX='./patches/hotfix-vllm-issue191-toolcall-failclosed.py' DSPARK_ISSUE191_TOOLCALL_RETRIES=$REMOTE_ISSUE191_RETRIES DSPARK_ISSUE191_TOOLCALL_MODE=$REMOTE_ISSUE191_MODE DSPARK_ISSUE191_TOOLCALL_THINKOFF_FALLBACK=$REMOTE_ISSUE191_THINKOFF DSPARK_ASYNC_SCHEDULING=$REMOTE_ASYNC_SCHEDULING TP_SIZE='$TP_SIZE' NNODES='$NNODES' TP3_PATCH_DIR='./patches/tp3' $(remote_nccl_env) $*"
+  ssh "$WORKER_HOST" "$REMOTE_COMPOSE DSPARK_ENABLE_C128A_PREFILL_CACHE=$REMOTE_C128A_PREFILL_CACHE DSPARK_C128A_PREFILL_CACHE_HOTFIX='./patches/hotfix-vllm-c128a-prefill-cache.py' DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX=$REMOTE_ISSUE136_ENABLE DSPARK_ISSUE136_XGRAMMAR_HOTFIX='./patches/hotfix-vllm-issue136-xgrammar-termination.py' DSPARK_ENABLE_ISSUE191_TOOLCALL_FAILCLOSED=$REMOTE_ISSUE191_ENABLE DSPARK_ISSUE191_TOOLCALL_HOTFIX='./patches/hotfix-vllm-issue191-toolcall-failclosed.py' DSPARK_ISSUE191_TOOLCALL_RETRIES=$REMOTE_ISSUE191_RETRIES DSPARK_ISSUE191_TOOLCALL_MODE=$REMOTE_ISSUE191_MODE DSPARK_ISSUE191_TOOLCALL_THINKOFF_FALLBACK=$REMOTE_ISSUE191_THINKOFF DSPARK_ASYNC_SCHEDULING=$REMOTE_ASYNC_SCHEDULING DSPARK_ENABLE_DSPARK_BLOCK_K=$REMOTE_DSPARK_BLOCK_K DSPARK_DSPARK_BLOCK_K_HOTFIX='./patches/hotfix-vllm-dspark-block-k.py' DSPARK_ENABLE_ROPE_SWA_FIX=$REMOTE_ROPE_SWA_FIX DSPARK_ROPE_SWA_FIX_HOTFIX='./patches/hotfix-vllm-rope-swa-fix.py' DSPARK_ENABLE_DSPARK_SWA_PREFIX=$REMOTE_DSPARK_SWA_PREFIX DSPARK_DSPARK_SWA_PREFIX_HOTFIX='./patches/hotfix-vllm-dspark-swa-prefix.py' DSPARK_ENABLE_DSML_RECOVERY=$REMOTE_DSML_RECOVERY DSPARK_DSML_RECOVERY_HOTFIX='./patches/hotfix-vllm-dsml-recovery.py' DSPARK_ENABLE_MXFP4_INDEXER_CACHE=$REMOTE_MXFP4_INDEXER DSPARK_MXFP4_INDEXER_CACHE_HOTFIX='./patches/hotfix-vllm-mxfp4-indexer-cache.py' DSPARK_ENABLE_ISSUE144_EFFORT_ALIGN=$REMOTE_ISSUE144_EFFORT_ALIGN DSPARK_ISSUE144_EFFORT_ALIGN_HOTFIX='./patches/hotfix-dsv4-issue144-effort-align.py' TP_SIZE='$TP_SIZE' NNODES='$NNODES' TP3_PATCH_DIR='./patches/tp3' $(remote_nccl_env) $*"
 }
 
 remote_compose2() {
-  ssh "$WORKER2_HOST" "$REMOTE_COMPOSE2 DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX=$REMOTE_ISSUE136_ENABLE DSPARK_ISSUE136_XGRAMMAR_HOTFIX='./patches/hotfix-vllm-issue136-xgrammar-termination.py' DSPARK_ENABLE_ISSUE191_TOOLCALL_FAILCLOSED=$REMOTE_ISSUE191_ENABLE DSPARK_ISSUE191_TOOLCALL_HOTFIX='./patches/hotfix-vllm-issue191-toolcall-failclosed.py' DSPARK_ISSUE191_TOOLCALL_RETRIES=$REMOTE_ISSUE191_RETRIES DSPARK_ISSUE191_TOOLCALL_MODE=$REMOTE_ISSUE191_MODE DSPARK_ISSUE191_TOOLCALL_THINKOFF_FALLBACK=$REMOTE_ISSUE191_THINKOFF DSPARK_ASYNC_SCHEDULING=$REMOTE_ASYNC_SCHEDULING TP_SIZE='$TP_SIZE' NNODES='$NNODES' TP3_PATCH_DIR='./patches/tp3' $(remote_nccl_env2) $*"
-  ssh "$WORKER_HOST" "$REMOTE_COMPOSE DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX=$REMOTE_ISSUE136_ENABLE DSPARK_ISSUE136_XGRAMMAR_HOTFIX='./patches/hotfix-vllm-issue136-xgrammar-termination.py' DSPARK_ENABLE_DSPARK_BLOCK_K=$REMOTE_DSPARK_BLOCK_K DSPARK_DSPARK_BLOCK_K_HOTFIX='./patches/hotfix-vllm-dspark-block-k.py' TP_SIZE='$TP_SIZE' NNODES='$NNODES' TP3_PATCH_DIR='./patches/tp3' $(remote_nccl_env) $*"
-}
-
-remote_compose2() {
-  ssh "$WORKER2_HOST" "$REMOTE_COMPOSE2 DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX=$REMOTE_ISSUE136_ENABLE DSPARK_ISSUE136_XGRAMMAR_HOTFIX='./patches/hotfix-vllm-issue136-xgrammar-termination.py' DSPARK_ENABLE_DSPARK_BLOCK_K=$REMOTE_DSPARK_BLOCK_K DSPARK_DSPARK_BLOCK_K_HOTFIX='./patches/hotfix-vllm-dspark-block-k.py' TP_SIZE='$TP_SIZE' NNODES='$NNODES' TP3_PATCH_DIR='./patches/tp3' $(remote_nccl_env2) $*"
+  ssh "$WORKER2_HOST" "$REMOTE_COMPOSE2 DSPARK_ENABLE_C128A_PREFILL_CACHE=$REMOTE_C128A_PREFILL_CACHE DSPARK_C128A_PREFILL_CACHE_HOTFIX='./patches/hotfix-vllm-c128a-prefill-cache.py' DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX=$REMOTE_ISSUE136_ENABLE DSPARK_ISSUE136_XGRAMMAR_HOTFIX='./patches/hotfix-vllm-issue136-xgrammar-termination.py' DSPARK_ENABLE_ISSUE191_TOOLCALL_FAILCLOSED=$REMOTE_ISSUE191_ENABLE DSPARK_ISSUE191_TOOLCALL_HOTFIX='./patches/hotfix-vllm-issue191-toolcall-failclosed.py' DSPARK_ISSUE191_TOOLCALL_RETRIES=$REMOTE_ISSUE191_RETRIES DSPARK_ISSUE191_TOOLCALL_MODE=$REMOTE_ISSUE191_MODE DSPARK_ISSUE191_TOOLCALL_THINKOFF_FALLBACK=$REMOTE_ISSUE191_THINKOFF DSPARK_ASYNC_SCHEDULING=$REMOTE_ASYNC_SCHEDULING DSPARK_ENABLE_DSPARK_BLOCK_K=$REMOTE_DSPARK_BLOCK_K DSPARK_DSPARK_BLOCK_K_HOTFIX='./patches/hotfix-vllm-dspark-block-k.py' DSPARK_ENABLE_ROPE_SWA_FIX=$REMOTE_ROPE_SWA_FIX DSPARK_ROPE_SWA_FIX_HOTFIX='./patches/hotfix-vllm-rope-swa-fix.py' DSPARK_ENABLE_DSPARK_SWA_PREFIX=$REMOTE_DSPARK_SWA_PREFIX DSPARK_DSPARK_SWA_PREFIX_HOTFIX='./patches/hotfix-vllm-dspark-swa-prefix.py' DSPARK_ENABLE_DSML_RECOVERY=$REMOTE_DSML_RECOVERY DSPARK_DSML_RECOVERY_HOTFIX='./patches/hotfix-vllm-dsml-recovery.py' DSPARK_ENABLE_MXFP4_INDEXER_CACHE=$REMOTE_MXFP4_INDEXER DSPARK_MXFP4_INDEXER_CACHE_HOTFIX='./patches/hotfix-vllm-mxfp4-indexer-cache.py' DSPARK_ENABLE_ISSUE144_EFFORT_ALIGN=$REMOTE_ISSUE144_EFFORT_ALIGN DSPARK_ISSUE144_EFFORT_ALIGN_HOTFIX='./patches/hotfix-dsv4-issue144-effort-align.py' TP_SIZE='$TP_SIZE' NNODES='$NNODES' TP3_PATCH_DIR='./patches/tp3' $(remote_nccl_env2) $*"
 }
 
 log_since() {
@@ -1046,6 +1267,11 @@ print_resolved_profile() {
   echo "Resolved DSpark profile:"
   echo "  project: $PROJECT_NAME"
   echo "  checkpoint: $DSPARK_MODEL (ABLITERATED=${ABLITERATED:-0})"
+  if [ "$ABLATE" = "1" ]; then
+    echo "  runtime ablation: ON (gated Hub terms + 18 KiB direction, lambda=$DSV4_ABLATE_LAMBDA, layers=$DSV4_ABLATE_LAYERS, source=$DSPARK_ABLATE_SOURCE_FILE)"
+  else
+    echo "  runtime ablation: off (stock model.py)"
+  fi
   if [ -n "${DSPARK_REVISION:-}" ]; then
     echo "  revision: $DSPARK_REVISION"
   else
@@ -1066,6 +1292,10 @@ print_resolved_profile() {
   echo "  issue191 tool-call fail-closed hotfix: ${DSPARK_ENABLE_ISSUE191_TOOLCALL_FAILCLOSED:-0} (0=stock / 1=preflight+apply; mode=${DSPARK_ISSUE191_TOOLCALL_MODE:-failclosed} retries=${DSPARK_ISSUE191_TOOLCALL_RETRIES:-2} thinkoff-fallback=${DSPARK_ISSUE191_TOOLCALL_THINKOFF_FALLBACK:-1})"
   echo "  async scheduling: ${DSPARK_ASYNC_SCHEDULING:-1} (1=--async-scheduling / 0=removed on both ranks)"
   echo "  dspark block-k unlock: ${DSPARK_ENABLE_DSPARK_BLOCK_K:-0} (0=stock k%n_predict rule / 1=k follows dspark_block_size)"
+  echo "  rope swa fix (vllm#54815): ${DSPARK_ENABLE_ROPE_SWA_FIX:-0} (0=stock YaRN on sparse-SWA / 1=plain RoPE on sparse-SWA layers)"
+  echo "  dsml recovery (vllm#52645): ${DSPARK_ENABLE_DSML_RECOVERY:-0} (0=stock, malformed-wrapper invokes leak as content / 1=recover declared-tool DSML invokes)"
+  echo "  issue144 effort alignment: ${DSPARK_ENABLE_ISSUE144_EFFORT_ALIGN:-0} (0=stock front-inserted effort directive / 1=directive at system-region tail, cross-bucket prefix-cache sharing)"
+  echo "  mxfp4 indexer K cache (item8 §3): ${DSPARK_ENABLE_MXFP4_INDEXER_CACHE:-0} (0=stock fp8 indexer K / 1=MXFP4 indexer K, halved logits reads; requires sm121 alias headers)"
   echo "  default thinking: $DEFAULT_THINKING (off/low/high/max)"
   echo "  issue31 GPU thinking_token_budget hotfix: ${DSPARK_ENABLE_ISSUE31_GPU_HOTFIX:-0} (0=stock V2 / 1=apply)"
   if [ "$VLLM_ENABLE_RESPONSES_API_STORE" = "1" ]; then
@@ -1167,6 +1397,7 @@ need_cmd docker
 need_cmd ssh
 need_cmd scp
 need_cmd curl
+need_cmd sha256sum
 
 if [ "$ENABLE_VLLM_GB10_PATCH" != "0" ] && [ "$ENABLE_VLLM_GB10_PATCH" != "1" ]; then
   echo "ENABLE_VLLM_GB10_PATCH must be 0 or 1." >&2
@@ -1281,6 +1512,7 @@ apply_tp3_bootstrap_ifaces() {
   echo "TP=3 RoCE: NCCL_IB_MERGE_NICS=0 NCCL_IB_SUBNET_AWARE_ROUTING=1 NCCL_IB_SUBNET_PREFIX_LEN=24"
 }
 
+stage_ablation_direction
 cd "$SCRIPT_DIR"
 resolve_nccl_gid_indexes
 apply_tp3_bootstrap_ifaces
@@ -1423,6 +1655,15 @@ if [ -f "$DSPARK_DEEPGEMM_ALIAS_HOTFIX" ]; then
   ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
   scp "$DSPARK_DEEPGEMM_ALIAS_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-deepgemm-sm121-mqa-header-alias.sh"
 fi
+DSPARK_ABLATION_HOTFIX="${DSPARK_ABLATION_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-runtime-ablation.py}"
+if [ -f "$DSPARK_ABLATION_HOTFIX" ]; then
+  echo "Syncing runtime-ablation hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_ABLATION_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-runtime-ablation.py"
+elif [ "$ABLATE" = "1" ]; then
+  echo "Missing required runtime-ablation hotfix: $DSPARK_ABLATION_HOTFIX" >&2
+  exit 1
+fi
 DSPARK_SUPPRESS_STOPS_HOTFIX="${DSPARK_SUPPRESS_STOPS_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-suppress-stops-in-reasoning.py}"
 if [ -f "$DSPARK_SUPPRESS_STOPS_HOTFIX" ]; then
   echo "Syncing suppress-stops-in-reasoning hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
@@ -1474,6 +1715,36 @@ if [ -f "$DSPARK_DSPARK_BLOCK_K_HOTFIX" ] && [ ! -L "$DSPARK_DSPARK_BLOCK_K_HOTF
   echo "Syncing DSpark block-k unlock hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
   ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
   scp "$DSPARK_DSPARK_BLOCK_K_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-dspark-block-k.py"
+fi
+if [ -f "$DSPARK_ROPE_SWA_FIX_HOTFIX" ] && [ ! -L "$DSPARK_ROPE_SWA_FIX_HOTFIX" ]; then
+  echo "Syncing RoPE SWA fix hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_ROPE_SWA_FIX_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-rope-swa-fix.py"
+fi
+if [ -f "$DSPARK_DSPARK_SWA_PREFIX_HOTFIX" ] && [ ! -L "$DSPARK_DSPARK_SWA_PREFIX_HOTFIX" ]; then
+  echo "Syncing DSpark SWA prefix hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_DSPARK_SWA_PREFIX_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-dspark-swa-prefix.py"
+fi
+if [ -f "$DSPARK_DSML_RECOVERY_HOTFIX" ] && [ ! -L "$DSPARK_DSML_RECOVERY_HOTFIX" ]; then
+  echo "Syncing DSML recovery hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_DSML_RECOVERY_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-dsml-recovery.py"
+fi
+if [ -f "$DSPARK_ISSUE144_EFFORT_ALIGN_HOTFIX" ] && [ ! -L "$DSPARK_ISSUE144_EFFORT_ALIGN_HOTFIX" ]; then
+  echo "Syncing Issue #144 effort alignment hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_ISSUE144_EFFORT_ALIGN_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-issue144-effort-align.py"
+fi
+if [ -f "$DSPARK_MXFP4_INDEXER_CACHE_HOTFIX" ] && [ ! -L "$DSPARK_MXFP4_INDEXER_CACHE_HOTFIX" ]; then
+  echo "Syncing MXFP4 indexer K cache hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_MXFP4_INDEXER_CACHE_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-mxfp4-indexer-cache.py"
+fi
+if [ -f "$DSPARK_C128A_PREFILL_CACHE_HOTFIX" ] && [ ! -L "$DSPARK_C128A_PREFILL_CACHE_HOTFIX" ]; then
+  echo "Syncing C128A prefill cache hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_C128A_PREFILL_CACHE_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-c128a-prefill-cache.py"
 fi
 # Compose always bind-mounts patches/tp3. Create it on the worker even for
 # TP=2 so Docker does not invent a root-owned empty dir (or fail the mount).
@@ -1549,6 +1820,9 @@ if [ "$DSPARK_TP3" = "1" ]; then
     echo "FATAL: failed to sync patches/ to ${WORKER2_HOST} -- refusing to boot TP=3." >&2
     exit 1
   }
+  if [ -f "$DSPARK_C128A_PREFILL_CACHE_HOTFIX" ] && [ ! -L "$DSPARK_C128A_PREFILL_CACHE_HOTFIX" ]; then
+    scp "$DSPARK_C128A_PREFILL_CACHE_HOTFIX" "${WORKER2_HOST}:${REMOTE_WORKER2_DIR}/patches/hotfix-vllm-c128a-prefill-cache.py"
+  fi
   if [ "$ENABLE_VLLM_GB10_PATCH" = "1" ]; then
     tar -C "$VLLM_GB10_PATCH_DIR" \
       --exclude='*.egg-info' \
@@ -1660,6 +1934,64 @@ if [ "${DSPARK_ENABLE_DSPARK_BLOCK_K:-0}" = "1" ]; then
   fi
   echo "Checking DSpark block-k unlock compatibility on the head before either rank starts..."
   compose_base 0 "" run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-dspark-block-k.py --check
+fi
+if [ "${DSPARK_ENABLE_ROPE_SWA_FIX:-0}" = "1" ]; then
+  echo "Checking RoPE SWA fix compatibility on the worker before either rank starts..."
+  remote_compose "NODE_RANK=1 HEADLESS=1 $WORKER_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER_COMPOSE_FILES run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-rope-swa-fix.py --check"
+  if [ "$DSPARK_TP3" = "1" ]; then
+    echo "Checking RoPE SWA fix compatibility on worker2 before ranks start..."
+    remote_compose2 "NODE_RANK=2 HEADLESS=1 $WORKER2_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER2_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER2_COMPOSE_FILES run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-rope-swa-fix.py --check"
+  fi
+  echo "Checking RoPE SWA fix compatibility on the head before either rank starts..."
+  compose_base 0 "" run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-rope-swa-fix.py --check
+fi
+if [ "${DSPARK_ENABLE_DSPARK_SWA_PREFIX:-0}" = "1" ]; then
+  echo "Checking DSpark SWA prefix compatibility on the worker before either rank starts..."
+  remote_compose "NODE_RANK=1 HEADLESS=1 $WORKER_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER_COMPOSE_FILES run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-dspark-swa-prefix.py --check"
+  if [ "$DSPARK_TP3" = "1" ]; then
+    echo "Checking DSpark SWA prefix compatibility on worker2 before ranks start..."
+    remote_compose2 "NODE_RANK=2 HEADLESS=1 $WORKER2_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER2_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER2_COMPOSE_FILES run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-dspark-swa-prefix.py --check"
+  fi
+  echo "Checking DSpark SWA prefix compatibility on the head before either rank starts..."
+  compose_base 0 "" run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-dspark-swa-prefix.py --check
+fi
+if [ "${DSPARK_ENABLE_DSML_RECOVERY:-0}" = "1" ]; then
+  echo "Checking DSML recovery compatibility on the worker before either rank starts..."
+  remote_compose "NODE_RANK=1 HEADLESS=1 $WORKER_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER_COMPOSE_FILES run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-dsml-recovery.py --check"
+  if [ "$DSPARK_TP3" = "1" ]; then
+    echo "Checking DSML recovery compatibility on worker2 before ranks start..."
+    remote_compose2 "NODE_RANK=2 HEADLESS=1 $WORKER2_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER2_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER2_COMPOSE_FILES run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-dsml-recovery.py --check"
+  fi
+  echo "Checking DSML recovery compatibility on the head before either rank starts..."
+  compose_base 0 "" run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-dsml-recovery.py --check
+fi
+if [ "${DSPARK_ENABLE_ISSUE144_EFFORT_ALIGN:-0}" = "1" ]; then
+  echo "Checking Issue #144 effort alignment compatibility on the worker before either rank starts..."
+  remote_compose "NODE_RANK=1 HEADLESS=1 $WORKER_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER_COMPOSE_FILES run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-dsv4-issue144-effort-align.py --check"
+  if [ "$DSPARK_TP3" = "1" ]; then
+    echo "Checking Issue #144 effort alignment compatibility on worker2 before ranks start..."
+    remote_compose2 "NODE_RANK=2 HEADLESS=1 $WORKER2_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER2_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER2_COMPOSE_FILES run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-dsv4-issue144-effort-align.py --check"
+  fi
+  echo "Checking Issue #144 effort alignment compatibility on the head before either rank starts..."
+  compose_base 0 "" run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-dsv4-issue144-effort-align.py --check
+fi
+if [ "${DSPARK_ENABLE_MXFP4_INDEXER_CACHE:-0}" = "1" ]; then
+  echo "Checking MXFP4 indexer K cache compatibility on the worker before either rank starts..."
+  remote_compose "NODE_RANK=1 HEADLESS=1 $WORKER_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER_COMPOSE_FILES run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-mxfp4-indexer-cache.py --check"
+  if [ "$DSPARK_TP3" = "1" ]; then
+    echo "Checking MXFP4 indexer K cache compatibility on worker2 before ranks start..."
+    remote_compose2 "NODE_RANK=2 HEADLESS=1 $WORKER2_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER2_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER2_COMPOSE_FILES run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-mxfp4-indexer-cache.py --check"
+  fi
+  echo "Checking MXFP4 indexer K cache compatibility on the head before either rank starts..."
+  compose_base 0 "" run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-mxfp4-indexer-cache.py --check
+fi
+if [ "${DSPARK_ENABLE_C128A_PREFILL_CACHE:-0}" = "1" ]; then
+  echo "Checking C128A prefill cache compatibility before either rank starts..."
+  remote_compose "NODE_RANK=1 HEADLESS=1 $WORKER_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER_COMPOSE_FILES run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-c128a-prefill-cache.py --check"
+  if [ "$DSPARK_TP3" = "1" ]; then
+    remote_compose2 "NODE_RANK=2 HEADLESS=1 $WORKER2_HF_COMPOSE_ENV VLLM_HOST_IP='$WORKER2_VLLM_HOST_IP' GPU_MEMORY_UTILIZATION='$GPU_MEMORY_UTILIZATION' DSPARK_MODEL='$DSPARK_MODEL' DSPARK_REVISION='${DSPARK_REVISION:-}' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark $WORKER2_COMPOSE_FILES run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-c128a-prefill-cache.py --check"
+  fi
+  compose_base 0 "" run --rm --no-deps --entrypoint python3 vllm-dspark /opt/hotfix-vllm-c128a-prefill-cache.py --check
 fi
 
 echo "Starting DSpark worker on ${WORKER_HOST}..."

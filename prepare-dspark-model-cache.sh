@@ -8,20 +8,22 @@ usage() {
   cat <<'EOF'
 Usage: ./prepare-dspark-model-cache.sh [--official | --abliterated] [--yes]
 
-Downloads DeepSeek-V4-Flash-Vision-Exp weights (official or abliterated) into HF_CACHE
-on this node, then onto the worker (default DSPARK_WORKER_HF_NFS=0). Set
+Downloads DeepSeek-V4-Flash-Vision-Exp weights into HF_CACHE on this node,
+then onto the worker (default DSPARK_WORKER_HF_NFS=0). Set
 DSPARK_WORKER_HF_NFS=1 to skip the worker copy; start then exports this cache over NFS.
 
   --official      Download deepseek-ai/DeepSeek-V4-Flash-Vision-Exp (sets ABLITERATED=0)
-  --abliterated   Download Keys abliterated weights (sets ABLITERATED=1)
+  --abliterated   Gated runtime ablation: official weights + 18 KiB direction
+                  (sets ABLITERATED=1). Does not download the 157 GiB Keys checkpoint.
+                  Requires HF_TOKEN and agreement on the gated Hub repo.
   --yes           Non-interactive: use ABLITERATED from .env.dspark (or 0)
 
 Official downloads default to DSPARK_REVISION=86f746b3… (Vision-Exp pin). Override
 via DSPARK_REVISION in .env.dspark, or clear it to follow tip of main.
-Abliterated uses DSPARK_REVISION_ABLITERATED (default: unpinned). The Hub id is
-gated (auto-approve after RESPONSIBLE_USE.md). Prefer overlaying the 26 edited
-shards onto the already-cached official Vision-Exp dump
-(scripts/overlay-vision-exp-ablit-cache.py) instead of re-fetching 157 GiB.
+Abliterated still serves official Vision-Exp. You must agree to the gated Keys
+terms (RESPONSIBLE_USE.md) at DSPARK_MODEL_ABLITERATED; prepare then downloads
+that terms file plus the 18 KiB refusal direction. The Hub id is gated
+(auto-approve after RESPONSIBLE_USE.md).
 
 Hub auth is automatic when HF_TOKEN or HUGGING_FACE_HUB_TOKEN is exported in
 the calling shell (it wins over .env.dspark). Otherwise prepare uses the env
@@ -126,11 +128,8 @@ fi
 unset _HF_TOKEN_SRC
 
 resolve_revision() {
-  # Export a single DSPARK_REVISION for prepare + compose (may be empty = unpin).
-  if [ "${ABLITERATED:-0}" = "1" ]; then
-    DSPARK_REVISION="${DSPARK_REVISION_ABLITERATED:-}"
-  elif [ -n "${DSPARK_REVISION+x}" ]; then
-    # Explicitly set in env (including empty → follow main tip).
+  # Runtime ablation still serves official Vision-Exp. Keep the official pin.
+  if [ -n "${DSPARK_REVISION+x}" ]; then
     :
   else
     DSPARK_REVISION="$DEFAULT_OFFICIAL_REVISION"
@@ -160,11 +159,7 @@ upsert_env_kv() {
 resolve_checkpoint() {
   # Worker recurse: trust env already set by head (no prompt).
   if [ "${PREPARE_WORKER:-1}" = "0" ]; then
-    if [ "${ABLITERATED:-0}" = "1" ]; then
-      DSPARK_MODEL="$DSPARK_MODEL_ABLITERATED"
-    else
-      DSPARK_MODEL="$DSPARK_MODEL_OFFICIAL"
-    fi
+    DSPARK_MODEL="$DSPARK_MODEL_OFFICIAL"
     return 0
   fi
 
@@ -176,9 +171,10 @@ resolve_checkpoint() {
   elif [ -t 0 ] && [ -t 1 ]; then
     local default="${ABLITERATED:-0}"
     echo "" >&2
-    echo "Which DeepSeek-V4-Flash checkpoint should be downloaded?" >&2
+    echo "Which DeepSeek-V4-Flash checkpoint should be prepared?" >&2
     echo "  [0] Official  — $DSPARK_MODEL_OFFICIAL" >&2
-    echo "  [1] Abliterated — $DSPARK_MODEL_ABLITERATED" >&2
+    echo "  [1] Abliterated — official weights + gated 18 KiB direction" >&2
+    echo "      (agree at https://huggingface.co/$DSPARK_MODEL_ABLITERATED)" >&2
     echo "Current .env.dspark ABLITERATED=${ABLITERATED:-unset} (default answer: $default)" >&2
     while true; do
       printf "Enter 0 or 1 [%s]: " "$default" >&2
@@ -195,11 +191,7 @@ resolve_checkpoint() {
   fi
 
   ABLITERATED="$choice"
-  if [ "$ABLITERATED" = "1" ]; then
-    DSPARK_MODEL="$DSPARK_MODEL_ABLITERATED"
-  else
-    DSPARK_MODEL="$DSPARK_MODEL_OFFICIAL"
-  fi
+  DSPARK_MODEL="$DSPARK_MODEL_OFFICIAL"
   export ABLITERATED DSPARK_MODEL
 
   if [ -f "$ENV_FILE" ]; then
@@ -230,10 +222,12 @@ resolve_revision
 
 # Serve profiles keep HF_HUB_OFFLINE=1; download must ignore that for this run only.
 echo "prepare: forcing HF online for download (serve can keep HF_HUB_OFFLINE=1)" >&2
-if [ -n "${DSPARK_REVISION:-}" ]; then
-  echo "prepare: ABLITERATED=${ABLITERATED:-0} → $DSPARK_MODEL @ $DSPARK_REVISION" >&2
+if [ "${ABLITERATED:-0}" = "1" ]; then
+  echo "prepare: ABLITERATED=1 → official $DSPARK_MODEL @ ${DSPARK_REVISION:-tip} + gated 18 KiB direction" >&2
+elif [ -n "${DSPARK_REVISION:-}" ]; then
+  echo "prepare: ABLITERATED=0 → $DSPARK_MODEL @ $DSPARK_REVISION" >&2
 else
-  echo "prepare: ABLITERATED=${ABLITERATED:-0} → $DSPARK_MODEL @ (tip of default branch)" >&2
+  echo "prepare: ABLITERATED=0 → $DSPARK_MODEL @ (tip of default branch)" >&2
 fi
 
 run_download() {
@@ -334,8 +328,130 @@ if missing:
 PY
 }
 
+run_gated_ablit_artifacts() {
+  local terms_repo="$DSPARK_MODEL_ABLITERATED"
+  local direction_repo="${DSPARK_ABLATE_DIRECTION_REPO:-drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-Anchored-Tensors}"
+  local direction_file="${DSPARK_ABLATE_DIRECTION_FILE:-ablit/refusal_direction_r1.pt}"
+  local expected_sha="${DSPARK_ABLATE_DIRECTION_SHA256:-6e4d8a8f3aa9e21795faab2c5b14d29b019acdf2ddbfbd8238430458a5837fe0}"
+  if [ -z "$HF_TOKEN" ]; then
+    echo "ABLITERATED=1 requires HF_TOKEN after you agree to the gated Hub terms." >&2
+    echo "  https://huggingface.co/${terms_repo}" >&2
+    exit 1
+  fi
+  echo "prepare: gated Keys terms + 18 KiB direction (not the 157 GiB checkpoint)" >&2
+  docker run --rm -i \
+    -v "${HF_CACHE}:/cache/huggingface" \
+    -v "${SCRIPT_DIR}/files:/opt/dspark-files:ro" \
+    -e HF_HOME=/cache/huggingface \
+    -e HF_HUB_OFFLINE=0 \
+    -e TRANSFORMERS_OFFLINE=0 \
+    -e HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}" \
+    -e HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-120}" \
+    -e HF_HUB_ETAG_TIMEOUT="${HF_HUB_ETAG_TIMEOUT:-30}" \
+    -e DSPARK_MODEL_ABLITERATED="$terms_repo" \
+    -e DSPARK_ABLATE_DIRECTION_REPO="$direction_repo" \
+    -e DSPARK_ABLATE_DIRECTION_FILE="$direction_file" \
+    -e DSPARK_ABLATE_DIRECTION_SHA256="$expected_sha" \
+    "${DOCKER_HF_TOKEN_ARGS[@]}" \
+    --entrypoint "$IMAGE_PYTHON" \
+    "$DSPARK_VLLM_IMAGE" \
+    - <<'PY'
+import hashlib
+import os
+import shutil
+import sys
+from pathlib import Path
+
+try:
+    from huggingface_hub.errors import GatedRepoError
+except ImportError:
+    try:
+        from huggingface_hub.utils import GatedRepoError
+    except ImportError:
+        class GatedRepoError(Exception):
+            pass
+
+from huggingface_hub import hf_hub_download
+
+terms_repo = os.environ["DSPARK_MODEL_ABLITERATED"]
+direction_repo = os.environ["DSPARK_ABLATE_DIRECTION_REPO"]
+direction_file = os.environ["DSPARK_ABLATE_DIRECTION_FILE"]
+expected = os.environ["DSPARK_ABLATE_DIRECTION_SHA256"]
+token = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
+out_dir = Path("/cache/huggingface/dspark-ablation")
+out_dir.mkdir(parents=True, exist_ok=True)
+fallback = Path("/opt/dspark-files/direction_r1.pt")
+
+
+def die_gated(repo: str) -> None:
+    print(
+        f"error: Hugging Face denied {repo}. Agree to the terms at:",
+        file=sys.stderr,
+    )
+    print(f"  https://huggingface.co/{repo}", file=sys.stderr)
+    print(
+        "then re-run ./prepare-dspark-model-cache.sh --abliterated",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
+def hub_get(repo: str, filename: str) -> Path:
+    try:
+        path = hf_hub_download(repo_id=repo, filename=filename, token=token)
+        return Path(path)
+    except GatedRepoError:
+        die_gated(repo)
+    except Exception as exc:
+        text = str(exc).lower()
+        if "401" in text or "403" in text or "gated" in text:
+            die_gated(repo)
+        raise
+
+
+terms = hub_get(terms_repo, "RESPONSIBLE_USE.md")
+shutil.copy2(terms, out_dir / "RESPONSIBLE_USE.md")
+try:
+    meta = hub_get(terms_repo, "ABLIT_META.json")
+    shutil.copy2(meta, out_dir / "ABLIT_META.json")
+except SystemExit:
+    raise
+except Exception as exc:
+    print(f"prepare: optional ABLIT_META.json skipped ({exc})", file=sys.stderr)
+
+direction_src = None
+try:
+    path = hf_hub_download(
+        repo_id=direction_repo, filename=direction_file, token=token
+    )
+    direction_src = Path(path)
+except Exception as exc:
+    print(
+        f"prepare: Hub direction download failed ({exc}); trying local fallback",
+        file=sys.stderr,
+    )
+if direction_src is None or not direction_src.is_file():
+    if not fallback.is_file():
+        raise SystemExit("direction file missing from Hub and local fallback")
+    direction_src = fallback
+data = direction_src.read_bytes()
+digest = hashlib.sha256(data).hexdigest()
+if digest != expected:
+    raise SystemExit(f"direction sha256 mismatch: {digest} (expected {expected})")
+dest = out_dir / "direction_r1.pt"
+tmp = dest.with_suffix(".tmp")
+tmp.write_bytes(data)
+tmp.replace(dest)
+(out_dir / "gated-repo.txt").write_text(f"{terms_repo}\n", encoding="utf-8")
+print(f"prepare: gated terms + direction staged sha256={digest}")
+PY
+}
+
 run_download "$DSPARK_MODEL" "${DSPARK_REVISION:-}"
 verify_cache "$DSPARK_MODEL" "${DSPARK_REVISION:-}"
+if [ "${ABLITERATED:-0}" = "1" ]; then
+  run_gated_ablit_artifacts
+fi
 
 if [ "${PREPARE_WORKER:-1}" = "1" ]; then
   : "${WORKER_HOST:?WORKER_HOST must be set in $ENV_FILE or environment}"

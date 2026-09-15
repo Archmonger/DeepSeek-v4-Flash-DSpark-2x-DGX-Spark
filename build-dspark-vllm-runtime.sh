@@ -84,9 +84,19 @@ build_one() {
     docker run --rm --entrypoint /opt/env/bin/python "$stage_c_tag" -c \
       "import vllm; print('dspark nvfp4 stage-c image ok', vllm.__version__)"
   else
-    ssh "$host" "mkdir -p '$checkout'"
-    rsync -az --delete "$SCRIPT_DIR/" "$host:$checkout/"
-    ssh "$host" "cd '$checkout' && DSPARK_BASE_IMAGE='$DSPARK_BASE_IMAGE' DSPARK_VLLM_IMAGE='$DSPARK_VLLM_IMAGE' WORKER_BUILD=0 ./build-dspark-vllm-runtime.sh"
+    # The compose filename is only a recipe heuristic, not proof of ownership:
+    # unrelated files in a recognized directory are still subject to --delete.
+    local remote_checkout="${checkout//\'/\'\\\'\'}"
+    ssh "$host" "
+      mkdir -p -- '$remote_checkout' &&
+      cd -- '$remote_checkout' &&
+      [ -r . ] && [ -x . ] &&
+      entries=\$(find . -mindepth 1 -maxdepth 1 -printf x -quit) &&
+      { [ -z \"\$entries\" ] || [ -f docker-compose.dspark.yml ]; } ||
+      { printf '%s\n' 'refusing to rsync --delete into $remote_checkout: cannot inspect or not an empty or recognized recipe directory' >&2; exit 1; }
+    "
+    rsync -az --protect-args --delete "$SCRIPT_DIR/" "$host:$checkout/"
+    ssh "$host" "cd '$remote_checkout' && DSPARK_BASE_IMAGE='$DSPARK_BASE_IMAGE' DSPARK_VLLM_IMAGE='$DSPARK_VLLM_IMAGE' WORKER_BUILD=0 ./build-dspark-vllm-runtime.sh"
   fi
 }
 

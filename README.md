@@ -77,8 +77,9 @@ Qwen3.8-Flash-vLLM).
    ```
 
    Use `--abliterated` or `--yes` (reads `ABLITERATED` from `.env.dspark`).
-   Abliterated weights are gated (`HF_TOKEN`). Prepare forces HF
-   online even if `HF_HUB_OFFLINE=1`, then you can serve offline.
+   Abliteration is gated (`HF_TOKEN`): agree on the Keys Hub repo, then
+   prepare downloads the 18 KiB direction — not the 157 GiB checkpoint.
+   Prepare forces HF online even if `HF_HUB_OFFLINE=1`, then you can serve offline.
    Default `DSPARK_WORKER_HF_NFS=0` also downloads onto the worker. After
    the cache is complete, keep `HF_HUB_OFFLINE=1`. See
    [Worker weights over NFS](#worker-weights-over-nfs-optional) to skip the
@@ -174,7 +175,7 @@ cluster wiring, not product switches. Full Anemll vs Stage-C matrix:
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| **`ABLITERATED`** | `0` | **`0`** = official [`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp) @ `DSPARK_REVISION`. **`1`** = [Keys abliterated](https://huggingface.co/drowzeys/keys-DeepSeekV4Flash-Vision-EXP-ablit). Start and prepare pick the HF id from this flag. Gated; `prepare --abliterated` needs `HF_TOKEN`. |
+| **`ABLITERATED`** | `0` | **`0`** = official [`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp) @ `DSPARK_REVISION`, stock decoder. **`1`** = same official weights plus runtime refusal-direction projection. Does **not** download the 157 GiB [Keys checkpoint](https://huggingface.co/drowzeys/keys-DeepSeekV4Flash-Vision-EXP-ablit). You must agree to that repo's gated terms, then `prepare --abliterated` downloads `RESPONSIBLE_USE.md` plus the 18 KiB direction (`HF_TOKEN`). Recreate both ranks after flipping. Default `λ=3.5`, layers `10-42`. The direction was captured on 0731 FP8 DSpark; transfer onto Vision-Exp is experimental. |
 | `DSPARK_REVISION` | `86f746b36186f0e567729a5c06a8c918caba82a9` | Official Vision-Exp pin. Empty = tip of `main`. |
 | `DSPARK_REVISION_ABLITERATED` | empty | Abliterated pin. Empty = tip of that repo. |
 | `DSPARK_MODEL_OFFICIAL` / `DSPARK_MODEL_ABLITERATED` | the two HF ids above | Override only if you intentionally swap the repo id. Do not point this at the 0731 ablit dump — that drops `image_url`. |
@@ -274,7 +275,7 @@ generous `max_tokens` or that budget hotfix, or thinking won't end. See
 | `MAX_NUM_SEQS` | `6` | Concurrent slots. `16` only with the 200K + Stage-C path. |
 | `MAX_NUM_BATCHED_TOKENS` | `8192` | Prefill tokens per step. `16384` for big-prompt coding. |
 | `LONG_PREFILL_TOKEN_THRESHOLD` | `1024` | Issue **#27** chunk cap. `0` lets one prefill eat the whole batch (decode starves). `2048` costs ~1.5 GB of head-node host RAM on GB10 (measured 2026-09-02), keep 1024. |
-| `DSPARK_MAX_INFLIGHT_PREFILLS` | `1` | Issue **#27** in-flight partial prefills (1–3). Default `1` (strictly serialized): the post-#211 exact admission gate is live-qualified at 1 (decode-fairness spread 1.60–1.76×, zero preemptions, repeated fresh boots). `2`–`3` are explicit opt-ins; the 2026-09-02 A/B that favored `2` predates the r3 counting fix. |
+| `DSPARK_MAX_INFLIGHT_PREFILLS` | `1` | Issue **#27** in-flight partial prefills (1–3). Default `1` (strictly serialized): the post-#211 exact admission gate is live-qualified at 1 (decode-fairness spread 1.60–1.76×, zero preemptions, repeated fresh boots). `2` is an evidence-backed opt-in, operator-qualified post-r3 on TP=2 with `LONG_PREFILL_TOKEN_THRESHOLD=1024` ([#217](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/217): 4 × 8K gate26 spread 1.50–1.57×, zero preemptions, TTFT spread 2.1–2.4× vs 4.1× at `1`), trading admission serialization for TTFT/equity on admission-limited shapes. `3` remains an explicit opt-in: a separate, limited [cap-3 sample](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/217#issuecomment-5554973680) improved 4 × 8K spread but worsened median TTFT on 8-wide bursts; it is not the same qualification as `2`. The 2026-09-02 A/B that first favored `2` predates the r3 counting fix. |
 | `GPU_MEMORY_UTILIZATION_TEXT` | `0.835` | Main GPU util / KV pool size. Larger = bigger KV pool. |
 | `LIMIT_MM_PER_PROMPT` | `{"image":8}` | Max images per request (Vision-Exp native `image_url`). `image=8` is converted to JSON for Anemll argparse. No video. |
 | `MTP_NUM_TOKENS` | `6` | DSpark draft depth. Vision-Exp `n_predict=3` so k must be ≥ 5 and divisible by 3. Capture size = `seqs * (k+1)` padded up to a multiple of 8 (48 at 6×6). |
@@ -294,6 +295,7 @@ generous `max_tokens` or that budget hotfix, or thinking won't end. See
 | `DSPARK_ENABLE_ISSUE31_GPU_HOTFIX` | `0` | `1` = apply GPU `thinking_token_budget` at boot (fail-closed). Default stock V2; omit-field clients do not need this ([Issue #66](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/66)). |
 | `DSPARK_ENABLE_SP_INDEXER` | `0` | `1` = sequence-parallel Lightning indexer for prefill chunks ≥ `DSPARK_SP_INDEXER_MIN_KEYS` (8192) compressed keys: each TP rank scores half the keys, exact top-k merge. Long-context TTFT lever ([docs/PATCHES.md](docs/PATCHES.md)). |
 | `DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS` | `0` | `1` = alias DeepGEMM `sm121_*` indexer-logits headers to the shipped `sm120_*` so a cold JIT cache can compile on GB10. |
+| `DSPARK_ENABLE_C128A_PREFILL_CACHE` | `0` | `1` = reuse C128A prefill index conversion across layers sharing the current metadata. Pinned Anemll 0.1.1 SM120 path; C4A/decode unchanged, no persistent buffers added ([details](docs/PATCHES.md#c128a-prefill-metadata-cache-default-off)). |
 | `ENABLE_VLLM_GB10_PATCH` | `0` | `1` = experimental hybrid NVFP4 plugin (`--quantization modelopt_gb10_hybrid`). |
 
 Issue **#21 / #26 / #27 / #43** Python hotfixes always run at container start
@@ -434,7 +436,21 @@ curl :8888/v1/chat/completions -H 'Content-Type: application/json' -d '{
 }'
 ```
 
-**pi** — the budget needs the boot flag **and** the pi model entry, so
+**pi image support** — [`pi-models.dspark.example.json`](pi-models.dspark.example.json)
+declares `"input": ["text", "image"]` for `deepseek-v4-flash-vision-exp`.
+The [pi model contract](https://github.com/badlogic/pi-mono/blob/d981de1229ef899957bbe968bc8dcda02a21f477/packages/coding-agent/docs/models.md#model-configuration)
+uses `input` to declare supported input types; `["text"]` is text-only.
+If you copied an older example to `~/.pi/agent/models.json`, add `"image"`
+to that model's `input` array without replacing your other settings.
+The [same revision's reload instructions](https://github.com/badlogic/pi-mono/blob/d981de1229ef899957bbe968bc8dcda02a21f477/packages/coding-agent/docs/models.md#full-example)
+say opening `/model` reloads the file without restarting pi; select the
+updated model before attaching an image. Other client versions may differ.
+Send screenshots on a **user** turn, following the server's image usage
+notes above, not as structured images on `system`, `assistant`, `tool`, or
+`function` turns. The example declaration alone does not verify screenshot
+delivery through a live pi session.
+
+**pi thinking budget** — the budget needs the boot flag **and** the pi model entry, so
 [`pi-models.dspark.example.json`](pi-models.dspark.example.json) ships
 `supportsThinkingTokenBudget: false` to match the server default
 (`DSPARK_ENABLE_ISSUE31_GPU_HOTFIX=0`). Copy it to `~/.pi/agent/models.json`;
@@ -685,7 +701,7 @@ Full list: [`CREDITS.md`](CREDITS.md).
 patch, ragged `query_start_loc`, `nvfp4_ds_mla` wiring.
 
 **[@u1tra_instinct](https://x.com/u1tra_instinct)** — abliterated Vision-Exp
-weights (`ABLITERATED=1`), from the original repo
+path (`ABLITERATED=1`), gated on
 [`drowzeys/keys-DeepSeekV4Flash-Vision-EXP-ablit`](https://huggingface.co/drowzeys/keys-DeepSeekV4Flash-Vision-EXP-ablit).
 
 Also: [tonyd2wild](https://github.com/tonyd2wild/), Rafael Caricio, Fraser Price,

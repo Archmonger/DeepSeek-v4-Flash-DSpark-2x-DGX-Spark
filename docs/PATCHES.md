@@ -867,6 +867,217 @@ at either k (0.88/0.74/0.53/0.36/0.24), so the gain is the cheaper step.
 
 ---
 
+## RoPE SWA fix — sparse-SWA layers use plain RoPE, not YaRN (default OFF)
+
+**Symptom.** `models/deepseek_v4/common/rope.py::build_deepseek_v4_rope`
+promotes the checkpoint's rope type to `deepseek_yarn` whenever it is not
+`"default"` — for every layer. The served Vision-Exp abliterated checkpoint
+ships a flat `rope_scaling = {type: yarn, factor: 16,
+original_max_position_embeddings: 65536}` with `sliding_window=128`, so its
+sparse-SWA layers — 0 and 1 (`compress_ratios[i]=0` → `compress_ratio=1`) plus
+the three DSpark drafter layers past `num_hidden_layers` — run YaRN factor=16
+over a 128-token window. Per the DeepSeek-V4 reference (`inference/model.py`
+L481-485) and transformers#45892, YaRN belongs only to compressor (CSA/HCA)
+layers; sliding-window layers must use plain RoPE.
+
+**What the patcher does.** `patches/hotfix-vllm-rope-swa-fix.py` ports merged
+upstream [vllm#54815](https://github.com/vllm-project/vllm/pull/54815)
+source-exact (stock identity `0074271a…` → patched `6452ce2e…`; the patched
+bytes minus the one mark comment equal the upstream post-image byte-for-byte):
+each call works on a per-layer dict copy (nested `{"main","compress"}`
+checkpoints route by layer type), the YaRN promotion additionally requires
+`compress_ratio > 1`, and every other layer takes `deepseek_yarn` with
+`factor=1.0` over `max_position_embeddings` — identity scaling, i.e. plain
+RoPE on the same kernel path. Compressor layers resolve byte-identical
+parameters to stock (`deepseek_yarn`, factor=16, theta=160000), and the
+shared `config.rope_parameters` dict is no longer mutated across layers.
+`DSPARK_ENABLE_ROPE_SWA_FIX=1` gates it (mount, `--check` preflight worker
+then head, apply at container start, atomic replace); the CPU suite is
+`python3 scripts/test-rope-swa-fix.py` (pins, idempotency, fail-closed CLI,
+and stubbed-`get_rope` routing for compress_ratio 1/4/128 with the served
+checkpoint's real rope values).
+
+**Live gate before defaulting on.** Positions ≤128 sit where the YaRN ramp is
+near-identity, so short-context output should be indistinguishable; the
+abliterated checkpoint may nevertheless have adapted to the served embedding.
+Run the 128K+ long-context quality A/B vs control (same seeds, gate26
+harness) before flipping the default.
+## DSpark draft SWA prefix fix — prefix-cache hits recompute the last draft window (default OFF)
+
+**Symptom.** With `--enable-prefix-caching`, re-sending an identical prompt
+(retries, cached tool-call prefixes, agent loops) returns a degenerate,
+truncated response (e.g. a 5-token `["json` + stop) instead of the full
+output; deterministic at temperature 0. Upstream report and fix:
+Anemll/dspark-vllm-gx10#2 (`4afc5e7eeb`).
+
+**Root cause.** The DSpark draft model attends over a sliding window of
+`sliding_window` (128) tokens populated from the target's hidden states via
+`precompute_and_store_context_kv`. On a prefix-cache hit the target skips
+recomputing the cached prefix, so only the non-cached suffix reaches the
+draft: its window cache is missing the prefix, the draft degenerates, and the
+verifier accepts the truncated output.
+
+**What the patcher does.** `patches/hotfix-vllm-dspark-swa-prefix.py` ports
+the upstream overlay verbatim (plus one `# [dspark-swa-prefix]` mark line per
+file): `v1/core/kv_cache_manager.py` (stock identity `be9c5091…`, patched
+`09f0e990…`, whole-file pinned — no other recipe hotfix touches it) gains a
+`dspark_window_size` parameter capping `max_cache_hit_length` to
+`num_tokens - 1 - dspark_window_size` in `get_computed_blocks`;
+`v1/core/sched/scheduler.py` (co-owned at boot by grammar-advance,
+empty-encoder-output and issue #27, so held to source-exact regions that must
+each occur exactly once; pure stock `e25d4c9a…` -> patched `69fc8118…` proven
+against fixtures) reads the draft's `hf_config.sliding_window` under
+`use_dspark()` and passes it to the `KVCacheManager`. Without DSpark the
+window stays `None` and cache-hit arithmetic is stock. Cost when active: a
+128-token recompute per prefix-cache hit. `DSPARK_ENABLE_DSPARK_SWA_PREFIX=1`
+gates it (mount, `--check` preflight worker then head, apply at container
+start, both targets preflighted before either atomic replace); the CPU suite
+is `python3 scripts/test-dspark-swa-prefix.py`.
+
+**Upstream validation (2×GB10, TP=2, 0731, K6 + probabilistic):** repeated
+json60 prompt 12.1 tok/s broken -> 86.5 fixed; count300/mult12/bst/story and
+8K/32K/100K prefill unchanged within noise. Local live gate still to run on
+the Vision-Exp abliterated lane: repeated-prompt output-quality A/B.
+
+---
+
+## DSML recovery — malformed-wrapper DeepSeek V4 tool calls recover instead of leaking (default OFF)
+
+**Symptom.** DeepSeek V4 intermittently emits an otherwise complete DSML
+`<invoke name="...">` block while the outer `tool_calls` opener is missing or
+malformed — one observed DeepSeek-V4-Flash-0731 variant emits `toolcalls`
+(upstream vllm#51914). The pinned parser only enters the tool-call state
+machine on the exact outer opener, so the whole invoke leaks verbatim into
+user-visible content (or stays in reasoning) and the structured tool call is
+lost; agent traffic sees DSML markup as prose instead of a tool call.
+
+**What the patcher does.** `patches/hotfix-vllm-dsml-recovery.py` ports open
+upstream [vllm#52645](https://github.com/vllm-project/vllm/pull/52645) (head
+`3df9776b0d`, the current-main DeepSeek V4 extraction of the #49117
+orphan-invoke recovery direction) onto the pinned parser engine, adapted to
+the pinned engine's pre-`token_count` API. Six files, all sole-owned by this
+hotfix and pinned by whole-file stock+patched identity:
+
+- `parser/engine/parser_engine_config.py` (stock `0854bd50…` → `76ed8f12…`):
+  `Transition` gains opt-in `provisional_tool_call` /
+  `commit_provisional_tool_call` markers; `ParserState` gains
+  `FOREIGN_BLOCK` / `FOREIGN_REASONING_BLOCK`.
+- `parser/engine/streaming_parser_engine.py` (`4ac9135e…` → `cd7d8778…`): a
+  provisional transition buffers its semantic events and raw text; the
+  completed name is validated through a parser-owned callback; only the
+  configured `INVOKE_END` transition commits (returning to CONTENT and
+  absorbing one optional outer closer); every other exit — truncation, an
+  outer `TOOL_END` without `INVOKE_END`, a rejected name, `finish()` — puts
+  the raw text back in its original content or reasoning state. Parser-level
+  drop tokens (EOS) never enter the buffers; name buffering aborts past 256
+  chars or a newline so quoted markers cannot stall a response.
+- `parser/deepseek_v4.py` (`97d7cd3c…` → `2cc89a1b…`): provisional
+  transitions for a bare `INVOKE_PREFIX` from CONTENT/REASONING; V3.2
+  `function_calls` wrappers become verbatim passthrough states (their inner
+  invokes are never recovered); the recovery validator accepts only names
+  declared by the live request and nothing under `tool_choice="none"`.
+- `parser/engine/adapters.py` (`dc1c1317…` → `9d743734…`),
+  `parser/abstract_parser.py` (`fd4eb7a6…` → `e11c1b78…`),
+  `parser/engine/parser_engine.py` (`886bf629…` → `f8f403ad…`): the request's
+  tools and `tool_choice` are mirrored into the reasoning-side engine before
+  recovery validation (non-streaming and per-delta), and a rolled-back
+  candidate parked in deferred reasoning is flushed at stream end.
+
+Misspelled wrappers are deliberately not normalized: recovery anchors on the
+inner invoke structure, so missing and corrupted openers share one
+conservative path and unrecognized wrapper text is preserved as content.
+`DSPARK_ENABLE_DSML_RECOVERY=1` gates it (mount, `--check` preflight worker
+then head, apply at container start; all six targets preflight before any
+write, one atomic replace per file, files already written roll back to stock
+if a later file fails). The CPU suite is `python3 scripts/test-dsml-recovery.py`:
+fixture/transform pins, patcher fail-closed/idempotency/rollback, the
+upstream #52645 regression matrix (16 engine + 5 serving-style delegating
+scenarios) replayed against the pinned fixtures, and a 16-case stock/patched
+parity matrix proving normal wrapped DSML, reasoning, streaming, and
+`tool_choice` handling are byte-identical in behavior.
+
+**Live gate before defaulting on.** Recovery only fires on traffic the stock
+parser already fails to execute, but the lane contract is agent tool-call
+acceptance parity vs the 42.3% C1 baseline on live agent traffic (existing
+parser suite + issue #191 tool-call contract stay green in CI).
+
+---
+
+## Issue #144 — effort-directive prefix-cache alignment (default OFF)
+
+**Symptom.** The checkpoint encoder (`encoding/encoding_dsv4.py`, installed at
+boot as `vllm/tokenizers/deepseek_v4_encoding.py`) front-inserts the
+reasoning-effort directive immediately after BOS and before all system content
+whenever `thinking_mode == "thinking"`. The directive is a static,
+non-256-aligned segment: BOS+directive is 93 tokens for `max`/`xhigh`, 80 for
+`high` (and the live `DEFAULT_THINKING=high` default), 0 extra tokens for
+`low`/`off`/`medium` (empty directive; the compose wrapper mapping folds
+`medium` and every other value into `low`, and only
+`chat_template_kwargs.reasoning_effort` reaches the encoder — the top-level
+OpenAI `reasoning_effort` field is ignored). vLLM v1 prefix caching hashes
+256-token blocks chained on the parent block hash, so requests that differ
+only in effort diverge at block 0 and share **zero** blocks. Measured on the
+live 2×GB10 lane: cross-bucket hit rate exactly 0, intra-bucket 96–98%; the
+cache is partitioned into `{low,off,medium}` / `{high,DEFAULT}` /
+`{max,xhigh}`.
+
+**What the patcher does.** `patches/hotfix-dsv4-issue144-effort-align.py`
+replaces one anchored region of `render_message` (the effort prefix plus the
+system branch; the region constants are sha256-pinned in the patcher) so the
+directive renders at the **end of the leading run of system messages** instead
+of in front of it:
+
+```
+stock:   BOS + directive + system-region + rest
+aligned: BOS + system-region + "\n\n" + directive + rest
+```
+
+`low` renders (empty directive), chat-mode renders, context continuations and
+conversations with no leading system message stay byte-identical to stock.
+The bytes of BOS + system prompt + tools are then identical for every effort,
+so all their full 256-token blocks hash identically across buckets; only the
+0/~80/~93-token directive tail plus the junction block diverges. Measured with
+the live tokenizer on a 4646-token agent-shaped prompt: stock shares 0 full
+blocks across buckets; aligned shares 18/18 cacheable blocks (shared token
+prefix 4630 of 4646; the BPE junction merge costs exactly 1 token).
+
+**Fail-closed operation.** The compose gate runs the patcher after the encoder
+copy and after the other encoder co-patchers (issue #21, Vision-Exp,
+assistant-final; the anchored region is disjoint from all three and accepted
+in both assistant-final pre-states). A missing or duplicated anchor aborts the
+boot; known whole-file identities (snapshot `b4bbb74b…` 36,707 B, live chain
+`07432ce4…` 39,960 B, and their patched forms `f99de710…` / `a976ae86…`) are
+recognized and reported, while an unrecognized file with an intact anchor is
+still patchable because the encoder is co-owned by gated patchers and
+`DSPARK_REVISION` is unpinned by default. After writing (same-directory atomic
+replace), a render self-check re-proves relocation and byte parity or the
+original bytes are restored and the boot fails. `--status` classifies the
+served copy; `--check` classifies the bytes the next boot will copy
+(env-resolved snapshot source, mirroring the entrypoint), which is what the
+launcher preflights on the worker(s) and head before either rank starts.
+
+**Wiring.** `DSPARK_ENABLE_ISSUE144_EFFORT_ALIGN=1` gates it (mount, worker
+sync, `--check` preflight worker→head, `scripts/ci-validate.sh` locks). The
+CPU suite is `python3 scripts/test-issue144-effort-align.py`: fixture/transform
+identity pins for both pre-states, exact-byte relocation and parity matrices,
+a chained-block-hash simulation proving stock shares zero cross-bucket blocks
+while aligned shares every full block of the shared prefix (deterministic
+surrogate tokenizer; set `DSPARK_I144_TOKENIZER_JSON` to the checkpoint's
+`tokenizer.json` to rerun the proof with real BPE), patcher
+fail-closed/idempotency, and wiring locks.
+
+**Live gate before defaulting on.** (1) Cache effectiveness: replay a
+repeated-prefix mixed-effort trace and compare
+`vllm:prefix_cache_hits`/`queries` plus TTFT cross-bucket (expect ≈0% → shared
+region hit; reporter's claim on repeated-prefix high/max traffic is 2.3–2.7×
+TTFT). (2) Output-quality parity: the directive moves from before to after the
+system prompt, so completions at `high`/`max` (temperature 0, fixed seeds,
+agent-shaped prompts with tools) must match stock in reasoning-length
+distribution and task outcomes within run-to-run noise; `low`/`off`/`medium`
+is byte-identical by construction and needs no gate.
+
+---
+
 ## Issue #117 — bounded SHM dispatch-ring reader recovery
 
 ### Scope and upstream fix
@@ -1003,3 +1214,76 @@ miss — fresh volume, new cache root, new index head count, the fp4 indexer pat
 (`#include <deep_gemm/impls/sm120_X.cuh>` + `#define sm121_X sm120_X`) for the
 fp8/fp4 × contiguous/paged mqa-logits kernels. Idempotent; `--status` reports.
 Details: `docs/CLAUDE/item8-fp4-kv-design.md` §5.
+
+## MXFP4 indexer K cache — relax the fp4 indexer gate to sm_12x (default OFF)
+
+**What ships in the image.** The pinned vLLM carries a complete MXFP4
+Lightning-indexer K cache behind `AttentionConfig.use_fp4_indexer_cache`: the
+indexer insert writes packed FP4 K (`use_fp4_cache=` / `use_fp4=` plumbing in
+`models/deepseek_v4/attention.py`), the DeepGEMM `fp8_fp4_*_mqa_logits`
+kernels consume it, and the vendored DeepGEMM ships
+`sm120_fp4_mqa_logits.cuh` / `sm120_fp4_paged_mqa_logits.cuh`. The metadata
+builder nevertheless asserts Blackwell *datacenter* only
+(`v1/attention/backends/mla/indexer.py:274-285`, "use_fp4_indexer_cache
+requires Blackwell datacenter GPUs (sm_10x)"), while the decode flattening
+rule directly below already covers every non-SM100 family via the shared
+`smxx_fp8_fp4_paged_mqa_logits` contract (k=5 flattens either way) — the gate
+is conservative, not a kernel limit (item8 design §3).
+
+**What the patcher does.** `patches/hotfix-vllm-mxfp4-indexer-cache.py`
+(source-exact, stock identity `02505c6c…` → patched `bfb0376d…`) widens that
+one assert with `or current_platform.is_device_capability_family(120)` and
+rewords its message; nothing else changes, and pre-Blackwell architectures
+still fail closed. Enablement is separate: the Compose gate passes
+`--attention-config {"use_fp4_indexer_cache":true}` on both ranks only when
+`DSPARK_ENABLE_MXFP4_INDEXER_CACHE=1`, which also applies the patcher at boot
+(mount, `--check` preflight worker then head, apply at container start,
+atomic replace). The launcher refuses the flag without
+`DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS=1`: the fp4 logits kernels are not in the
+persisted DeepGEMM JIT cache, and a GB10 compile emits `sm121_*` includes
+that exist only as the §5 alias headers. CPU suite:
+`python3 scripts/test-mxfp4-indexer-cache.py` (pins, idempotency, fail-closed
+CLI, exec-level gate semantics on the real region bytes, wiring).
+
+**Expected effect.** The pinned writer keeps the FP8-size 132 B/row indexer K
+allocation and uses the first half for FP4 (`attention.py` NOTE), so the flag
+halves indexer K *read* bytes per scored key today — the indexer is
+replicated across both TP ranks and its O(queries × keys) logits reads
+dominate long-context score traffic. The item8 §3 headline (−0.35 KB/token ≈
+−9 % of physical KV bytes) additionally needs the spec-side half-row
+allocation follow-up. The first enabled boot JIT-compiles the fp4 logits
+kernels (~minutes; persisted in `VLLM_CACHE_ROOT/deep_gemm`).
+
+**Live gate before defaulting on.** MXFP4 (e2m1 values, per-32 UE8M0 scales)
+quantizes indexer *scores* — top-k selection, never attention values — so the
+risk is selection drift at depth: run ruler-lite 32K/131K, the context-garble
+sweep to 900K, and the 128K TTFT A/B vs control before flipping the default.
+
+## C128A prefill metadata cache (default OFF)
+
+`DSPARK_ENABLE_C128A_PREFILL_CACHE=1` applies
+`patches/hotfix-vllm-c128a-prefill-cache.py` on the pinned Anemll 0.1.1
+vLLM (`0.25.2.dev0+g752a3a504.d20260714`).
+
+The SM120 attention path previously converted C128A local top-k indices to
+physical slots separately in every layer. The first consumer now stores the
+unchanged conversion's return tuple on its `DeepseekV4FlashMLAMetadata`;
+later consumers sharing that metadata reuse it. The GPU runner builds fresh
+metadata each forward and shares it per attention subgroup within a KV group,
+so the cache cannot carry old physical block IDs into the next step. C4A
+indices remain layer-dependent; C4A, decode, SM100 and the conversion kernel
+are unchanged. No persistent tensors or output-buffer API are added.
+
+The launcher synchronizes the selected patcher, preflights workers and head
+with `--check`, and applies at container startup. The patcher validates both
+source regions and compiles both candidates before per-file atomic replacement.
+`--status` validates source compatibility without writing. An unexpected
+version, missing/duplicated region or damaged cache region fails closed.
+Disable the gate and recreate containers to restore stock.
+
+CPU regression: `python3 scripts/test-c128a-prefill-cache.py`. It exercises
+the pinned prefill method with a physical-index model, covering shared metadata,
+new-step block changes, C4 layer-specific indices and mixed-batch slicing.
+Runtime qualification and timing must be reported separately; reduced conversion
+count alone is not an end-to-end speedup claim. Context-parallel and full-graph
+prefill configurations beyond the qualified GPU-runner lane remain unverified.
