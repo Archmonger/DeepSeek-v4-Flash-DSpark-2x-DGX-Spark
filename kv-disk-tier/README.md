@@ -1,8 +1,22 @@
 # `kv-disk-tier` — disk backed KV cache
 
-Backs the prefix cache with NVMe so a large context survives GPU KV eviction and
-restores from disk instead of paying a cold prefill. Multi-node TP safe (per-node
-sharded tier) and needs no vLLM source change — modules are bind-mounted.
+Experimental, default-off NVMe backing for the prefix cache, intended to restore
+evicted contexts without a cold prefill. The design uses per-node shards for
+multi-node TP and bind-mounted modules rather than a rebuilt vLLM source tree.
+
+**Maintainer-owned HOLD:** the revised source is not qualified for two-node
+serving, native copy kernels, direct I/O, ENOSPC recovery, or reconnect behavior.
+Maintainer `plotarmordev` owns current-main integration and an explicitly
+authorized maintenance window before lifting this hold. All performance and
+restore observations below are historical, not qualification of this revision.
+
+CPU bookkeeping checks exercise pinned Python APIs, real temporary files and
+the real `FileMapper`; some parent operations remain isolated test seams.
+Qualification requires a nonzero test count and **zero skips**, not merely a
+successful host test exit when optional dependencies are absent. This does not
+qualify native extensions, GPU memory, transport, or allocator behavior.
+Optional module absence remains distinct from incompatible installed APIs:
+errors resolving present packages or importing required symbols propagate.
 
 ## Build (once per node)
 
@@ -45,8 +59,9 @@ Pinned identities: serving image
 (vLLM `0.25.2.dev0+g752a3a504.d20260714`), build image
 `vllm-dspark-runtime:dspark-nvfp4-stage-c`, model
 `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp@6821d6ad3681a4b137b066b76094fa82ebd0a380`.
-The patches target that exact vLLM build; a drifted source tree fails the
-startup preflight rather than silently skipping a required patch.
+These identities define the intended qualification target, not proof that all
+patches, native artifacts, or other image builds are compatible. Source/API
+checks do not replace current-image runtime qualification.
 
 ## Enable
 

@@ -1401,7 +1401,7 @@ def apply_offload_budget() -> None:
 
 
 def _module_available(name: str) -> bool:
-    """True only when `name` is absent from this image, not when it is broken.
+    """Return whether a module spec exists; propagate broken parent imports.
 
     Used to pick between vLLM runner generations: each image ships one of
     ``vllm.v1.worker.gpu_model_runner`` (V1) or ``vllm.v1.worker.gpu.model_runner``
@@ -1851,20 +1851,24 @@ def apply_host_kv_direct_map() -> None:
     global _BLOCK_SIZE_FACTOR
     if "hostkv_direct_map" in _APPLIED:
         return
-    try:
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
-            TransferJob,
-        )
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
-            OffloadingConnectorScheduler,
-        )
-        from vllm.v1.kv_offload.base import (
-            BlockIDsLoadStoreSpec,
-            GPULoadStoreSpec,
-            PrepareStoreOutput,
-        )
-    except ImportError:
-        return
+    for module in (
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.common",
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler",
+        "vllm.v1.kv_offload.base",
+    ):
+        if not _module_available(module):
+            return
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+        TransferJob,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        OffloadingConnectorScheduler,
+    )
+    from vllm.v1.kv_offload.base import (
+        BlockIDsLoadStoreSpec,
+        GPULoadStoreSpec,
+        PrepareStoreOutput,
+    )
 
     _orig_pso_init = PrepareStoreOutput.__init__
 
@@ -1948,15 +1952,18 @@ def apply_host_kv_direct_skip() -> None:
     """
     if "hostkv_direct_skip" in _APPLIED:
         return
-    try:
-        from vllm.v1.kv_offload.base import TransferResult
-        from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
-            OffloadingConnectorWorker,
-        )
-    except ImportError:
-        # V1-only image (no vllm.v1.kv_offload.cpu.gpu_worker): nothing to skip.
-        return
+    for module in (
+        "vllm.v1.kv_offload.base",
+        "vllm.v1.kv_offload.cpu.gpu_worker",
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker",
+    ):
+        if not _module_available(module):
+            return
+    from vllm.v1.kv_offload.base import TransferResult
+    from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
+        OffloadingConnectorWorker,
+    )
     if getattr(CPUOffloadingWorker, "_dsv4_direct", False):
         _APPLIED.add("hostkv_direct_skip")
         return

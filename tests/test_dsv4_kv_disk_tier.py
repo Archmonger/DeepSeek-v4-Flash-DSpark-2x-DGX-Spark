@@ -16,8 +16,7 @@ The cases pin the specific bugs fixed over the life of this module:
   * ``has_pending_work`` ignored the already-completed ``_done`` queue.
   * ``CappedFileSystemTierManager.lookup`` used truthiness on a ``LookupResult``.
   * ``CappedFileSystemTierManager`` kept phantom entries after a failed store.
-  * the fs_capped completion hook released no load pins, so every resident
-    block stayed pinned and the byte cap was silently bypassed.
+  * load completion must release pins so the fs_capped byte cap stays enforceable.
   * a failed load left its unreadable block file accounted (and on disk).
   * a failed-store reconcile un-accounted a path that was present on disk.
   * an out-of-range block id clamped a memoryview instead of failing the job.
@@ -340,15 +339,15 @@ class TestRecoveryTransitions(unittest.TestCase):
         self.assertIn(b"b", t._present)
         self.assertNotIn(b"zzz", t._present)
 
-    def test_duplicate_rank_is_reported(self):
+    def test_duplicate_rank_cannot_satisfy_the_barrier(self):
         t = make_head()
         t._on_hello(b"id0", {"rank": 0, "keys": [b"a"]})
-        # _hellos is keyed by rank, so a second identity claiming rank 0
-        # collapses into one entry and the tier can never reach READY. Nothing
-        # else distinguishes that from an agent that has not started.
-        with self.assertLogs(dsv4_shard_tier.logger, level="ERROR") as caught:
-            t._on_hello(b"id9", {"rank": 0, "keys": [b"a"]})
-        self.assertTrue(any("duplicate rank 0" in m for m in caught.output))
+        t._on_hello(b"id9", {"rank": 0, "keys": [b"a"]})
+        self.assertFalse(t._ready)
+        self.assertEqual(t.lookup(b"a", None), LookupResult.MISS)
+        t._on_hello(b"id1", {"rank": 1, "keys": [b"a"]})
+        self.assertTrue(t._ready)
+        self.assertEqual(t.lookup(b"a", None), LookupResult.HIT)
 
 
 @unittest.skipIf(
@@ -555,31 +554,29 @@ class TestShardSliceIo(unittest.TestCase):
 class TestShardInventory(unittest.TestCase):
     def test_keys_that_do_not_round_trip_are_dropped(self):
         with tempfile.TemporaryDirectory() as td:
-            base = os.path.join(td, "kvdisk")
-            root = base + "_r0"
+            from vllm.v1.kv_offload.file_mapper import FileMapper
+
+            mapper = FileMapper(
+                root_dir=td, model_name="inert", hash_block_size=16,
+                gpu_blocks_per_file=1, tp_size=2, pp_size=1, pcp_size=1,
+                dcp_size=1, rank=0, dtype="float32",
+            )
+            root = mapper.base_path + "_r0"
             good_key = bytes.fromhex("01020304") + (0).to_bytes(4, "big")
-            good = os.path.join(root, "aaa", "aa_g0", "01020304.bin")
+            good = mapper.get_file_name(good_key)
             stray = os.path.join(root, "bbb", "bb_g0", "05060708.bin")
             for p in (good, stray):
                 os.makedirs(os.path.dirname(p), exist_ok=True)
                 with open(p, "wb") as f:
                     f.write(b"abcd")
 
-            class _FM:
-                base_path = base
-
-                def get_file_name(self, key):
-                    # Only the good key names the file it was reconstructed from.
-                    if bytes(key) == good_key:
-                        return good
-                    return os.path.join(root, "elsewhere.bin")
 
             a = dsv4_shard_tier.ShardAgent.__new__(dsv4_shard_tier.ShardAgent)
             a._rank = 0
             a._slice_bytes = 4
             a._direct_layout = None
             a._direct_cell = 0
-            a._mapper = _FM()
+            a._mapper = mapper
             # A key that does not round-trip through FileMapper would be counted
             # as resident by the head but can never be served: re-storing the
             # block is cheap, adopting a phantom is not.
