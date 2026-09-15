@@ -14,10 +14,21 @@ The cases pin the specific bugs fixed over the life of this module:
   * ``has_pending_work`` ignored the already-completed ``_done`` queue.
   * ``CappedFileSystemTierManager.lookup`` used truthiness on a ``LookupResult``.
   * ``CappedFileSystemTierManager`` kept phantom entries after a failed store.
+  * the fs_capped completion hook had no old-API name, so its pins (and the byte
+    cap) were never released on a vLLM that calls ``get_finished()``.
+  * a failed load left its unreadable block file accounted (and on disk).
+  * a failed-store reconcile un-accounted a path that was present on disk.
+  * an out-of-range block id clamped a memoryview instead of failing the job.
+  * a mid-round agent (re)connect was dropped, stalling the tier below READY.
+  * an agent-side job failure sent no ack, holding the head's job to timeout.
+  * direct-I/O mappings survived their owning job (stale slot -> GPU block ids)
+    and used 0 both as a real GPU block id and as the null-sub-block sentinel.
 """
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 import threading
 import unittest
 from collections import OrderedDict
@@ -60,6 +71,7 @@ else:
 
 if _HAVE_TIER:
     # Our own symbols: an import failure here is a real bug, never a missing dep.
+    import dsv4_vllm_patches
     from dsv4_kv_disk_tier import CappedFileSystemTierManager, _load_block_buffered
 
     try:
@@ -76,6 +88,7 @@ else:
     _load_block_buffered = None
     LookupResult = None
     FileSystemTierManager = None
+    dsv4_vllm_patches = None
 
 SLICE = 10
 
@@ -163,6 +176,9 @@ def make_head():
     t._n_timeouts = 0
     t._sent = []
     t._broadcast = lambda payload: (t._sent.append(payload), True)[1]
+    t._send_rehello = lambda ident, gen: t._sent.append(
+        {"t": "rehello", "gen": gen, "to": ident}
+    )
     return t
 
 
@@ -249,6 +265,55 @@ class TestRecoveryTransitions(unittest.TestCase):
         self.assertIn(b"b", t._present)
         self.assertNotIn(b"a", t._present)
 
+    def test_mid_round_reconnect_is_repolled(self):
+        t = make_head()
+        # Round 1 is in flight (a reconnect already bumped the epoch) and only
+        # rank 0 has reported.
+        t._ready = False
+        t._epoch = 1
+        t._hellos = {0: [b"a"]}
+        # Rank 1's agent restarted, so its hello carries no gen: it is not a
+        # reply to a rehello that was broadcast before it registered. Dropping
+        # it stalls _hellos below _num_agents forever -- the tier never serves
+        # again -- so it must be re-polled instead.
+        t._on_hello(b"id1", {"rank": 1, "keys": [b"a"]})
+        self.assertNotIn(1, t._hellos)
+        self.assertFalse(t._ready)
+        self.assertIn({"t": "rehello", "gen": 1, "to": b"id1"}, t._sent)
+        # Its answer for the current round is counted normally.
+        t._on_hello(b"id1", {"rank": 1, "keys": [b"a"], "gen": 1})
+        self.assertTrue(t._ready)
+        self.assertIn(b"a", t._present)
+
+    def test_restart_after_a_round_is_not_ignored(self):
+        t = make_head()
+        t._on_hello(b"id0", {"rank": 0, "keys": [b"a"]})
+        t._on_hello(b"id1", {"rank": 1, "keys": [b"a"]})
+        self.assertTrue(t._ready)
+        # Round 1: rank 0 reconnects and everyone re-reports.
+        t._on_hello(b"id0", {"rank": 0, "keys": [b"b"]})
+        t._on_hello(b"id0", {"rank": 0, "keys": [b"b"], "gen": 1})
+        t._on_hello(b"id1", {"rank": 1, "keys": [b"b"], "gen": 1})
+        self.assertTrue(t._ready)
+        self.assertEqual(t._epoch, 1)
+        # Rank 1 now restarts: gen-less hello with gen (0) < epoch (1). It is
+        # not a late reply, so ignoring it would keep serving an index built
+        # from the previous inventory of that node.
+        t._on_hello(b"id1", {"rank": 1, "keys": [b"c"]})
+        self.assertFalse(t._ready)
+        self.assertEqual(t._epoch, 2)
+        self.assertEqual(t._hellos, {})
+
+    def test_duplicate_rank_is_reported(self):
+        t = make_head()
+        t._on_hello(b"id0", {"rank": 0, "keys": [b"a"]})
+        # _hellos is keyed by rank, so a second identity claiming rank 0
+        # collapses into one entry and the tier can never reach READY. Nothing
+        # else distinguishes that from an agent that has not started.
+        with self.assertLogs(dsv4_shard_tier.logger, level="ERROR") as caught:
+            t._on_hello(b"id9", {"rank": 0, "keys": [b"a"]})
+        self.assertTrue(any("duplicate rank 0" in m for m in caught.output))
+
 
 @unittest.skipIf(
     CappedFileSystemTierManager is None, "vllm/zmq not importable"
@@ -303,6 +368,79 @@ class TestFsCapped(unittest.TestCase):
         self.assertIn("/c", cm._lru)
         self.assertEqual(cm._total_bytes, 100)
 
+    def test_finished_hook_serves_both_vllm_generations(self):
+        # Older (DeepSeek-image) vLLM exposes only get_finished() and calls that
+        # name: if the pin retirement is bound to the new name alone, it never
+        # runs there -- every resident block stays pinned, _evict_for() stops
+        # evicting, and the byte cap is silently bypassed while the disk fills.
+        # Exercise exactly that surface, then the new-API one.
+        cm = self._make()
+        cm._load_job_keys = {1: ["/x/k"]}
+        cm._pinned = {"/x/k": 1}
+        Res = type("Res", (), {"job_id": 1, "success": True})
+        has_jobs = "get_finished_jobs" in FileSystemTierManager.__dict__
+        jobs = FileSystemTierManager.__dict__.get("get_finished_jobs")
+        has_old = "get_finished" in FileSystemTierManager.__dict__
+        old = FileSystemTierManager.__dict__.get("get_finished")
+        if has_jobs:
+            del FileSystemTierManager.get_finished_jobs
+        FileSystemTierManager.get_finished = lambda self: iter([Res()])
+        try:
+            self.assertEqual(len(list(cm.get_finished())), 1)
+        finally:
+            if has_old:
+                FileSystemTierManager.get_finished = old
+            else:
+                del FileSystemTierManager.get_finished
+            if has_jobs:
+                FileSystemTierManager.get_finished_jobs = jobs
+        self.assertEqual(cm._pinned, {})
+        self.assertTrue(hasattr(cm, "get_finished_jobs"))
+
+    def test_failed_load_drops_retired_block_accounting(self):
+        cm = self._make()
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "retired.bin")
+            with open(p, "wb") as f:
+                f.write(b"x" * 100)
+            cm._lru = OrderedDict([(p, 100)])
+            cm._total_bytes = 100
+            cm._pinned = {p: 1}
+            cm._load_job_keys = {1: [p]}
+            os.unlink(p)  # _load_block_buffered retired it on the I/O thread
+            Res = type("Res", (), {"job_id": 1, "success": False})
+            orig = FileSystemTierManager.get_finished_jobs
+            try:
+                FileSystemTierManager.get_finished_jobs = lambda self: iter([Res()])
+                list(cm.get_finished())
+            finally:
+                FileSystemTierManager.get_finished_jobs = orig
+        self.assertNotIn(p, cm._lru)
+        self.assertEqual(cm._total_bytes, 0)
+        self.assertEqual(cm._pinned, {})
+
+    def test_failed_store_keeps_present_file_accounted(self):
+        cm = self._make()
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "restored.bin")
+            # A later store of the same key re-created the file: un-accounting
+            # it here would orphan real bytes (invisible to the cap, never
+            # evicted, and never rewritten because lookup() keeps hitting them).
+            with open(p, "wb") as f:
+                f.write(b"x" * 100)
+            cm._store_job_keys = {1: [p]}
+            cm._lru = OrderedDict([(p, 100)])
+            cm._total_bytes = 100
+            Res = type("Res", (), {"job_id": 1, "success": False})
+            orig = FileSystemTierManager.get_finished_jobs
+            try:
+                FileSystemTierManager.get_finished_jobs = lambda self: iter([Res()])
+                list(cm.get_finished())
+            finally:
+                FileSystemTierManager.get_finished_jobs = orig
+        self.assertIn(p, cm._lru)
+        self.assertEqual(cm._total_bytes, 100)
+
 
 @unittest.skipIf(_load_block_buffered is None, "vllm/zmq not importable")
 class TestLoadBlockBuffered(unittest.TestCase):
@@ -310,6 +448,164 @@ class TestLoadBlockBuffered(unittest.TestCase):
         view = memoryview(bytearray(100))
         with self.assertRaises(ValueError):
             _load_block_buffered("/nonexistent", view, 90, 20)  # 90+20 > 100
+
+    def test_unreadable_block_is_retired(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "short.bin")
+            with open(p, "wb") as f:
+                f.write(b"abc")  # shorter than the block being promoted
+            with self.assertRaises(OSError):
+                _load_block_buffered(p, memoryview(bytearray(100)), 0, 100)
+            # The parent's lookup() is a bare os.path.exists(): a block that can
+            # never be read must not stay on disk, or every request whose prefix
+            # touches it re-promotes it forever.
+            self.assertFalse(os.path.exists(p))
+
+
+def make_agent():
+    a = dsv4_shard_tier.ShardAgent.__new__(dsv4_shard_tier.ShardAgent)
+    a._direct_layout = None
+    a._zero_buf = None
+    a._zero_addr = 0
+    a._zero_discard_addr = 0
+    return a
+
+
+@unittest.skipIf(dsv4_shard_tier is None, "vllm/zmq not importable")
+class TestShardSliceIo(unittest.TestCase):
+    def test_slice_bounds_are_rejected_not_clamped(self):
+        # memoryview slicing clamps: an out-of-range offset would leave the
+        # write loop spinning on an empty buffer (os.write returns 0) instead of
+        # failing the job, and a partially clamped one would publish a truncated
+        # file that the size-only inventory scan accepts.
+        mv = memoryview(bytearray(100))
+        with self.assertRaises(OSError):
+            dsv4_shard_tier._store_one("/nonexistent", mv, 90, 20)
+        with self.assertRaises(OSError):
+            dsv4_shard_tier._load_one("/nonexistent", mv, 90, 20)
+
+    def test_gpu_block_zero_is_not_the_null_sentinel(self):
+        a = make_agent()
+        a._direct_layout = [(0x1000, 16, 8)]
+        a._zero_addr = 0xDEAD
+        a._zero_discard_addr = 0xBEEF
+        self.assertEqual(
+            a._direct_iovecs([0, 2], for_write=True),
+            [(0x1000, 8), (0x1000 + 2 * 16, 8)],
+        )
+        self.assertEqual(a._direct_iovecs([-1], for_write=False), [(0xBEEF, 8)])
+
+    def test_failed_frame_is_acked(self):
+        # Without the ack the head holds the job for the full double timeout
+        # with its primary-tier slots pinned, because a job that is never acked
+        # never completes.
+        a = make_agent()
+        sent = []
+
+        class _Sock:
+            def send(self, payload):
+                sent.append(payload)
+
+        frame = dsv4_shard_tier._ENC.encode(
+            {"t": "store", "job": 7, "keys": [], "bids": []}
+        )
+        a._ack_frame_failure(_Sock(), frame, RuntimeError("no GPU block ids"))
+        self.assertEqual(
+            [dsv4_shard_tier._DEC.decode(p) for p in sent],
+            [{"t": "ack", "job": 7, "ok": False}],
+        )
+        # Frames that carry no job must not produce an ack.
+        a._ack_frame_failure(
+            _Sock(),
+            dsv4_shard_tier._ENC.encode({"t": "evict", "keys": []}),
+            RuntimeError("x"),
+        )
+        self.assertEqual(len(sent), 1)
+
+
+@unittest.skipIf(dsv4_shard_tier is None, "vllm/zmq not importable")
+class TestShardInventory(unittest.TestCase):
+    def test_keys_that_do_not_round_trip_are_dropped(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = os.path.join(td, "kvdisk")
+            root = base + "_r0"
+            good_key = bytes.fromhex("01020304") + (0).to_bytes(4, "big")
+            good = os.path.join(root, "aaa", "aa_g0", "01020304.bin")
+            stray = os.path.join(root, "bbb", "bb_g0", "05060708.bin")
+            for p in (good, stray):
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "wb") as f:
+                    f.write(b"abcd")
+
+            class _FM:
+                base_path = base
+
+                def get_file_name(self, key):
+                    # Only the good key names the file it was reconstructed from.
+                    if bytes(key) == good_key:
+                        return good
+                    return os.path.join(root, "elsewhere.bin")
+
+            a = dsv4_shard_tier.ShardAgent.__new__(dsv4_shard_tier.ShardAgent)
+            a._rank = 0
+            a._slice_bytes = 4
+            a._direct_layout = None
+            a._direct_cell = 0
+            a._mapper = _FM()
+            # A key that does not round-trip through FileMapper would be counted
+            # as resident by the head but can never be served: re-storing the
+            # block is cheap, adopting a phantom is not.
+            self.assertEqual(a._inventory(), [good_key])
+
+
+@unittest.skipIf(dsv4_vllm_patches is None, "vllm/zmq not importable")
+class TestDirectIoMapping(unittest.TestCase):
+    def setUp(self):
+        self._saved = dict(dsv4_vllm_patches._GPU_BLOCK_MAP)
+
+    def tearDown(self):
+        dsv4_vllm_patches._GPU_BLOCK_MAP.clear()
+        dsv4_vllm_patches._GPU_BLOCK_MAP.update(self._saved)
+
+    @staticmethod
+    def _spec(block_ids, group_sizes=None, block_indices=None):
+        return type(
+            "Spec",
+            (),
+            {
+                "block_ids": block_ids,
+                "group_sizes": group_sizes,
+                "block_indices": block_indices,
+            },
+        )()
+
+    def test_new_owner_of_a_slot_replaces_the_old_mapping(self):
+        staging = self._spec([5])
+        dsv4_vllm_patches._map_staging_to_gpu(
+            self._spec([10, 11], [2], [0]), staging, 2
+        )
+        self.assertEqual(dsv4_vllm_patches.get_gpu_blocks(5), [10, 11])
+        # The next job reuses slot 5 but carries no usable spec: its slots are
+        # forgotten, so the head cannot read the previous job's GPU blocks as
+        # this key's (that would gather/scatter KV belonging to another request).
+        dsv4_vllm_patches._map_staging_to_gpu(object(), staging, 2)
+        self.assertIsNone(dsv4_vllm_patches.get_gpu_blocks(5))
+
+    def test_shifted_mapping_is_not_recorded(self):
+        staging = self._spec([7])  # a 4-block group at F=2 needs 2 slots
+        dsv4_vllm_patches._map_staging_to_gpu(
+            self._spec([10, 11, 12, 13], [4], [0]), staging, 2
+        )
+        self.assertIsNone(dsv4_vllm_patches.get_gpu_blocks(7))
+
+    def test_null_sub_blocks_use_a_negative_sentinel(self):
+        dsv4_vllm_patches._map_staging_to_gpu(
+            self._spec([10], [1], [1]), self._spec([3]), 2
+        )
+        self.assertEqual(
+            dsv4_vllm_patches.get_gpu_blocks(3),
+            [dsv4_vllm_patches._NULL_BLOCK, 10],
+        )
 
 
 if __name__ == "__main__":

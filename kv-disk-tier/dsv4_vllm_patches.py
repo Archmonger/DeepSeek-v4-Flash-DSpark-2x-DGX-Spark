@@ -245,7 +245,22 @@ def _direct_store_disk(ctx, src_ptrs, dst_ptrs, sizes) -> None:
                     ),
                     shape=(int(sz[i]),),
                 )
-                os.pwrite(fd, buf, off)
+                # pwrite may legally write fewer bytes than requested (ENOSPC,
+                # RLIMIT_FSIZE, signal). The cell was pre-sized by ftruncate, so
+                # a short write leaves a zero-filled hole inside a
+                # correctly-SIZED file -- and every downstream check (agent
+                # store verify, inventory scan) only looks at the size, so the
+                # torn cell would be adopted and served as valid KV. Loop until
+                # the buffer is consumed, exactly as _transfer_exact does.
+                _done = 0
+                while _done < int(sz[i]):
+                    _n = os.pwrite(fd, buf[_done:], off + _done)
+                    if _n == 0:
+                        raise OSError(
+                            f"[dsv4-patch] short pwrite to {tmp}: "
+                            f"{_done}/{int(sz[i])} bytes"
+                        )
+                    _done += _n
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -1233,9 +1248,24 @@ def _multinode_guard_patched(self, *args, **kwargs):
     try:
         import torch
 
-        world = int(self.vllm_config.parallel_config.world_size)
+        # GLM53-ABC-PORT: a newer spec carries an OffloadingConfig on `.config`
+        # and no vllm_config at all. Reading only .vllm_config raised
+        # AttributeError, which the handler below treats as "detection failed"
+        # and passes -- so this guard FAILED OPEN on the new API, which is
+        # exactly when a head-only secondary tier must refuse. Resolve both
+        # shapes (same shim as DistributedShardTier.__init__).
+        _cfg = getattr(self, "config", None)
+        if _cfg is not None and hasattr(_cfg, "parallel"):
+            world = int(_cfg.parallel.world_size)
+        else:
+            world = int(self.vllm_config.parallel_config.world_size)
         local = int(torch.cuda.device_count() or 1)
-    except Exception:  # never block startup on a detection failure
+    except Exception as e:  # never block startup on a detection failure
+        logger.warning(
+            "[dsv4-patch] multinode guard could not determine world_size/local "
+            "GPUs (%r); building the disk tier UNCHECKED against the "
+            "peer-shard-is-zeros corruption mode", e,
+        )
         return _ORIG_TIERING_GET_MANAGER(self, *args, **kwargs)
 
     if world > local:
@@ -1370,6 +1400,23 @@ def apply_offload_budget() -> None:
 # ===========================================================================
 
 
+def _module_available(name: str) -> bool:
+    """True when `name` (and its parent packages) can be imported on this image.
+
+    Used to pick between vLLM runner generations: each image ships one of
+    ``vllm.v1.worker.gpu_model_runner`` (V1) or ``vllm.v1.worker.gpu.model_runner``
+    (V2). find_spec imports the parent packages, so a missing parent raises
+    ModuleNotFoundError -- "not on this image" -- while anything else propagates
+    instead of being swallowed as absence.
+    """
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(name) is not None
+    except ImportError:
+        return False
+
+
 def apply_all() -> None:
     global _PIN_DESCRIPTORS, _WAITSTREAM_ON_LOAD, _BATCH_LOG
     global _MAX_COPIES_PER_BATCH, _MAX_OFFLOAD_BLOCKS
@@ -1408,12 +1455,23 @@ def apply_all() -> None:
         apply_bug2_keepalive()
     # Opt-in: off by default until proven under the real MLA/DSpark kernels.
     if _flag("KV_DISK_CACHE_DIRECT_IO", "0"):
-        apply_host_kv_alloc()
-        try:
-            apply_host_kv_alloc_v2()
-        except ImportError:
-            # V1-only vLLM image: no vllm.v1.worker.gpu.model_runner module.
-            pass
+        # Each runner generation is optional and independent: the V1 runner
+        # module is absent on a V2-only image and vice versa (sitecustomize
+        # hooks BOTH paths for exactly that reason). Apply each only when its
+        # module is importable -- an unguarded V1 call raised ImportError out of
+        # apply_all, which is imported by dsv4_kv_disk_tier, and killed the
+        # engine at startup.
+        for _apply, _mod in (
+            (apply_host_kv_alloc, "vllm.v1.worker.gpu_model_runner"),
+            (apply_host_kv_alloc_v2, "vllm.v1.worker.gpu.model_runner"),
+        ):
+            if _module_available(_mod):
+                _apply()
+            else:
+                logger.info(
+                    "[dsv4-patch] hostkv: %s absent on this image; skipping "
+                    "that runner generation", _mod,
+                )
         apply_host_kv_direct_skip()
         apply_host_kv_direct_map()
 
@@ -1490,17 +1548,26 @@ def _verify_host_kv_tensors(tensors: dict) -> None:
     import ctypes as _ct
 
     sample = next(iter(tensors.values()))
-    ptr = sample.data_ptr()
+    ptr = int(sample.data_ptr())
+    # mincore(2) requires a page-aligned address on some kernels (EINVAL
+    # otherwise), and a tensor's data_ptr need not be page-aligned even though
+    # its allocation is -- a false failure here aborts KV init, because the
+    # caller re-raises. Probe the page the tensor starts in.
+    try:
+        _page = int(os.sysconf("SC_PAGE_SIZE"))
+    except (AttributeError, ValueError, OSError):
+        _page = 4096
+    probe = ptr & ~(_page - 1)
     libc = _ct.CDLL("libc.so.6", use_errno=True)
     mincore = libc.mincore
     mincore.argtypes = [_ct.c_void_p, _ct.c_size_t, _ct.POINTER(_ct.c_ubyte)]
     mincore.restype = _ct.c_int
     vec = (_ct.c_ubyte * 1)()
-    if mincore(_ct.c_void_p(ptr), _ct.c_size_t(1), vec) != 0:
+    if mincore(_ct.c_void_p(probe), _ct.c_size_t(1), vec) != 0:
         err = _ct.get_errno()
         raise RuntimeError(
             f"mincore probe failed (errno={err}) -- KV at 0x{ptr:x} "
-            "is not host-addressable"
+            f"(page 0x{probe:x}) is not host-addressable"
         )
     logger.info("[dsv4-patch] host-KV verified: CPU can address KV at 0x%x", ptr)
     # Dump the distinct backing tensors (deduped by data_ptr) so the
@@ -1627,19 +1694,40 @@ def apply_host_kv_alloc_v2() -> None:
 
 _GPU_BLOCK_MAP: dict[int, list[int]] = {}
 
+# Null/skipped sub-block sentinel. NOT 0: 0 is a valid GPU block id, so using
+# it as the sentinel silently replaced real block 0 with zeros on store and
+# discarded it on load.
+_NULL_BLOCK = -1
+
 
 def get_gpu_blocks(bid: int) -> list[int] | None:
     """Return the ordered GPU block ids for a staging slot, or None."""
     return _GPU_BLOCK_MAP.get(int(bid))
 
 
+def _forget_staging_slots(staging_spec) -> None:
+    """Drop any mapping recorded for the staging slots this spec names.
+
+    Staging slots are an LRU-reused namespace, so an entry left by an earlier
+    job is indistinguishable from a fresh one, and a caller that reads it gets
+    THAT job's GPU block ids for this key. Called before a job records its own
+    mapping and whenever a job produces none: a missing mapping already fails
+    the job safely on the head, a stale one silently corrupts KV.
+    """
+    for b in getattr(staging_spec, "block_ids", None) or ():
+        try:
+            _GPU_BLOCK_MAP.pop(int(b), None)
+        except (TypeError, ValueError):
+            continue
+
+
 def _map_staging_to_gpu(gpu_spec, staging_spec, block_size_factor: int) -> None:
-    """Record staging-slot -> [gpu block ids | 0] for one TransferJob's specs.
+    """Record staging-slot -> [gpu block ids | _NULL_BLOCK] for one TransferJob.
 
     Each slot's list is exactly block_size_factor entries long, in file order
-    (sub-block 0..F-1). A 0 entry marks a null/skipped sub-block whose bytes are
-    stale in the staging path; the direct I/O writes/reads zeros there and the
-    load side never reads them back, so their content is irrelevant.
+    (sub-block 0..F-1). A _NULL_BLOCK entry marks a null/skipped sub-block whose
+    bytes are stale in the staging path; the direct I/O writes/reads zeros there
+    and the load side never reads them back, so their content is irrelevant.
     """
     try:
         gpu_blocks = [int(b) for b in gpu_spec.block_ids]
@@ -1647,7 +1735,14 @@ def _map_staging_to_gpu(gpu_spec, staging_spec, block_size_factor: int) -> None:
         group_sizes = list(gpu_spec.group_sizes)
         block_indices = list(gpu_spec.block_indices)
     except (AttributeError, TypeError):
+        # This job cannot be mapped (e.g. a spec without group metadata). Drop
+        # the slots it owns rather than leave a previous job's ids in place.
+        _forget_staging_slots(staging_spec)
         return
+    # These slots belong to THIS job now: retire the previous owner's mapping
+    # before recording anything, so a partially-built map can never be read as
+    # this job's.
+    _forget_staging_slots(staging_spec)
     F = max(1, int(block_size_factor or 0))
     src_off = 0
     dst_off = 0
@@ -1663,15 +1758,52 @@ def _map_staging_to_gpu(gpu_spec, staging_spec, block_size_factor: int) -> None:
             sub = []
             for j in range(F):
                 p = start + j
-                sub.append(int(group_src[p]) if 0 <= p < group_size else 0)
+                sub.append(
+                    int(group_src[p]) if 0 <= p < group_size else _NULL_BLOCK
+                )
             _GPU_BLOCK_MAP[int(slot)] = sub
         src_off += group_size
         dst_off += dst_count
+    # Cardinality. The grouping math above re-derives
+    # SingleDirectionOffloadingHandler.transfer_async's layout, and if it
+    # diverges from the real one every recorded slot is shifted relative to the
+    # GPU blocks the copy engine will use -- silent cross-request corruption
+    # under KV_DISK_CACHE_DIRECT_IO=1. The two namespaces must be consumed
+    # exactly; when they are not, record NOTHING for this job (the head treats a
+    # missing mapping as "fail this job safely") instead of a wrong mapping.
+    if dst_off != len(staging) or src_off != len(gpu_blocks):
+        _forget_staging_slots(staging_spec)
+        logger.error(
+            "[dsv4-patch] direct-I/O mapping does not consume both block specs "
+            "exactly (staging %d/%d, gpu %d/%d, F=%d): refusing to record a "
+            "possibly-shifted slot->GPU-block map for this job; its direct I/O "
+            "will fail safely. Re-derive against vLLM's transfer_async.",
+            dst_off, len(staging), src_off, len(gpu_blocks), F,
+        )
 
 
 _BLOCK_SIZE_FACTOR = 1
 _SLOT_TO_KEY: dict[int, bytes] = {}  # scheduler process: staging slot -> key
 _JOB_KEYS: dict[int, list] = {}  # worker process: connector job_id -> ordered keys
+
+# Bound on _JOB_KEYS. Keys are only needed between prepare_store_kv and the
+# job's transfer_async; a job that never reaches transfer_async would otherwise
+# leak its entry for the process lifetime.
+_JOB_KEYS_MAX = 4096
+
+
+def _prune_job_keys() -> None:
+    """Drop the oldest _JOB_KEYS entries once the registry exceeds its bound.
+
+    Connector job ids increase monotonically, so the oldest entries are the
+    stale ones (already consumed by transfer_async, or never going to be).
+    Same intent as _offload_budget_prune: keep the registry proportional to
+    in-flight work instead of cumulative requests.
+    """
+    if len(_JOB_KEYS) <= _JOB_KEYS_MAX:
+        return
+    for job_id in list(_JOB_KEYS)[: len(_JOB_KEYS) - _JOB_KEYS_MAX]:
+        del _JOB_KEYS[job_id]
 
 
 def apply_host_kv_direct_map() -> None:
@@ -1731,6 +1863,13 @@ def apply_host_kv_direct_map() -> None:
             gpu_spec, staging_spec = dst_spec, src_spec
             is_store = False
         else:
+            # No GPU spec on this job, so it records no mapping -- but its
+            # staging slots are reused later, and an entry left by a previous
+            # job under one of them would be read as this job's GPU blocks
+            # (silent cross-request corruption under DIRECT_IO=1). Drop them.
+            for _spec in (src_spec, dst_spec):
+                if isinstance(_spec, BlockIDsLoadStoreSpec):
+                    _forget_staging_slots(_spec)
             return
         if isinstance(staging_spec, BlockIDsLoadStoreSpec):
             _map_staging_to_gpu(gpu_spec, staging_spec, _BLOCK_SIZE_FACTOR)
@@ -1839,6 +1978,7 @@ def apply_host_kv_direct_skip() -> None:
     def _patched_psk(self, metadata):
         for job_id, entry in metadata.store_jobs.items():
             _JOB_KEYS[job_id] = getattr(entry, "_dsv4_keys", None)
+        _prune_job_keys()
         return _orig_psk(self, metadata)
 
     CPUOffloadingWorker.__init__ = _init

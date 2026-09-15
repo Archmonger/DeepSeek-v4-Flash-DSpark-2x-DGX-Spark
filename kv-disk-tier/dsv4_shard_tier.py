@@ -186,6 +186,17 @@ def _aligned(offset: int, nbytes: int) -> bool:
 def _store_one(path: str, mv: memoryview, offset: int, nbytes: int) -> None:
     """Write this node's slice of one block, atomically."""
     global _ODIRECT_OK
+    # memoryview slicing CLAMPS, so an out-of-range offset yields a short or
+    # empty view: the write loop below would then spin forever on an empty
+    # buffer (os.write of nothing returns 0) or publish a truncated file that
+    # still passes the size-only inventory scan. Fail the job instead of
+    # wedging a pool thread. Same shape as dsv4_vllm_patches._byte_slice, which
+    # exists for this same trap.
+    if offset < 0 or nbytes < 0 or offset + nbytes > mv.nbytes:
+        raise OSError(
+            f"store slice out of range: offset={offset} nbytes={nbytes} "
+            f"region={mv.nbytes}"
+        )
     # Unique per writer: a fixed "<path>.tmp" lets two threads from the 16-thread
     # pool interleave writes into one temp file and then both rename it, which
     # publishes a block built from two different sources under a valid key.
@@ -235,6 +246,13 @@ def _store_one(path: str, mv: memoryview, offset: int, nbytes: int) -> None:
 def _load_one(path: str, mv: memoryview, offset: int, nbytes: int) -> None:
     """Read this node's slice of one block back into its /dev/shm slot."""
     global _ODIRECT_OK
+    # Symmetric with _store_one: a clamped dst would make readv() return 0 and
+    # report a short read for what is really a geometry error.
+    if offset < 0 or nbytes < 0 or offset + nbytes > mv.nbytes:
+        raise OSError(
+            f"load slice out of range: offset={offset} nbytes={nbytes} "
+            f"region={mv.nbytes}"
+        )
     dst = mv[offset : offset + nbytes]
     direct = _aligned(offset, nbytes)
     try:
@@ -451,7 +469,23 @@ class ShardAgent:
         # offsets every read/write inside each slot -- silent cross-slot
         # corruption, not a crash.
         _computed_row = self._slice_bytes * int(world_size)
-        self._row_stride = int(getattr(region, "_row_stride", _computed_row))
+        # Fail closed when the region does not expose its stride. The computed
+        # value is only right when the row carries no inter-worker padding, and
+        # this change builds the region with kv_bytes_per_block and cpu_page_size
+        # as INDEPENDENT parameters -- the cell is rounded up to
+        # BLOCK_SIZE_ALIGNMENT while the slice is not (dsv4_kv_disk_tier's
+        # geometry) -- so padding is the expected case here, not a hypothetical.
+        # Substituting it would offset every read and write inside the slot:
+        # silent cross-slot corruption, not a crash.
+        _region_row = getattr(region, "_row_stride", None)
+        if _region_row is None:
+            raise RuntimeError(
+                "SharedOffloadRegion exposes no _row_stride, so this node's shard "
+                f"geometry cannot be derived (slice={self._slice_bytes} B, "
+                f"world={int(world_size)}). Refusing to guess a row stride: a "
+                "wrong one mis-offsets every block instead of failing."
+            )
+        self._row_stride = int(_region_row)
         # Must match SharedOffloadRegion's own arithmetic. region.rank is the
         # LOCAL device index; _worker_offset drifts as create_next_view() is
         # called, so recompute rather than reading it back.
@@ -587,10 +621,12 @@ class ShardAgent:
 
         ``gpu_blocks`` is the ORDERED list of GPU block ids this cell holds
         (one entry per sub-block, computed by the scheduler and forwarded by
-        the head). A 0 entry is a null/skipped sub-block: for a store it is
+        the head). A -1 entry is a null/skipped sub-block: for a store it is
         filled from an immutable zero buffer; for a load it is discarded into a
         separate mutable buffer. NOT a staging slot id -- staging slots are an
-        LRU-reused namespace that never corresponds to GPU block addresses.
+        LRU-reused namespace that never corresponds to GPU block addresses, and
+        NOT 0 either, which is a valid GPU block id (see
+        dsv4_vllm_patches._NULL_BLOCK).
         """
         if not gpu_blocks:
             # The staging copy was skipped (direct mode), so a missing mapping
@@ -605,7 +641,7 @@ class ShardAgent:
         iov = []
         for ptr, stride, size in self._direct_layout:
             for g in gpu_blocks:
-                if int(g) > 0:
+                if int(g) >= 0:
                     iov.append((ptr + int(g) * stride, size))
                 else:
                     iov.append((zaddr, size))
@@ -625,6 +661,7 @@ class ShardAgent:
         """
         found: list[tuple[float, bytes]] = []
         root = f"{self._mapper.base_path}_r{self._rank}"
+        dropped = 0
         try:
             for dirpath, _dirs, files in os.walk(root):
                 group_part = os.path.basename(dirpath)
@@ -663,12 +700,35 @@ class ShardAgent:
                         h = bytes.fromhex(fn[: -len(".bin")])
                     except ValueError:
                         continue
-                    found.append(
-                        (st.st_mtime, h + group_idx.to_bytes(4, "big", signed=False))
-                    )
+                    # Round-trip the reconstructed key through FileMapper rather
+                    # than trusting the layout parsed above. FileMapper owns the
+                    # naming scheme, and the head counts every adopted key as
+                    # resident: a key that does not name the file it came from is
+                    # either dead capacity (lookup() can never hit it) or, worse,
+                    # a key for a different block. Re-storing such a block is
+                    # cheap; adopting a phantom is not.
+                    _key = h + group_idx.to_bytes(4, "big", signed=False)
+                    _path = os.path.join(dirpath, fn)
+                    try:
+                        _rt = self._mapper.get_file_name(OffloadKey(_key))
+                    except Exception:
+                        dropped += 1
+                        continue
+                    if os.path.abspath(_rt) != os.path.abspath(_path):
+                        dropped += 1
+                        continue
+                    found.append((st.st_mtime, _key))
         except OSError as e:
             logger.warning("[dsv4-shard] inventory scan of %s failed: %s", root, e)
             return []
+        if dropped:
+            logger.warning(
+                "[dsv4-shard] inventory: dropped %d file(s) under %s whose "
+                "reconstructed key does not round-trip through "
+                "FileMapper.get_file_name; they will be re-stored instead of "
+                "adopted (the on-disk naming scheme has drifted)",
+                dropped, root,
+            )
         found.sort(key=lambda t: t[0])
         return [k for _m, k in found]
 
@@ -707,6 +767,10 @@ class ShardAgent:
                                 "[dsv4-shard] agent failed to handle a frame: %s",
                                 e,
                             )
+                            # A store/load frame that raised before its pool
+                            # enqueue has done no I/O, so the job must be failed
+                            # explicitly -- not held until the double timeout.
+                            self._ack_frame_failure(sock, raw, e)
                 for job_id, ok, *_ in self._pool.get_finished():  # GLM53-POOL-UNPACK: now (job_id, ok, transfer_time)
                     if not ok:
                         self._n_fail += 1
@@ -833,6 +897,33 @@ class ShardAgent:
         elif kind == "bye":
             self._stop = True
 
+    def _ack_frame_failure(self, sock, raw: bytes, err: Exception) -> None:
+        """Ack ok=False for a store/load frame that raised before enqueueing.
+
+        Without this the head's job just sits: it waits the full double timeout
+        (2 x job_timeout_s) while holding its primary-tier slots pinned, because
+        a job that is never acked never completes. The failure is already real;
+        only the head's knowledge of it is missing.
+        """
+        try:
+            msg = _DEC.decode(raw)
+        except Exception:
+            return
+        if msg.get("t") not in ("store", "load") or "job" not in msg:
+            return
+        try:
+            sock.send(_ENC.encode({"t": "ack", "job": int(msg["job"]), "ok": False}))
+        except Exception as send_err:
+            logger.error(
+                "[dsv4-shard] failed to ack failed job %s: %s", msg["job"], send_err
+            )
+            return
+        logger.warning(
+            "[dsv4-shard] job %s failed agent-side before any I/O (%r); acked "
+            "ok=False so the head releases it now instead of at timeout",
+            msg["job"], err,
+        )
+
 
 def _bind(fn, *args):
     return lambda: fn(*args)
@@ -854,9 +945,11 @@ def _lookup_gpu_blocks(bid: int):
     """Return the ordered GPU block ids for a staging slot (direct host-KV I/O).
 
     The scheduler records the mapping via dsv4_vllm_patches.apply_host_kv_direct_map;
-    the head (same process) forwards it here. Returns None when direct mode is
-    off or the slot has no recorded mapping (then the agent falls back to the
-    staging path).
+    the head (same process) forwards it here. Returns None when direct mode is off
+    or the slot has no recorded mapping. Under direct I/O a missing mapping is
+    NOT recoverable by falling back to the staging path: the staging copy was
+    skipped, so those bytes were never written. The agent fails the job instead
+    (see ShardAgent._direct_iovecs).
     """
     try:
         import dsv4_vllm_patches as _p
@@ -885,10 +978,13 @@ class _JobAcc:
         self.keys = keys
         self.is_promotion = is_promotion
         self.deadline = deadline
-        # Set on the FIRST timeout: the job is abandoned (results discarded)
-        # but still held so a live agent's in-flight I/O can finish touching its
-        # staging slots before the primary tier reuses them. A second timeout
-        # means the agents are presumed dead and the job is force-failed.
+        # Set on the FIRST timeout: the job has stopped waiting on its original
+        # deadline but is still HELD so a live agent's in-flight I/O can finish
+        # touching its staging slots before the primary tier reuses them. If it
+        # completes inside the grace window its result IS delivered (success or
+        # failure) -- that is the safer outcome, because the primary tier
+        # releases the blocks on a real completion. A second timeout means the
+        # agents are presumed dead and the job is force-failed.
         self.abandoned = False
 
 
@@ -917,14 +1013,19 @@ class DistributedShardTier(SecondaryTierManager):
         if _cfg is not None and hasattr(_cfg, "parallel"):
             self._num_agents = int(_cfg.parallel.world_size)
             # cpu_page_size_per_worker, NOT worker_kv_bytes_per_block: the
-            # latter is the region's ROW stride and omits per-worker padding.
-            self._slice_bytes = int(
-                getattr(
-                    offloading_spec,
-                    "cpu_page_size_per_worker",
-                    _cfg.worker_kv_bytes_per_block,
+            # latter is the region's ROW stride -- every worker plus any
+            # alignment padding -- so using it as the slice length would
+            # mis-offset every block. Fail closed if it is missing instead of
+            # substituting a quantity the comment above calls wrong (the
+            # older-API branch below already treats it as required).
+            _slice = getattr(offloading_spec, "cpu_page_size_per_worker", None)
+            if not _slice:
+                raise RuntimeError(
+                    "offloading spec exposes no cpu_page_size_per_worker on this "
+                    "vLLM; refusing to guess the per-worker KV slice from the "
+                    "region's row stride"
                 )
-            )
+            self._slice_bytes = int(_slice)
         else:  # older vLLM (DeepSeek image)
             pc = offloading_spec.vllm_config.parallel_config
             self._num_agents = int(pc.world_size)
@@ -990,6 +1091,20 @@ class DistributedShardTier(SecondaryTierManager):
                 return False
         return True
 
+    def _send_rehello(self, ident: bytes, gen: int) -> None:
+        """Ask ONE agent to re-report for the round in flight.
+
+        Used when a hello arrives for a round it was not registered for: the
+        round's broadcast went out before this identity existed, so nothing else
+        would ever ask it to report (see _on_hello).
+        """
+        try:
+            self._sock.send_multipart(
+                [ident, _ENC.encode({"t": "rehello", "gen": int(gen)})]
+            )
+        except zmq.ZMQError as e:
+            logger.error("[dsv4-shard] rehello to %s failed: %s", ident, e)
+
     def _drain(self) -> None:
         while True:
             try:
@@ -1015,14 +1130,52 @@ class DistributedShardTier(SecondaryTierManager):
 
     def _on_hello(self, ident: bytes, msg: dict) -> None:
         rank = int(msg["rank"])
+        prev_rank = self._identities.get(ident)
+        if prev_rank is not None and int(prev_rank) != rank:
+            logger.error(
+                "[dsv4-shard] identity %r helloed as rank %d but is registered "
+                "as rank %d; check the per-node rank assignment",
+                ident, rank, int(prev_rank),
+            )
+        for _other, _r in self._identities.items():
+            if _other != ident and int(_r) == rank:
+                # _hellos is keyed by rank, so two identities claiming one rank
+                # collapse to a single entry: the tier can never reach READY
+                # (len(_hellos) < _num_agents) and nothing else distinguishes
+                # this from an agent that has not started yet.
+                logger.error(
+                    "[dsv4-shard] duplicate rank %d: identity %r is already "
+                    "registered as rank %d, so this hello for %r cannot be "
+                    "counted (%d/%d agents up) -- two agents are claiming one "
+                    "rank",
+                    rank, _other, int(_r), ident, len(self._hellos),
+                    self._num_agents,
+                )
+                break
         self._identities[ident] = rank
 
         # Ignore hellos from an older round: a late rehello reply must not
-        # restart reconciliation after READY, and a spontaneous hello that raced
-        # a reconnect must not be counted into the new round.
+        # restart reconciliation after READY. Two cases are NOT ignorable, and
+        # dropping them is what left the tier stuck below READY:
+        #   * not READY: a round is in flight, this identity was not registered
+        #     when the round's rehello broadcast went out (an agent that
+        #     (re)started mid-round), so nothing would ever ask it to report.
+        #     Re-poll it alone; the next hello carries the current gen.
+        #   * READY and gen absent: a spontaneous hello is an agent (re)start
+        #     whose inventory may have changed, so it must re-reconcile (the
+        #     branch below). A gen-bearing late reply stays ignored.
         gen = int(msg.get("gen", 0))
         if gen < self._epoch:
-            return
+            if not self._ready:
+                logger.warning(
+                    "[dsv4-shard] agent rank=%d helloed with gen=%d while round "
+                    "%d was in flight; re-polling that identity so the round can "
+                    "complete", rank, gen, self._epoch,
+                )
+                self._send_rehello(ident, self._epoch)
+                return
+            if gen != 0:
+                return
 
         # A re-registration after READY means an agent reconnected with a
         # possibly-changed inventory (e.g. its process restarted). The
@@ -1303,12 +1456,15 @@ class DistributedShardTier(SecondaryTierManager):
                 if now <= acc.deadline:
                     continue
                 if not acc.abandoned:
-                    # First timeout: discard the result but HOLD the job so a
-                    # live agent's queued/running I/O can still finish touching
-                    # its staging slots. Releasing now would let the primary
-                    # tier hand those slots to a new job while the old read/write
-                    # is still in flight. Give the agents one more full window
-                    # to ack; a live agent acks as soon as its I/O completes.
+                    # First timeout: stop waiting on the original deadline but
+                    # HOLD the job so a live agent's queued/running I/O can still
+                    # finish touching its staging slots. Releasing now would let
+                    # the primary tier hand those slots to a new job while the
+                    # old read/write is still in flight. A result produced during
+                    # the grace window is still delivered normally; only a
+                    # second timeout force-fails. Give the agents one more full
+                    # window to ack; a live agent acks as soon as its I/O
+                    # completes.
                     acc.abandoned = True
                     acc.deadline = now + self._job_timeout_s
                     logger.warning(
@@ -1456,14 +1612,16 @@ def maybe_start_shard_agent(offloading_spec, handlers) -> None:
         _world_size = int(_cfg.parallel.world_size)
         _global_rank = int(_cfg.parallel.rank)
         # See DistributedShardTier.__init__: the per-worker slice is
-        # cpu_page_size_per_worker; worker_kv_bytes_per_block is the row stride.
-        _slice_bytes = int(
-            getattr(
-                offloading_spec,
-                "cpu_page_size_per_worker",
-                _cfg.worker_kv_bytes_per_block,
+        # cpu_page_size_per_worker; worker_kv_bytes_per_block is the row stride
+        # (every worker plus alignment padding), so it is not a substitute.
+        _slice = getattr(offloading_spec, "cpu_page_size_per_worker", None)
+        if not _slice:
+            raise RuntimeError(
+                "[dsv4-shard] offloading spec exposes no "
+                "cpu_page_size_per_worker on this vLLM; refusing to guess the "
+                "per-worker KV slice from the region's row stride"
             )
-        )
+        _slice_bytes = int(_slice)
     else:  # older vLLM (DeepSeek image)
         pc = offloading_spec.vllm_config.parallel_config
         _world_size = int(pc.world_size)

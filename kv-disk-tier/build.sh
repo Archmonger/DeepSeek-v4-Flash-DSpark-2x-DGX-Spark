@@ -18,6 +18,10 @@ IMG="${IMG:-vllm-dspark-runtime:dspark-nvfp4-stage-c}"
 ARCH="${ARCH:-sm_121a}"     # GB10. Use sm_120a on consumer Blackwell.
 
 docker run --rm --gpus all -v "$KV_SRC":/src --entrypoint bash "$IMG" -lc "
+  # -e/-o pipefail: without them a failing first nvcc is masked by the second
+  # nvcc and by the final ls, so the container reports a build failure whose
+  # message points at ls instead of at the compile error that caused it.
+  set -e -o pipefail
   export PATH=/opt/env/bin:\$PATH
   export LD_LIBRARY_PATH=/opt/env/lib:/opt/env/targets/sbsa-linux/lib:\$LD_LIBRARY_PATH
   nvcc -O3 -arch=$ARCH -shared -Xcompiler -fPIC \

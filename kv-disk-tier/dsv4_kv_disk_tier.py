@@ -106,9 +106,15 @@ def _load_block_buffered(
     Two deliberate differences from the stock implementation:
       1. No ``O_DIRECT`` -- see CappedFileSystemTierManager.submit_load for the
          alignment arithmetic that makes the stock read fail with EINVAL.
-      2. No ``os.remove(source_path)`` on failure. Stock io.py deletes the block
-         file when a read raises, which turns a transient I/O error into
-         permanent cache loss.
+      2. The block file is retired only after THIS buffered attempt has failed,
+         which is the same rule the patched ``load_block`` uses (dsv4_vllm_patches
+         BUG1-IO: direct read, then buffered retry, then remove). A block that
+         cannot be read must not stay on disk: the parent's lookup() is a bare
+         ``os.path.exists()``, so a permanently unreadable file returns HIT,
+         fails the promotion, and is re-promoted forever for every request whose
+         prefix touches it -- the file livelocks instead of being evicted. The
+         stock "remove on the first raise" was wrong for a different reason: it
+         let one transient error destroy the block.
     Loops on short reads rather than assuming one readv() drains the file.
     """
     try:
@@ -118,18 +124,40 @@ def _load_block_buffered(
                 f"block_size={block_size} region={view.nbytes}"
             )
         view_slice = view.cast("B")[offset : offset + block_size]
-        fd = os.open(source_path, os.O_RDONLY)
         try:
-            n = 0
-            while n < block_size:
-                r = os.readv(fd, [view_slice[n:]])
-                if r == 0:
-                    raise OSError(
-                        f"short read of {source_path}: {n}/{block_size} bytes"
-                    )
-                n += r
-        finally:
-            os.close(fd)
+            fd = os.open(source_path, os.O_RDONLY)
+            try:
+                n = 0
+                while n < block_size:
+                    r = os.readv(fd, [view_slice[n:]])
+                    if r == 0:
+                        raise OSError(
+                            f"short read of {source_path}: {n}/{block_size} bytes"
+                        )
+                    n += r
+            finally:
+                os.close(fd)
+        except OSError as read_err:
+            # Retire the unreadable block so lookup() stops reporting a hit for
+            # it. The manager drops the LRU/byte accounting once this job is
+            # reported failed (it owns _lru/_total_bytes). A missing file is
+            # already out of the way; anything else is reported, not hidden.
+            try:
+                os.remove(source_path)
+            except FileNotFoundError:
+                pass
+            except OSError as cleanup_exc:
+                logger.warning(
+                    "CappedFileSystemTier: could not retire unreadable %s: %s",
+                    source_path,
+                    cleanup_exc,
+                )
+            logger.warning(
+                "CappedFileSystemTier: retired unreadable block %s (%s)",
+                source_path,
+                read_err,
+            )
+            raise
     except BaseException as e:
         # Count and SURFACE failures. Stock io.py swallowed the cause into a
         # generic thread-pool log line; without this the promotion path is
@@ -389,7 +417,10 @@ class CappedFileSystemTierManager(FileSystemTierManager):
         Worse, stock io.py then ``os.remove()``s the source file on failure and
         the manager calls ``complete_write(success=False)``, which frees the CPU
         entry too -- so each attempt DESTROYED the cached block in both tiers.
-        This override drops O_DIRECT and never deletes on failure.
+        This override drops O_DIRECT. It does not delete on a failed read
+        either: retirement is deferred to ``_load_block_buffered``, which removes
+        the file only after its own buffered attempt has failed, so a transient
+        error cannot destroy a good block and a permanent one cannot livelock.
         """
         # A load is a use: keep these blocks hot.
         paths = [self.file_mapper.get_file_name(k) for k in job_metadata.keys]
@@ -410,13 +441,23 @@ class CappedFileSystemTierManager(FileSystemTierManager):
         )
         self._pool.enqueue_load(job_metadata.job_id, len(job_metadata.keys), tasks)
 
-    def get_finished_jobs(self):
+    def get_finished(self):
         """Poll completions and release load pins before they can block eviction.
 
         A block stays pinned from submit_load() until its job reports finished,
         so _evict_for() can never unlink a file a read thread is about to open.
         """
-        for result in super().get_finished_jobs():
+        try:
+            # Newer vLLM renamed this hook to get_finished_jobs, and the parent
+            # may carry only one of the two names. Resolving it here is what
+            # makes the override actually run on the older (DeepSeek-image)
+            # vLLM, which calls get_finished(): with only get_finished_jobs
+            # defined, the pins were never released and _evict_for() found every
+            # resident block pinned, silently bypassing the byte cap.
+            parent_get_finished = super().get_finished_jobs
+        except AttributeError:  # older vLLM (DeepSeek image)
+            parent_get_finished = super().get_finished
+        for result in parent_get_finished():
             paths = self._load_job_keys.pop(result.job_id, None)
             if paths:
                 with self._lock:
@@ -426,16 +467,35 @@ class CappedFileSystemTierManager(FileSystemTierManager):
                             self._pinned.pop(p, None)
                         else:
                             self._pinned[p] = n
+                if not result.success:
+                    # _load_block_buffered retired the unreadable file(s), so
+                    # the LRU must forget them too: leaving them accounted would
+                    # charge the cap for bytes that are gone. Checked on disk
+                    # because a concurrent store of the same key may have
+                    # re-created them (its _account already counted the bytes).
+                    with self._lock:
+                        for p in paths:
+                            if p in self._lru and not os.path.exists(p):
+                                self._total_bytes -= self._lru.pop(p)
             # A failed store never landed its file, but submit_store already
             # accounted its bytes optimistically; drop the phantom entry so
-            # _total_bytes and the LRU do not drift after a write error.
+            # _total_bytes and the LRU do not drift after a write error. Same
+            # on-disk check as above: a later successful store of the same key
+            # re-added the path, and un-accounting it would orphan real bytes
+            # (invisible to the cap, therefore never evicted, and never
+            # rewritten because lookup() keeps hitting them).
             store_paths = self._store_job_keys.pop(result.job_id, None)
             if store_paths is not None and not result.success:
                 with self._lock:
                     for p in store_paths:
-                        if p in self._lru:
+                        if p in self._lru and not os.path.exists(p):
                             self._total_bytes -= self._lru.pop(p)
             yield result
+
+    # GLM53-ABC-PORT: newer vLLM renamed this hook; both names stay bound so the
+    # pin retirement above runs on either vLLM generation (see get_finished).
+    def get_finished_jobs(self):
+        return self.get_finished()
 
     def stats(self) -> dict:
         with self._lock:

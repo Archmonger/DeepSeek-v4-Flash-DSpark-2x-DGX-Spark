@@ -33,7 +33,16 @@ void* dsv4_host_malloc(ssize_t size, int device, cudaStream_t stream) {
     // Bind the allocation to the right device before pinning, so the mapping lands in
     // this device's page tables rather than whichever context happens to be current.
     int prev = -1;
-    cudaGetDevice(&prev);
+    if (cudaGetDevice(&prev) != cudaSuccess) {
+        // Without the current device the restore below is skipped, so a device switch
+        // would be permanent for the rest of the process and later allocations would
+        // land on the wrong device. Fail the allocation instead (torch raises a clean
+        // OOM) -- a silently misfiled KV allocation is the worse outcome.
+        fprintf(stderr, "[dsv4-host-kv] cudaGetDevice failed: %s\n",
+                cudaGetErrorString(cudaGetLastError()));
+        fflush(stderr);
+        return nullptr;
+    }
     if (device >= 0 && device != prev) cudaSetDevice(device);
 
     void* p = nullptr;
@@ -57,6 +66,15 @@ void* dsv4_host_malloc(ssize_t size, int device, cudaStream_t stream) {
 }
 
 // torch calls this as: void free(void* ptr, ssize_t size, int device, cudaStream_t stream)
+//
+// LIFETIME ASSUMPTION (unsupported for transient tensors). cudaFreeHost is host
+// synchronous, not device synchronous: it does not wait for work already enqueued on
+// `stream` (which is ignored here). This allocator is used for the KV cache, which is
+// allocated once and held for the process lifetime, so no GPU read can still be in
+// flight against a freed block. A short-lived tensor freed while the GPU is still
+// reading it WOULD be a use-after-free; such a caller must synchronize the reading
+// stream before freeing, which this function deliberately does not do (a per-free
+// stream sync would be wrong for the pool it currently backs).
 void dsv4_host_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
     (void)size; (void)device; (void)stream;
     if (ptr) cudaFreeHost(ptr);
