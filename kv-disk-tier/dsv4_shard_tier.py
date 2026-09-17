@@ -968,7 +968,7 @@ class _JobAcc:
     """Completion accumulator for one job, across all nodes."""
 
     __slots__ = ("need", "acks", "ok", "deadline", "keys", "is_promotion",
-                 "abandoned")
+                 "abandoned", "acked")
 
     def __init__(self, need: int, keys: list[bytes], is_promotion: bool,
                  deadline: float) -> None:
@@ -986,6 +986,12 @@ class _JobAcc:
         # releases the blocks on a real completion. A second timeout means the
         # agents are presumed dead and the job is force-failed.
         self.abandoned = False
+        # ZMQ identities that have acked this job. Completion means `need`
+        # DISTINCT participants acked, not `need` frames: a single misbehaving
+        # or duplicate identity could otherwise satisfy the all-nodes barrier
+        # and let the primary tier release slots before every peer actually
+        # finished its I/O.
+        self.acked: set[bytes] = set()
 
 
 class DistributedShardTier(SecondaryTierManager):
@@ -1126,7 +1132,7 @@ class DistributedShardTier(SecondaryTierManager):
             if kind == "hello":
                 self._on_hello(ident, msg)
             elif kind == "ack":
-                self._on_ack(int(msg["job"]), bool(msg["ok"]))
+                self._on_ack(int(msg["job"]), bool(msg["ok"]), ident)
 
     def _on_hello(self, ident: bytes, msg: dict) -> None:
         rank = int(msg["rank"])
@@ -1262,11 +1268,19 @@ class DistributedShardTier(SecondaryTierManager):
             len(self._present), self._num_agents, self._bytes / (1 << 30),
         )
 
-    def _on_ack(self, job_id: int, ok: bool) -> None:
+    def _on_ack(self, job_id: int, ok: bool, ident: bytes) -> None:
         acc = self._jobs.get(job_id)
         if acc is None:
             return
-        acc.acks += 1
+        # Count DISTINCT senders, not frames. The all-nodes barrier must mean
+        # `need` distinct participants completed; counting raw frames lets one
+        # identity satisfying the quota by itself (a duplicate ack, a
+        # reconnect re-sending an old ack, or a buggy/duplicate identity)
+        # release the primary-tier slots before every peer finished its I/O.
+        if ident in acc.acked:
+            return
+        acc.acked.add(ident)
+        acc.acks = len(acc.acked)
         acc.ok = acc.ok and ok
         if acc.acks < acc.need:
             return

@@ -43,12 +43,35 @@ void* dsv4_host_malloc(ssize_t size, int device, cudaStream_t stream) {
         fflush(stderr);
         return nullptr;
     }
-    if (device >= 0 && device != prev) cudaSetDevice(device);
+    // cudaSetDevice is just as fallible as cudaGetDevice and the failure mode is the
+    // same: the pinning below would land in whichever context happens to be current
+    // instead of the requested device, silently misfiling the allocation. Check both
+    // switches and fail closed rather than pinning to the wrong device.
+    if (device >= 0 && device != prev) {
+        if (cudaSetDevice(device) != cudaSuccess) {
+            fprintf(stderr, "[dsv4-host-kv] cudaSetDevice(%d) failed: %s\n",
+                    device, cudaGetErrorString(cudaGetLastError()));
+            fflush(stderr);
+            return nullptr;
+        }
+    }
 
     void* p = nullptr;
     cudaError_t e = cudaHostAlloc(&p, (size_t)size, cudaHostAllocDefault);
 
-    if (prev >= 0 && device >= 0 && device != prev) cudaSetDevice(prev);
+    // Restore the original device before reporting any failure. A failed restore
+    // would leave the process pinned to the allocation device for later calls, so it
+    // must also fail the allocation (and free the pinned block, which torch would
+    // otherwise never see).
+    if (prev >= 0 && device >= 0 && device != prev) {
+        if (cudaSetDevice(prev) != cudaSuccess) {
+            fprintf(stderr, "[dsv4-host-kv] cudaSetDevice(%d) restore failed: %s\n",
+                    prev, cudaGetErrorString(cudaGetLastError()));
+            fflush(stderr);
+            if (p) cudaFreeHost(p);
+            return nullptr;
+        }
+    }
 
     if (e != cudaSuccess || p == nullptr) {
         // Returning null makes torch raise a clean OOM instead of corrupting silently.

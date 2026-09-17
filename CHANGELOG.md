@@ -1,3 +1,10 @@
+## 2026-09-17
+
+### Fixed
+- **`kv-disk-tier` failed retirement of an unreadable block no longer livelocks promotion**: in `dsv4_kv_disk_tier.py`, when `_load_block_buffered` could not remove an unreadable block file (`os.remove` raised), the surviving file kept the parent's bare `os.path.exists()` lookup reporting a HIT, so every request touching that block re-promoted the same unusable block forever. Failed loads now drop the block from LRU/byte accounting and quarantine it, so `lookup()` returns MISS until a fresh store rewrites the file; the un-account is skipped when a concurrent store is rewriting the same key. CPU coverage adds the quarantine, store-un-quarantine and concurrent-store cases.
+- **`kv-disk-tier` completion barrier now requires distinct participants**: in `dsv4_shard_tier.py`, `_on_ack` counted raw ACK frames, so a single (or duplicate) identity could satisfy the all-nodes `need` and release the primary-tier slots before every peer finished its I/O. Ack counting now tracks the distinct ZMQ sender identities per job, and a duplicate sender is ignored. CPU coverage adds the duplicate-sender case.
+- **`dsv4_host_kv_alloc.cu` checks `cudaSetDevice` results**: the KV host allocator checked `cudaGetDevice` but ignored the outcome of both `cudaSetDevice` calls. A failed device switch could silently pin the allocation on (or leave the process pinned to) the wrong device. Both switches are now checked and fail closed, freeing the pinned block on a failed restore.
+
 ## 2026-09-15
 
 ### Fixed

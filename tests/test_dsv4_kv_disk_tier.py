@@ -28,6 +28,12 @@ The cases pin the specific bugs fixed over the life of this module:
     and used 0 both as a real GPU block id and as the null-sub-block sentinel.
   * slot invalidation took the truth of a real numpy ``block_ids``, which raised
     for a multi-slot spec and skipped the single slot 0.
+  * a failed load whose unreadable file could not be retired stayed eligible for
+    lookup (parent is a bare os.path.exists) and was re-promoted forever; it is
+    now forgotten and quarantined until a fresh store rewrites it.
+  * a job completed when enough ACK frames arrived, letting a single/duplicate
+    sender satisfy the all-nodes barrier; completion now requires ``need``
+    distinct sender identities.
 """
 from __future__ import annotations
 
@@ -207,6 +213,7 @@ def _jacc(need, keys, deadline, abandoned=False):
             "keys": keys,
             "is_promotion": False,
             "abandoned": abandoned,
+            "acked": set(),
         },
     )()
 
@@ -237,6 +244,26 @@ class TestRecoveryTransitions(unittest.TestCase):
         self.assertFalse(out[0].success)
         self.assertEqual(t._n_timeouts, 1)
         self.assertNotIn(1, t._jobs)
+
+    def test_completion_requires_distinct_senders(self):
+        # Completion must mean the required distinct participants completed, not
+        # that enough ACK frames arrived. A single (or duplicate) identity
+        # re-acking must not satisfy the all-nodes barrier and release the
+        # primary-tier slots before every peer finished its I/O.
+        t = make_head()
+        t._pinned = {b"a": 1}
+        t._present = OrderedDict([(b"a", None)])
+        t._bytes = SLICE
+        acc = _jacc(2, [b"a"], deadline=1e9)
+        t._jobs = {1: acc}
+        # Two ACKs from the same identity: only the first counts.
+        t._on_ack(1, True, b"id0")
+        t._on_ack(1, True, b"id0")
+        self.assertEqual(acc.acks, 1)
+        self.assertIn(1, t._jobs)  # not finished on a duplicate sender
+        # The lone distinct identity alone cannot satisfy need=2 either.
+        t._on_ack(1, True, b"id1")
+        self.assertNotIn(1, t._jobs)  # now 2 distinct senders -> done
 
     def test_reconcile_drops_partial_shards(self):
         t = make_head()
@@ -363,6 +390,9 @@ class TestFsCapped(unittest.TestCase):
         cm._pinned = {}
         cm._load_job_keys = {}
         cm._store_job_keys = {}
+        cm._store_all_keys = {}
+        cm._store_in_flight = set()
+        cm._unreadable = set()
         cm.file_mapper = type(
             "FM", (), {"get_file_name": lambda self, k: f"/x/{k}"}
         )()
@@ -445,6 +475,72 @@ class TestFsCapped(unittest.TestCase):
         self.assertNotIn(p, cm._lru)
         self.assertEqual(cm._total_bytes, 0)
         self.assertEqual(cm._pinned, {})
+
+    def test_failed_load_quarantines_unremovable_file(self):
+        # A block can remain eligible for lookup if retiring an unreadable file
+        # fails (e.g. os.remove raises): the parent's lookup() is a bare
+        # os.path.exists(), so the surviving file keeps reporting a HIT and the
+        # same unusable block is re-promoted forever. It must be forgotten AND
+        # quarantined so lookup() returns MISS until a fresh store rewrites it.
+        cm = self._make()
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "stuck.bin")
+            with open(p, "wb") as f:
+                f.write(b"x" * 100)
+            cm._lru = OrderedDict([(p, 100)])
+            cm._total_bytes = 100
+            cm._pinned = {p: 1}
+            cm._load_job_keys = {1: [p]}
+            # The file survives because retirement FAILED (not retired like the
+            # test above), so it is still present on disk -- the dangerous case.
+            Res = type("Res", (), {"job_id": 1, "success": False})
+            orig = FileSystemTierManager.get_finished_jobs
+            try:
+                FileSystemTierManager.get_finished_jobs = lambda self: iter([Res()])
+                list(cm.get_finished())
+            finally:
+                FileSystemTierManager.get_finished_jobs = orig
+            self.assertNotIn(p, cm._lru)
+            self.assertEqual(cm._total_bytes, 0)
+            self.assertIn(p, cm._unreadable)
+            # lookup() must report MISS for the quarantined path, not a HIT from
+            # the surviving unreadable file (whose bytes are present on disk).
+            cm.file_mapper = type(
+                "FM", (), {"get_file_name": lambda self, k: p}
+            )()
+            self.assertIs(cm.lookup("stuck.bin", None), LookupResult.MISS)
+            self.assertTrue(os.path.exists(p))  # the file really is still there
+
+    def test_store_unquarantines_a_failed_load_block(self):
+        # A fresh store rewrites the file, so a previous quarantine must not
+        # keep the manager blind to the now-readable block.
+        cm = self._make()
+        cm._unreadable = {"/x/k"}
+        cm._account(["/x/k"])
+        self.assertEqual(cm._unreadable, set())
+        self.assertIn("/x/k", cm._lru)
+        self.assertEqual(cm._total_bytes, 100)
+
+    def test_failed_load_skips_concurrent_store_path(self):
+        # A concurrent store of the same key is about to rewrite the file; the
+        # failed load must not quarantine it (the store's fresh write is
+        # readable) and must not un-account its already-reserved bytes.
+        cm = self._make()
+        cm._lru = OrderedDict([("/x/k", 100)])
+        cm._total_bytes = 100
+        cm._pinned = {"/x/k": 1}
+        cm._load_job_keys = {1: ["/x/k"]}
+        cm._store_in_flight = {"/x/k"}
+        Res = type("Res", (), {"job_id": 1, "success": False})
+        orig = FileSystemTierManager.get_finished_jobs
+        try:
+            FileSystemTierManager.get_finished_jobs = lambda self: iter([Res()])
+            list(cm.get_finished())
+        finally:
+            FileSystemTierManager.get_finished_jobs = orig
+        self.assertIn("/x/k", cm._lru)
+        self.assertEqual(cm._total_bytes, 100)
+        self.assertNotIn("/x/k", cm._unreadable)
 
     def test_failed_store_keeps_present_file_accounted(self):
         cm = self._make()

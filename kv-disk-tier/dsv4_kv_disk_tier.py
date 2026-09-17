@@ -258,6 +258,18 @@ class CappedFileSystemTierManager(FileSystemTierManager):
         self._pinned: dict[str, int] = {}
         self._load_job_keys: dict[int, list[str]] = {}
         self._store_job_keys: dict[int, list[str]] = {}
+        # Every path each store writes, and the union of those paths: used so a
+        # failed load of the same key does not quarantine a block a concurrent
+        # store is about to rewrite (see get_finished).
+        self._store_all_keys: dict[int, list[str]] = {}
+        self._store_in_flight: set[str] = set()
+        # Block paths whose load failed (unreadable) even though retirement
+        # could not remove the file. The parent's lookup() is a bare
+        # os.path.exists(), so a file that survives retirement keeps returning
+        # HIT and every request touching it re-promotes it forever -- a
+        # livelock. These are quarantined: lookup() reports MISS and the bytes
+        # no longer count toward the cap until a fresh store rewrites the file.
+        self._unreadable: set[str] = set()
 
         if self._max_bytes <= 0:
             logger.warning(
@@ -360,6 +372,11 @@ class CappedFileSystemTierManager(FileSystemTierManager):
     def _account(self, paths: Iterable[str]) -> None:
         with self._lock:
             for p in paths:
+                # A store rewrites the file fresh, so a previously quarantined
+                # block becomes readable again: un-quarantine it (its bytes are
+                # about to be valid on disk again, and a stale quarantine would
+                # keep lookup() blind to a good block).
+                self._unreadable.discard(p)
                 if p in self._lru:
                     self._lru.move_to_end(p)
                 else:
@@ -370,12 +387,19 @@ class CappedFileSystemTierManager(FileSystemTierManager):
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext | None = None):
+        path = self.file_mapper.get_file_name(key)
+        # Quarantined block: the load failed and the unreadable file could not
+        # be retired. Returning HIT here would re-promote the same unusable
+        # block on every touching request. Report MISS so the primary tier
+        # recomputes instead.
+        if path in self._unreadable:
+            return LookupResult.MISS
         hit = super().lookup(key, req_context)
         # GLM53-LOOKUPRESULT: the parent returns a LookupResult enum, and every
         # member (MISS/HIT_PENDING/RETRY included) is truthy. Only a real HIT
         # should refresh LRU position.
         if hit is LookupResult.HIT:
-            self._mark_recent([self.file_mapper.get_file_name(key)])
+            self._mark_recent([path])
         return hit
 
     @override
@@ -391,6 +415,12 @@ class CappedFileSystemTierManager(FileSystemTierManager):
             new_paths = [p for p in paths if p not in self._lru]
             self._evict_for(len(new_paths) * self._block_size)
             self._store_job_keys[job_metadata.job_id] = new_paths
+            # Record every path this store will write so a concurrent failed
+            # load of the same key does NOT quarantine it: the store is about to
+            # rewrite the file, and _account() below clears any stale
+            # quarantine. Cleared when the store job completes.
+            self._store_all_keys[job_metadata.job_id] = paths
+            self._store_in_flight.update(paths)
         super().submit_store(job_metadata)
         self._account(paths)
 
@@ -472,13 +502,25 @@ class CappedFileSystemTierManager(FileSystemTierManager):
                 if not result.success:
                     # _load_block_buffered retired the unreadable file(s), so
                     # the LRU must forget them too: leaving them accounted would
-                    # charge the cap for bytes that are gone. Checked on disk
-                    # because a concurrent store of the same key may have
-                    # re-created them (its _account already counted the bytes).
+                    # charge the cap for bytes that are gone.
                     with self._lock:
                         for p in paths:
-                            if p in self._lru and not os.path.exists(p):
+                            # A concurrent store of the same key is about to (or
+                            # already did) rewrite the file; its _account will
+                            # own the accounting and _account un-quarantines it.
+                            # Skip so we neither under-count nor quarantine a
+                            # block that is about to become readable again.
+                            if p in self._store_in_flight:
+                                continue
+                            if p in self._lru:
                                 self._total_bytes -= self._lru.pop(p)
+                            # If retirement of the unreadable file FAILED
+                            # (os.remove raised), the file still exists and the
+                            # parent's lookup() (bare os.path.exists) would keep
+                            # reporting a HIT -- re-promoting this same unusable
+                            # block on every touching request. Quarantine it so
+                            # lookup() returns MISS instead.
+                            self._unreadable.add(p)
             # A failed store never landed its file, but submit_store already
             # accounted its bytes optimistically; drop the phantom entry so
             # _total_bytes and the LRU do not drift after a write error. Same
@@ -486,6 +528,13 @@ class CappedFileSystemTierManager(FileSystemTierManager):
             # re-added the path, and un-accounting it would orphan real bytes
             # (invisible to the cap, therefore never evicted, and never
             # rewritten because lookup() keeps hitting them).
+            # The store job is over: it no longer protects its keys from a
+            # concurrent failed-load quarantine, so drop the in-flight marks.
+            written = self._store_all_keys.pop(result.job_id, None)
+            if written is not None:
+                with self._lock:
+                    for p in written:
+                        self._store_in_flight.discard(p)
             store_paths = self._store_job_keys.pop(result.job_id, None)
             if store_paths is not None and not result.success:
                 with self._lock:
